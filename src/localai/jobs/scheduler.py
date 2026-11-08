@@ -282,6 +282,7 @@ class JobScheduler:
             "separate": self._parallel_limit("separate"),
             "speaker": self._parallel_limit("speaker"),
             "media": self._parallel_limit("media"),
+            "translate": self._parallel_limit("translate"),
         }
 
     @property

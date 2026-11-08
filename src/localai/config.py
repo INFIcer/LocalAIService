@@ -38,6 +38,11 @@
     LOCALAI_WHISPER_DEVICE    faster-whisper 设备（默认 cuda，可设 cpu）
     LOCALAI_WHISPER_COMPUTE   faster-whisper 计算类型（默认 int8_float16；CPU 回退 int8）
     LOCALAI_WHISPER_IDLE_UNLOAD faster-whisper 空闲卸载秒数（默认 900，0=关闭）
+    LOCALAI_TRANSLATE_DIR     翻译权重根目录（默认 <HOME>/models/nllb）
+    LOCALAI_TRANSLATE_IDLE_UNLOAD 翻译空闲卸载秒数（默认 900，0=关闭）
+    LOCALAI_TRANSLATE_FP16    GPU 上是否用 fp16（默认 1；设 0 用 fp32）
+    LOCALAI_TRANSLATE_NUM_BEAMS 翻译 beam 数（默认 4，范围 1~8）
+    LOCALAI_TRANSLATE_BATCH_SIZE 翻译默认批大小（默认 8，范围 1~32）
     LOCALAI_TOKEN             可选的 Bearer 鉴权令牌（默认空=不鉴权）
 
 任务队列（详见 ``localai.jobs``）::
@@ -192,6 +197,12 @@ class Config:
     whisper_device: str = "cuda"
     whisper_compute: str = "int8_float16"
     whisper_idle_unload: int = 900
+    #: 翻译（NLLB-200）权重根目录；权重在 ``<translate_dir>/nllb-200-distilled-600M/``。
+    translate_dir: Path = field(default_factory=Path)
+    translate_idle_unload: int = 900
+    translate_fp16: bool = True
+    translate_num_beams: int = 4
+    translate_batch_size: int = 8
     speaker_model_dir: Path = field(default_factory=Path)
     comfy_model_dir: Path = field(default_factory=Path)
     comfy_base: str = "http://127.0.0.1:8188"
@@ -386,6 +397,20 @@ class Config:
                 _pick("LOCALAI_WHISPER_COMPUTE", default="int8_float16") or "int8_float16"
             ).strip(),
             whisper_idle_unload=_pick_int(900, "LOCALAI_WHISPER_IDLE_UNLOAD"),
+            translate_dir=Path(
+                _pick(
+                    "LOCALAI_TRANSLATE_DIR",
+                    default=str(root / "models" / "nllb"),
+                )
+            ).expanduser(),
+            translate_idle_unload=_pick_int(900, "LOCALAI_TRANSLATE_IDLE_UNLOAD"),
+            translate_fp16=_pick_bool(True, "LOCALAI_TRANSLATE_FP16"),
+            translate_num_beams=max(
+                1, min(8, _pick_int(4, "LOCALAI_TRANSLATE_NUM_BEAMS"))
+            ),
+            translate_batch_size=max(
+                1, min(32, _pick_int(8, "LOCALAI_TRANSLATE_BATCH_SIZE"))
+            ),
             speaker_model_dir=Path(
                 _pick(
                     "LOCALAI_CAMPPUS_DIR",
@@ -496,12 +521,18 @@ class Config:
             "LOCALAI_WHISPER_DEVICE": self.whisper_device,
             "LOCALAI_WHISPER_COMPUTE": self.whisper_compute,
             "LOCALAI_WHISPER_IDLE_UNLOAD": str(self.whisper_idle_unload),
+            "LOCALAI_TRANSLATE_DIR": str(self.translate_dir),
+            "LOCALAI_TRANSLATE_IDLE_UNLOAD": str(self.translate_idle_unload),
+            "LOCALAI_TRANSLATE_FP16": "1" if self.translate_fp16 else "0",
+            "LOCALAI_TRANSLATE_NUM_BEAMS": str(self.translate_num_beams),
+            "LOCALAI_TRANSLATE_BATCH_SIZE": str(self.translate_batch_size),
             "INDEX_TTS_CAMPPUS_DIR": str(self.speaker_model_dir),
             "INDEX_TTS_SPEAKERS_DIR": str(self.speakers_dir),
             "INDEX_TTS_TORCH_HOME": str(self.torch_home),
             "INDEX_TTS_DEMUCS_REPO": str(self.demucs_repo),
             "INDEX_TTS_VOICES": str(self.voices_dir),
             "INDEX_TTS_OUTPUT": str(self.output_dir),
+            "LOCALAI_LOGS_DIR": str(self.logs_dir),
             "INDEX_TTS_VRAM_ESTIMATES": str(self.vram_estimates_path),
             "INDEX_TTS_VRAM_MARGIN_MB": str(self.vram_margin_mb),
             "INDEX_TTS_IDLE_UNLOAD": str(self.idle_unload),
@@ -539,6 +570,14 @@ class Config:
                 "compute_type": self.whisper_compute,
                 "idle_unload": self.whisper_idle_unload,
             },
+            "translate": {
+                "dir": str(self.translate_dir),
+                "model": "nllb-200-distilled-600M",
+                "idle_unload": self.translate_idle_unload,
+                "fp16": self.translate_fp16,
+                "num_beams": self.translate_num_beams,
+                "batch_size": self.translate_batch_size,
+            },
             "speaker_model_dir": str(self.speaker_model_dir),
             "voices_dir": str(self.voices_dir),
             "output_dir": str(self.output_dir),
@@ -558,6 +597,7 @@ class Config:
                 "whisper": self.whisper_idle_unload,
                 "speaker": self.speaker_idle_unload,
                 "separate": self.separate_idle_unload,
+                "translate": self.translate_idle_unload,
             },
             "auth_required": bool(self.token),
             "jobs": {
@@ -601,6 +641,7 @@ class Config:
             "separate": self.jobs_parallel_separate,
             "speaker": 1,
             "media": 1,
+            "translate": 1,
         }
 
     def jobs_global_cap(self) -> Optional[int]:
@@ -637,6 +678,7 @@ def ensure_directories(cfg: Optional[Config] = None) -> list[Path]:
         cfg.frames_dir,
         cfg.scenes_dir,
         cfg.whisper_dir,
+        cfg.translate_dir,
         cfg.asr_vad_dir,
         cfg.speaker_tmp_dir,
         cfg.separate_tmp_dir,

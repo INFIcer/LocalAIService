@@ -10,6 +10,11 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from ... import API_VERSION, __version__
+from ...constants import (
+    TRANSLATE_BATCH_CHARS,
+    TRANSLATE_BATCH_MAX,
+    TRANSLATE_MAX_TEXT,
+)
 from ...core.voices import scan_voices
 from ..deps import get_cfg, get_client, get_registry, get_vram_manager
 from ..schemas import VramUnloadRequest
@@ -43,6 +48,15 @@ async def health(request: Request) -> dict[str, Any]:
         "loaded": bool(whisper.get("loaded")),
         "model": whisper.get("model") or f"faster-whisper-{cfg.whisper_model}",
         "idle_unload_seconds": cfg.whisper_idle_unload,
+    }
+    translate_status = registry.get("translate").status()
+    translate_health = {
+        "ready": bool(translate_status.get("ready")),
+        "loaded": bool(translate_status.get("loaded")),
+        "model": translate_status.get("model") or "nllb-200-distilled-600M",
+        "idle_unload_seconds": cfg.translate_idle_unload,
+        "device": translate_status.get("device"),
+        "dtype": translate_status.get("dtype"),
     }
     spk = registry.get("speaker").status()
     speaker_health = {
@@ -84,6 +98,7 @@ async def health(request: Request) -> dict[str, Any]:
             "idle_seconds": None if idle is None else round(idle, 1),
             "asr": asr_health,
             "whisper": whisper_health,
+            "translate": translate_health,
             "speaker": speaker_health,
             "separate": separate_health,
             "vram": vram_health,
@@ -109,6 +124,7 @@ async def health(request: Request) -> dict[str, Any]:
         "comfy_url": cfg.comfy_base,
         "asr": asr_health,
         "whisper": whisper_health,
+        "translate": translate_health,
         "speaker": speaker_health,
         "separate": separate_health,
         "vram": vram_health,
@@ -167,6 +183,21 @@ async def capabilities(request: Request) -> dict[str, Any]:
             },
         },
         "auth": {"required": bool(cfg.token), "scheme": "bearer"},
+        "translate": {
+            "engine": "nllb",
+            "model": "nllb-200-distilled-600M",
+            "weights_dir": str(cfg.translate_dir / "nllb-200-distilled-600M"),
+            "idle_unload_seconds": cfg.translate_idle_unload,
+            "fp16": cfg.translate_fp16,
+            "num_beams": cfg.translate_num_beams,
+            "batch_size": cfg.translate_batch_size,
+            "max_text_chars": TRANSLATE_MAX_TEXT,
+            "batch_max_items": TRANSLATE_BATCH_MAX,
+            "batch_max_chars": TRANSLATE_BATCH_CHARS,
+            "languages": registry.get("translate").languages(),
+            "endpoints": ["/translate", "/translate/batch", "/translate/status", "/jobs/translate"],
+            "note": "source=auto 只覆盖常见语种；检测失败会要求显式给 source",
+        },
         "gpu": {
             "available": bool(total_mb),
             "free_mb": free_mb,
@@ -195,6 +226,9 @@ async def capabilities(request: Request) -> dict[str, Any]:
             "upload_max_mb": 200,
             "audio_upload_max_mb": 50,
             "tts_max_text_chars": 5000,
+            "translate_max_text_chars": TRANSLATE_MAX_TEXT,
+            "translate_batch_max_items": TRANSLATE_BATCH_MAX,
+            "translate_batch_max_chars": TRANSLATE_BATCH_CHARS,
             "job_timeout_seconds": cfg.job_timeout,
         },
         "defaults": {
@@ -204,6 +238,7 @@ async def capabilities(request: Request) -> dict[str, Any]:
                 "whisper": cfg.whisper_idle_unload,
                 "speaker": cfg.speaker_idle_unload,
                 "separate": cfg.separate_idle_unload,
+                "translate": cfg.translate_idle_unload,
             },
         },
         "files": {

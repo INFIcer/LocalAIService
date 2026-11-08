@@ -20,6 +20,7 @@ from .base import BaseAdapter
 from .media_ffmpeg import MediaAdapter
 from .separate_demucs import SeparateAdapter
 from .speaker_campplus import SpeakerAdapter
+from .translate_nllb import TranslateAdapter
 from .tts_indextts import TtsAdapter
 
 __all__ = [
@@ -30,6 +31,7 @@ __all__ = [
     "SpeakerAdapter",
     "SeparateAdapter",
     "MediaAdapter",
+    "TranslateAdapter",
     "build_registry",
 ]
 
@@ -42,6 +44,7 @@ def build_registry(cfg: Optional[Config] = None) -> EngineRegistry:
     registry.register(TtsAdapter(cfg))
     registry.register(AsrAdapter(cfg))
     registry.register(WhisperAdapter(cfg))
+    registry.register(TranslateAdapter(cfg))
     registry.register(SpeakerAdapter(cfg))
     registry.register(SeparateAdapter(cfg))
     registry.register(MediaAdapter(cfg))

@@ -997,3 +997,331 @@ failed / canceled）后默认删除，`LOCALAI_JOBS_KEEP_UPLOADS=1` 可保留。
   这是主人明确要求的取舍；调用方如果在意延迟，应自己控制提交节奏，
   或把任务拆到不同服务实例。
 
+---
+
+## 13. 翻译（NLLB-200）
+
+新增的**轻量快速翻译**能力：`facebook/nllb-200-distilled-600M`（约 2.37 GB 权重，
+GPU fp16 约占 1.2 GB 显存）。和 TTS / ASR 一样是**懒加载 + 空闲卸载 + 显存 LRU**：
+服务启动 0 模型，第一次 `/translate` 才加载；空闲 900 秒（可配）自动卸载；
+显存不够时和 TTS / whisper / Demucs 按 LRU 互相腾地方。
+
+- 能力名：`translate`（`/capabilities` 里可发现）
+- 引擎名：`nllb`（请求里的 `engine` 字段，目前唯一可选值）
+- 权重目录：`LOCALAI_HOME/models/nllb/nllb-200-distilled-600M/`
+  （可用 `LOCALAI_TRANSLATE_DIR` 改根目录）
+- 安装日志：`logs/nllb_install.log`（每次下载尝试与失败原因都写在这里）
+
+### 13.1 接口一览
+
+| 接口 | 用途 | 是否入任务队列 |
+| --- | --- | --- |
+| `POST /translate` | 单条文本翻译（≤ 5000 字），长文本自动切分后拼回 | 否（直接调用） |
+| `POST /translate/batch` | 一批文本（≤ 500 条 / ≤ 200k 字），内部批量推理 | 否（直接调用） |
+| `POST /jobs/translate` | 超大批量进队列，立刻返回 job id | 是（`kind=translate`） |
+| `GET /translate/status` | 模型是否就绪/已加载、空闲秒数、语言表、权重信息 | 否 |
+| `GET /jobs/{id}/result` | 取 `/jobs/translate` 的结果 | — |
+
+`/translate` 与 `/translate/batch` 不写任务库（短请求不留垃圾记录）；
+需要持久化、排队、或单批超过 500 条时用 `/jobs/translate`。
+
+### 13.2 单条：`POST /translate`
+
+```bash
+curl -X POST http://127.0.0.1:7880/translate \
+  -H "Content-Type: application/json" \
+  -d '{"text":"今天天气不错，我们出去走走吧。","source":"zh","target":"en"}'
+```
+
+```json
+{
+  "ok": true,
+  "engine": "nllb",
+  "source": "zho_Hans",
+  "target": "eng_Latn",
+  "text": "The weather is fine today, let's go for a walk.",
+  "elapsed_ms": 7509,
+  "chunks": 1
+}
+```
+
+- 第一次调用包含加载时间（本机约 5~8 秒），之后单条短句约 **0.23 秒**；
+- `source` 可写 `auto`、常见别名（`zh`/`en`/`ja`…）或 NLLB 码（`zho_Hans`）；
+- `target` 同上（不接受 `auto`）；
+- `chunks` 是这条文本被切成了多少块（长文本会 >1）；
+- 可选字段：`engine`（默认 `nllb`）、`max_len`（每块最大 token，默认 400）、
+  `batch_size`（内部批大小，默认 8）。
+
+### 13.3 批量：`POST /translate/batch`
+
+```bash
+curl -X POST http://127.0.0.1:7880/translate/batch \
+  -H "Content-Type: application/json" \
+  -d '{"texts":["你吃饭了吗？","这个方案还得再讨论一下。","人工智能正在改变生活。"],
+       "source":"zh","target":"en","batch_size":8}'
+```
+
+```json
+{
+  "ok": true,
+  "engine": "nllb",
+  "source": "zho_Hans",
+  "target": "eng_Latn",
+  "texts": [
+    "Have you eaten?",
+    "This plan needs further discussion.",
+    "Artificial intelligence is changing life."
+  ],
+  "count": 3,
+  "elapsed_ms": 269,
+  "chunks": 3
+}
+```
+
+- 返回顺序与 `texts` 严格一致；空字符串原样返回空字符串；
+- 内部按 `batch_size` 分批跑 GPU，**比逐条调用快很多**（500 条约 31~36 秒）；
+- 上限：单条 5000 字、单批 500 条、单批总量 200,000 字；
+  超限返回 **400**（不是 422），说明里会告诉你超了多少、该改用哪个接口。
+
+### 13.4 超大批量：`POST /jobs/translate`
+
+```bash
+curl -X POST http://127.0.0.1:7880/jobs/translate \
+  -H "Content-Type: application/json" \
+  -d '{"texts":["第一条……","第二条……"],"source":"zh","target":"en","batch_size":8,"priority":0}'
+```
+
+```json
+{"ok": true, "id": "6f7e0bb4e249463da456e7252142fdbe", "state": "queued",
+ "count": 500, "source": "zho_Hans", "target": "eng_Latn"}
+```
+
+结果：
+
+```bash
+curl http://127.0.0.1:7880/jobs/6f7e0bb4e249463da456e7252142fdbe/result
+```
+
+```json
+{
+  "ok": true,
+  "id": "6f7e0bb4e249463da456e7252142fdbe",
+  "state": "done",
+  "result": {
+    "ok": true,
+    "engine": "nllb",
+    "model": "nllb-200-distilled-600M",
+    "source": "zho_Hans",
+    "target": "eng_Latn",
+    "texts": ["...", "..."],
+    "count": 500,
+    "chunks": 500,
+    "elapsed_ms": 34000,
+    "loaded": true
+  }
+}
+```
+
+- 调度器按「同类型优先」把连续的 translate 任务排在一起，模型只加载一次；
+- 语言/长度等参数错误在**入队前**返回 400，不会产生失败任务；
+- 单任务超时默认 600 秒（`LOCALAI_JOB_TIMEOUT`），500 条远低于上限。
+
+### 13.5 状态：`GET /translate/status`
+
+```json
+{
+  "ok": true,
+  "ready": true,
+  "loaded": true,
+  "idle_seconds": 0.5,
+  "idle_unload_seconds": 900,
+  "model": "nllb-200-distilled-600M",
+  "model_dir": "E:\\LocalAIService\\models\\nllb\\nllb-200-distilled-600M",
+  "device": "cuda",
+  "dtype": "float16",
+  "fp16": true,
+  "size_mb": 2367.6,
+  "weights_source": "local",
+  "missing": [],
+  "load_seconds": 5.1,
+  "load_error": null,
+  "install_log": "E:\\LocalAIService\\logs\\nllb_install.log",
+  "languages": [{"code": "zho_Hans", "name": "简体中文"}],
+  "detail": "nllb-200-distilled-600M 权重已就绪（模型已加载）"
+}
+```
+
+`/health` 与 `/capabilities` 也各有一块 `translate`（轻量字段）；
+`/capabilities` 的 `translate.languages` 是完整语言表，插件可直接用它做下拉框。
+
+### 13.6 语言码
+
+入口同时接受三种写法：
+
+1. **NLLB 码**（推荐，含义最明确）：`zho_Hans`、`eng_Latn`、`jpn_Jpan` …；
+2. **常见别名**：`zh`、`zh-cn`、`en`、`ja`、`ko`、`fr`、`de`、`es`、`ru`、`ar` …；
+3. **ISO 风格**：`zh-cn`、`eng-latn`（大小写与 `-`/`_` 不敏感）。
+
+常用对照（完整 39 种见 `/translate/status` 的 `languages`）：
+
+| NLLB 码 | 语言 | 常见别名 |
+| --- | --- | --- |
+| `zho_Hans` | 简体中文 | `zh` / `zh-cn` / `chinese` / `cn` |
+| `zho_Hant` | 繁体中文 | `zh-tw` / `zh-hant` |
+| `yue_Hant` | 粤语 | `yue` / `cantonese` |
+| `eng_Latn` | 英语 | `en` / `english` |
+| `jpn_Jpan` | 日语 | `ja` / `jp` |
+| `kor_Hang` | 韩语 | `ko` / `kr` |
+| `fra_Latn` | 法语 | `fr` |
+| `deu_Latn` | 德语 | `de` |
+| `spa_Latn` | 西班牙语 | `es` |
+| `rus_Cyrl` | 俄语 | `ru` |
+| `ara_Arab` | 阿拉伯语 | `ar` |
+| `por_Latn` / `ita_Latn` / `nld_Latn` | 葡/意/荷 | `pt` / `it` / `nl` |
+| `pol_Latn` / `tur_Latn` / `ukr_Cyrl` | 波/土/乌 | `pl` / `tr` / `uk` |
+| `vie_Latn` / `tha_Thai` / `ind_Latn` | 越/泰/印尼 | `vi` / `th` / `id` |
+| `hin_Deva` / `ben_Beng` / `tam_Taml` | 印地/孟加拉/泰米尔 | `hi` / `bn` / `ta` |
+| `heb_Hebr` / `fas_Arab` / `urd_Arab` | 希伯来/波斯/乌尔都 | `he` / `fa` / `ur` |
+| `swe_Latn` / `dan_Latn` / `nor_Latn` / `fin_Latn` | 北欧四语 | `sv` / `da` / `no` / `fi` |
+| `ces_Latn` / `ron_Latn` / `hun_Latn` / `ell_Grek` / `bul_Cyrl` / `srp_Cyrl` | 捷/罗/匈/希/保/塞 | 对应两字母码 |
+
+未知语言会返回 400，并在 `detail` 里列出**全部可用 NLLB 码与别名**。
+
+### 13.7 `source=auto` 的边界
+
+`auto` 用 `langdetect`（纯 Python，无额外模型下载）判断，再映射到 NLLB 码：
+
+- 只覆盖上表里的**常见语种**；检测到表外语种会返回 400，要求显式给 `source`；
+- 文本太短（一两个词）、纯数字/符号、或中英混排时检测可能不准；
+- 一批文本只检测**第一条非空文本**，整批按同一源语言处理；
+- 要稳定结果就显式给 `source`（尤其是术语、代码、商品名这类文本）。
+
+错误示例：
+
+```json
+{"detail": "检测到的语言不在支持列表里（tl(78%)）；auto 只覆盖常见语种，请显式指定 source。可用 NLLB 码：……"}
+```
+
+### 13.8 长文本策略
+
+一条请求里的长文本会这样处理：
+
+1. **按段落切**：`\n` / `\r\n` 原样保留为分隔块，不送进模型；
+2. **按句子切**：中文 `。！？；…`、英文 `. ! ? ;` 都认；英文句号只在后面是空白/结尾时切，
+   不会切开 `3.14`；句尾的引号/括号归到同一句；
+3. **超长句再切**：先按逗号/顿号/冒号等次级标点切，仍超过 `max_len` 的按字符二分硬切；
+4. **每块 ≤ `max_len` token**（默认 400，真正用 tokenizer 计数）；
+5. 翻译后**按原结构拼回**：段落间的换行原样保留；同一段内被切开的块用空格连接
+   （中文/日文目标不加空格，避免句间多出空格）；硬切开的同一句用空字符串连接。
+
+结构保证：段落数、空行数不丢；每个切块都会出现在结果里（内部有数量校验，
+不一致会直接报错而不是悄悄丢句）。注意：**句子之间的原始空格**不会逐字保留
+（由目标语言习惯决定连接符）。
+
+### 13.9 实测（本机 RTX 3070 8GB / torch 2.11+cu130 / fp16）
+
+**质量抽检**（默认 `num_beams=4`，人工阅读后给评语）：
+
+| 方向 | 原文 | 译文 | 评语 |
+| --- | --- | --- | --- |
+| 中→英 | 今天天气不错，我们出去走走吧。 | The weather is fine today, let's go for a walk. | 通顺，口语自然 |
+| 中→英 | 请把这份文件打印三份，下午开会要用。 | Please print this document in three copies for the afternoon meeting. | 完整，语序正确 |
+| 中→英 | 该系统采用分布式架构，支持水平扩展。 | The system uses a distributed architecture to support level expansion. | 可读，但“水平扩展”译成 level expansion，术语不准 |
+| 中→英 | 请在提交代码前运行单元测试，确保没有回归。 | Please run the unit test before submitting the code to make sure there is no return. | “回归”误译为 return，术语错 |
+| 中→英 | 这家餐厅的招牌菜是红烧肉，味道很地道。 | The restaurant's signature dish is roasted meat, which tastes delicious. | 可读，“红烧肉”丢失 |
+| 英→中 | Please print three copies of this document for the afternoon meeting. | 请为下午会议打印这份文件的三个副本。 | 完整通顺 |
+| 英→中 | The system uses a distributed architecture and supports horizontal scaling. | 该系统采用分布式架构，支持水平扩展。 | 术语准确 |
+| 英→中 | Sorry, I may have misheard you. Could you say that again? | 抱歉，我可能听不到你，你能再说吗？ | “misheard”误译成“听不到” |
+| 英→中 | The restaurant's signature dish is braised pork, and it tastes authentic. | 这家餐厅的标志性菜是烤的猪肉， | 术语错（braised pork→红烧肉），句尾略缺 |
+| 英→中 | Urban rail transit passenger flow peaks during the morning and evening rush hours. | 城市铁路运输乘客流量在凌晨和晚上高峰。 | “早晚高峰”译成“凌晨和晚上”，语义偏差 |
+| 中→日 | 你吃饭了吗？我有点饿了。 | あなたは食べましたか? 私は少し腹が減りました。 | 自然 |
+| 中→日 | 他昨天加班到很晚，今天状态不太好。 | 彼は昨日遅くまで働いていたので，今日も不調です。 | 基本准确 |
+| 中→日 | 这家餐厅的招牌菜是红烧肉，味道很地道。 | このレストランの標識は赤い焼肉で，美味しい。 | “招牌菜”误成“標識”，术语错 |
+| 中→日 | 该系统采用分布式架构，支持水平扩展。 | このシステムは分布式構造を採用し，レベル拡張をサポートします。 | 中文词“分布式/扩展”残留 |
+| 中→日 | 如果有任何问题，请随时联系客服。 | 顧客サービスにご連絡ください。 | 条件从句丢失 |
+
+总体：**日常口语、书面陈述句可读性较好**；**专业术语、文化专有名词
+（红烧肉/招牌菜/回归/水平扩展）准确率一般**；小模型偶有漏译。适合“先看懂大意”，
+不适合法务/医疗等要求逐字准确的场景。
+
+**速度**（已加载后，batch_size=8）：
+
+| 场景 | 配置 | 耗时 | 吞吐 |
+| --- | --- | --- | --- |
+| 单条短句 | beams=4 | 0.223~0.235 s（首次预热 0.66 s） | ~4.3 条/s |
+| 20 句短句 | beams=1 | 0.792 s | 25.3 条/s |
+| 20 句短句 | beams=2 | 1.098 s | 18.2 条/s |
+| 20 句短句 | **beams=4（默认）** | 1.333 s | 15.0 条/s |
+| 500 条，引擎直调 | beams=2 | 24.68 s | 20.3 条/s / 351 字/s |
+| 500 条，引擎直调 | **beams=4（默认）** | 31.65 s | 15.8 条/s / 274 字/s |
+| 500 条，`/translate/batch`（含首次加载） | beams=4 | 36.56 s | 13.7 条/s / 237 字/s |
+| 500 条，`/jobs/translate`（排队到完成） | beams=4 | 34.07 s | 14.7 条/s |
+
+“RTF 类似指标”：按**输入字符**算约 **237~274 字符/秒**（beam 2 时约 351）。
+500 条与 20 条的单位吞吐接近，说明批量接口没有明显额外开销。
+
+**长文本结构**（每段 327~336 字，3 段，空行分段）：
+
+| 文档 | 输入 | 输出块数 | 段落（入→出） | 空行（入→出） | 耗时 | 结构 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 长文 1（AI 行业） | 336 字 | 3 | 3 → 3 | 2 → 2 | 1.33 s | ✅ |
+| 长文 2（公司故事） | 327 字 | 3 | 3 → 3 | 2 → 2 | 1.27 s | ✅ |
+| 长文 3（睡眠研究） | 334 字 | 3 | 3 → 3 | 2 → 2 | 1.30 s | ✅ |
+
+人工核对：每段都有对应译文，没有整段丢失；句子数量与语义基本对应
+（个别小模型漏译属于质量问题，不是切分丢句）。
+
+**显存与共存**（8GB 卡，桌面/驱动基础占用约 1.2 GB）：
+
+| 状态 | 整卡空闲 | 说明 |
+| --- | --- | --- |
+| 加载前 | 7097 MB | 服务 0 模型 |
+| 加载 NLLB 后 | 5913 MB | 增量 **1184 MB**（torch 已分配 1177 MB） |
+| NLLB + whisper-small 同时加载 | 4949 MB | 可以共存（约 1.6 GB） |
+| 再加载 TTS | 1221 MB | **LRU 自动卸掉 translate + whisper**，TTS 独占 |
+| 再调 `/translate` | 5753 MB | **LRU 反过来卸掉 TTS**，翻译重新加载 |
+| `/vram/unload {"all":true}` | 6965 MB | 全部卸载，回到基线 |
+| 500 条批次后 | 5499 MB | 比加载后多 414 MB（PyTorch 保留缓存，非泄漏） |
+| 卸载后 | 7031 MB | 相对基线差 66 MB，属统计噪声 |
+
+结论：NLLB 可以和 whisper/ASR 这类小模型共存；和 TTS（6.2 GB）**不能同时**，
+由显存管家按 LRU 自动二选一。`/vram` 里 translate 的估算会按实测校准
+（初始 1500 MB，本机校准到 1200 MB）。
+
+**稳定性**：500 条批次连续跑完无报错、无 OOM；进程显存前后差在噪声范围内；
+重复调用与卸载/重载均正常。
+
+### 13.10 默认参数与理由
+
+| 参数 | 默认 | 理由 |
+| --- | --- | --- |
+| `num_beams` | **4** | 批量下 beams=2 会出现明显漏译（如“三份副本…下午开会”只译前半句），beams=4 能修正；速度只比 beams=2 慢约 19%（20 句 1.10s→1.33s），值得 |
+| `batch_size` | **8** | 8GB 卡上 8 条一批吞吐已接近饱和，再大收益有限、显存峰值更高 |
+| `max_len` | **400 token** | 覆盖绝大多数段落；超长会切块，不会截断丢内容 |
+| fp16 | **开**（`LOCALAI_TRANSLATE_FP16=1`） | 3070 支持；显存减半、速度更快，实测质量无明显下降；CPU 自动回退 fp32 |
+| 空闲卸载 | **900 秒**（`LOCALAI_TRANSLATE_IDLE_UNLOAD`） | 与其它能力一致；0 = 关闭 |
+| 并发 | **1** | `transformers.generate` 未验证同模型并发安全；吞吐靠批内 batch_size，而不是多请求并发 |
+
+### 13.11 错误与限制
+
+| 情况 | HTTP | 说明 |
+| --- | --- | --- |
+| text 超 5000 字 / 批超 500 条 / 超 20 万字 | 400 | `detail` 说明超了多少、建议改用 `/jobs/translate` |
+| 语言码不认识 / `auto` 检测失败 | 400 | `detail` 列出可用 NLLB 码与别名 |
+| 引擎名不认识 | 400 | 目前只支持 `nllb` |
+| 权重未下载且下载失败 | 503 | `detail` 含各下载源失败原因；看 `logs/nllb_install.log` |
+| 显存不足（LRU 腾完仍不够） | 507 | 与其它能力一致，`released` 里是已卸载的模型 |
+| 任务超时（队列） | 504 | 默认 600 秒 |
+
+已知限制：
+
+- NLLB-200-distilled-600M 是**小模型**：日常文本可读，专业术语/文化词/长难句准确率有限，
+  且没有术语表/自定义词典；需要稳定术语时建议调用方后处理或换更大模型。
+- 短而抽象的技术短语容易误译（例如“显存互相腾挪的验证”可能译成完全无关的句子），
+  给足上下文会明显改善。
+- 一次请求只按一种源语言处理；中英混排请拆成多条并分别给 `source`。
+- 标点会跟随模型输出（中文常输出半角逗号/句号），不会强制转成全角。
+- 不支持流式；长文本按块串行生成，首字延迟 = 整条耗时。
+- `source=auto` 依赖 `langdetect`，对超短文本/代码/符号串不可靠。
+- GPU 与 TTS 不能同时驻留（8GB 卡），切换时会有一次加载等待。
+

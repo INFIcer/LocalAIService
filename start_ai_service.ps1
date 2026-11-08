@@ -10,7 +10,8 @@
 #   - 空闲超过 -WhisperIdleSeconds 秒（默认 900）就自动卸载 faster-whisper；
 #   - 空闲超过 -SpeakerIdleSeconds 秒（默认 900）就自动卸载 campplus 声纹模型；
 #   - 空闲超过 -SeparateIdleSeconds 秒（默认 900）就自动卸载 Demucs 分离模型；
-#   - 卸载后再来请求会自动重新加载，四边各自独立、互不影响。
+#   - 空闲超过 -TranslateIdleSeconds 秒（默认 900）就自动卸载 NLLB 翻译模型；
+#   - 卸载后再来请求会自动重新加载，五边各自独立、互不影响。
 #
 # 目录全部从脚本位置推导（本脚本在服务根目录下），所以：
 #   - 真实目录 E:\LocalAIService 能用；
@@ -24,13 +25,15 @@
 #   powershell -ExecutionPolicy Bypass -File E:\LocalAIService\start_ai_service.ps1 -WhisperIdleSeconds 0 # 关闭 whisper 空闲卸载
 #   powershell -ExecutionPolicy Bypass -File E:\LocalAIService\start_ai_service.ps1 -SpeakerIdleSeconds 0 # 关闭声纹空闲卸载
 #   powershell -ExecutionPolicy Bypass -File E:\LocalAIService\start_ai_service.ps1 -SeparateIdleSeconds 0 # 关闭分离空闲卸载
-#   powershell -ExecutionPolicy Bypass -File E:\LocalAIService\start_ai_service.ps1 -IdleSeconds 60 -AsrIdleSeconds 60 -SpeakerIdleSeconds 60 -SeparateIdleSeconds 60  # 调试
+#   powershell -ExecutionPolicy Bypass -File E:\LocalAIService\start_ai_service.ps1 -TranslateIdleSeconds 0 # 关闭翻译空闲卸载
+#   powershell -ExecutionPolicy Bypass -File E:\LocalAIService\start_ai_service.ps1 -IdleSeconds 60 -AsrIdleSeconds 60 -SpeakerIdleSeconds 60 -SeparateIdleSeconds 60 -TranslateIdleSeconds 60  # 调试
 param(
     [int]$IdleSeconds = 900,
     [int]$AsrIdleSeconds = 900,
     [int]$WhisperIdleSeconds = 900,
     [int]$SpeakerIdleSeconds = 900,
-    [int]$SeparateIdleSeconds = 900
+    [int]$SeparateIdleSeconds = 900,
+    [int]$TranslateIdleSeconds = 900
 )
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -45,6 +48,7 @@ $env:LOCALAI_ASR_IDLE_UNLOAD = [string]$AsrIdleSeconds
 $env:LOCALAI_WHISPER_IDLE_UNLOAD = [string]$WhisperIdleSeconds
 $env:LOCALAI_SPEAKER_IDLE_UNLOAD = [string]$SpeakerIdleSeconds
 $env:LOCALAI_SEPARATE_IDLE_UNLOAD = [string]$SeparateIdleSeconds
+$env:LOCALAI_TRANSLATE_IDLE_UNLOAD = [string]$TranslateIdleSeconds
 # 兼容旧变量名，方便旧脚本/旧文档继续生效
 $env:INDEX_TTS_IDLE_UNLOAD = [string]$IdleSeconds
 $env:INDEX_TTS_ASR_IDLE_UNLOAD = [string]$AsrIdleSeconds
@@ -60,7 +64,7 @@ $logDir = Join-Path $root 'logs'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $outLog = Join-Path $logDir 'service.out.log'
 $errLog = Join-Path $logDir 'service.err.log'
-"[$(Get-Date -Format 'yyyy-MM-ddTHH:mm:ss')] 启动服务 (入口=localai serve, backend=engine, TTS空闲卸载=${IdleSeconds}s, ASR空闲卸载=${AsrIdleSeconds}s, whisper空闲卸载=${WhisperIdleSeconds}s, 声纹空闲卸载=${SpeakerIdleSeconds}s, 分离空闲卸载=${SeparateIdleSeconds}s)" | Out-File -FilePath $outLog -Append -Encoding UTF8
+"[$(Get-Date -Format 'yyyy-MM-ddTHH:mm:ss')] 启动服务 (入口=localai serve, backend=engine, TTS空闲卸载=${IdleSeconds}s, ASR空闲卸载=${AsrIdleSeconds}s, whisper空闲卸载=${WhisperIdleSeconds}s, 声纹空闲卸载=${SpeakerIdleSeconds}s, 分离空闲卸载=${SeparateIdleSeconds}s, 翻译空闲卸载=${TranslateIdleSeconds}s)" | Out-File -FilePath $outLog -Append -Encoding UTF8
 
 $python = Join-Path $root 'engine\.venv\Scripts\python.exe'
 

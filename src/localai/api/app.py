@@ -30,13 +30,23 @@ from ..core.errors import (
     JobError,
     SeparateBackendError,
     SpeakerBackendError,
+    TranslateBackendError,
     VoiceNotFound,
 )
 from ..core.idle import IdleWatchdog
 from ..core.vram import register_adapters
 from ..engines import build_registry
 from ..jobs import JobScheduler, JobStore
-from .routers import asr, jobs, media, separate, speakers, system, tts
+from .routers import (
+    asr,
+    jobs,
+    media,
+    separate,
+    speakers,
+    system,
+    translate,
+    tts,
+)
 
 logger = logging.getLogger("localai.api")
 
@@ -103,6 +113,15 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
             whisper_status["detail"],
         )
 
+        translate_adapter = registry.get("translate")
+        translate_status = translate_adapter.status()
+        logger.info("翻译引擎：%s", translate_status["detail"])
+        logger.info(
+            "翻译模型目录：%s（首次 /translate 请求时加载；空闲 %ds 卸载）",
+            translate_status.get("model_dir") or cfg.translate_dir,
+            cfg.translate_idle_unload,
+        )
+
         media_adapter = registry.get("media")
         media_health = media_adapter.health()
         if media_health.get("ffmpeg") == "ok":
@@ -158,10 +177,11 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
             await app.state.client.aclose()
 
     app = FastAPI(
-        title="本地 AI 服务管理器（TTS + ASR + 声纹 + 媒体 + 人声分离）",
+        title="本地 AI 服务管理器（TTS + ASR + 翻译 + 声纹 + 媒体 + 人声分离）",
         description=(
             "一个端口提供 TTS（IndexTTS-2.5）、ASR（SenseVoiceSmall / faster-whisper）、"
-            "声纹（campplus）、ffmpeg 媒体工具（含场景检测）与 Demucs 人声分离；"
+            "翻译（NLLB-200-distilled-600M）、声纹（campplus）、"
+            "ffmpeg 媒体工具（含场景检测）与 Demucs 人声分离；"
             "模型懒加载 + 空闲卸载。\n\n"
             "能力发现：`GET /capabilities`；调用方文档：`docs/SERVICE_API.md`。"
         ),
@@ -263,6 +283,20 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
             content={"ok": False, "error": "asr_error", "detail": exc.message},
         )
 
+    @app.exception_handler(TranslateBackendError)
+    async def _translate_error_handler(
+        request: Request, exc: TranslateBackendError
+    ) -> JSONResponse:
+        logger.error("翻译引擎错误：%s | %s", exc.message, exc.detail or "")
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "ok": False,
+                "error": "translate_error",
+                "detail": exc.message,
+            },
+        )
+
     @app.exception_handler(SpeakerBackendError)
     async def _speaker_error_handler(request: Request, exc: SpeakerBackendError) -> JSONResponse:
         logger.error("声纹引擎错误：%s | %s", exc.message, exc.detail or "")
@@ -350,6 +384,7 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
     app.include_router(jobs.router)
     app.include_router(tts.router)
     app.include_router(asr.router)
+    app.include_router(translate.router)
     app.include_router(speakers.router)
     app.include_router(separate.router)
     app.include_router(media.router)

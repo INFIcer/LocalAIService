@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "localai-service"
-version = "2.2.0"
-description = "本地 AI 服务层：TTS / ASR / 声纹 / 人声分离 / 媒体工具，统一 HTTP 接口、懒加载与显存管理"
+version = "2.3.0"
+description = "本地 AI 服务层：TTS / ASR / 翻译 / 声纹 / 人声分离 / 媒体工具，统一 HTTP 接口、懒加载与显存管理"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -37,6 +37,8 @@ engines = [
     "funasr>=1.1",
     "demucs>=4.0",
     "transformers>=4.40",
+    "sentencepiece>=0.2",
+    "langdetect>=1.0.9",
 ]
 
 [project.scripts]
@@ -50,5 +52,8 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q -m 'not slow'"
 filterwarnings = ["ignore::DeprecationWarning"]
+markers = [
+    "slow: 需要真实模型 / 联网的慢测试（默认跳过；用 `pytest -m slow` 单独跑）",
+]

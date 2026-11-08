@@ -192,6 +192,7 @@ def _doctor_dependencies() -> list[tuple[str, str, bool]]:
         "modelscope",
         "faster_whisper",
         "ctranslate2",
+        "langdetect",
     ]
     rows: list[tuple[str, str, bool]] = []
     for name in required:
@@ -256,6 +257,35 @@ def _doctor_models(cfg: Config) -> list[tuple[str, str, bool, str]]:
                 "权重齐全"
                 if not whisper_missing
                 else "可选：未下载（首次 /asr engine=whisper 时自动从 ModelScope 下载）"
+            ),
+        )
+    )
+
+    # 翻译（NLLB-200，可选能力）：权重缺失不影响启动，首次 /translate 会自动下载。
+    translate_dir = cfg.translate_dir / "nllb-200-distilled-600M"
+    translate_missing = _check_files(
+        translate_dir,
+        (
+            "config.json",
+            "sentencepiece.bpe.model",
+            "tokenizer.json",
+            "tokenizer_config.json",
+        ),
+    )[1]
+    if not any(
+        (translate_dir / name).is_file()
+        for name in ("model.safetensors", "pytorch_model.bin")
+    ):
+        translate_missing.append("pytorch_model.bin")
+    rows.append(
+        (
+            "NLLB-200 翻译",
+            str(translate_dir),
+            not translate_missing,
+            (
+                "权重齐全"
+                if not translate_missing
+                else "可选：未下载（首次 /translate 时自动从 ModelScope 下载）"
             ),
         )
     )
@@ -377,7 +407,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     for name, directory, ok, detail in _doctor_models(cfg):
         if ok:
             mark = OK
-        elif "htdemucs_ft" in name or "faster-whisper" in name or "fsmn-vad" in name:
+        elif (
+            "htdemucs_ft" in name
+            or "faster-whisper" in name
+            or "fsmn-vad" in name
+            or "NLLB" in name
+        ):
             # 可选组件：缺失只提示，不算问题、不增加警告（doctor 要能 0 警告）。
             mark = INFO
         else:
@@ -425,7 +460,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "       idle_unload: "
         f"tts={cfg.idle_unload}s asr={cfg.asr_idle_unload}s "
         f"whisper={cfg.whisper_idle_unload}s "
-        f"speaker={cfg.speaker_idle_unload}s separate={cfg.separate_idle_unload}s"
+        f"speaker={cfg.speaker_idle_unload}s separate={cfg.separate_idle_unload}s "
+        f"translate={cfg.translate_idle_unload}s"
+    )
+    print(
+        f"       翻译：nllb-200-distilled-600M fp16={'开' if cfg.translate_fp16 else '关'}"
+        f" beams={cfg.translate_num_beams} batch={cfg.translate_batch_size}"
     )
     print(f"       默认识别引擎：{cfg.asr_engine}；whisper 档位：{cfg.whisper_model}"
           f"（{cfg.whisper_device}/{cfg.whisper_compute}）")

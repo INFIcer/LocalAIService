@@ -74,6 +74,7 @@ ASR_ENGINES = ("sensevoice", "whisper")
 #: 请求里可用的 engine 取值；``auto`` 表示按「是否要时间戳 / 配置默认」决定。
 ASR_ENGINE_CHOICES = ("sensevoice", "whisper", "auto")
 
+
 #: faster-whisper 支持的档位（与 engine/whisper_engine.py 保持一致）。
 WHISPER_SIZES = ("tiny", "base", "small", "medium", "large-v3")
 
@@ -85,6 +86,23 @@ WHISPER_ESTIMATE_MB = {
     "medium": 1600,
     "large-v3": 3500,
 }
+
+# ---------------------------------------------------------------------------
+# 翻译（NLLB-200）
+# ---------------------------------------------------------------------------
+
+#: 单条翻译文本上限（字符）。
+TRANSLATE_MAX_TEXT = 5000
+#: 单批 texts 条数上限。
+TRANSLATE_BATCH_MAX = 500
+#: 单批 texts 总字符上限（200k）。
+TRANSLATE_BATCH_CHARS = 200_000
+#: 一次推理最多多少块（防止单条超长文本切出过多块）。
+TRANSLATE_MAX_CHUNKS = 2000
+#: 翻译引擎可选的实现名（目前只有 NLLB，保留 engine 字段便于以后扩展）。
+TRANSLATE_ENGINES = ("nllb",)
+#: NLLB-200-distilled-600M 的显存初始估算（MB）；之后由显存管家按实测校准。
+TRANSLATE_ESTIMATE_MB = 1500
 
 # ---------------------------------------------------------------------------
 # 人声分离

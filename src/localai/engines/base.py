@@ -129,6 +129,7 @@ class BaseAdapter(ABC):
             "whisper": self.cfg.whisper_idle_unload,
             "speaker": self.cfg.speaker_idle_unload,
             "separate": self.cfg.separate_idle_unload,
+            "translate": self.cfg.translate_idle_unload,
         }.get(self.name, 0)
 
     # ------------------------------------------------------------------

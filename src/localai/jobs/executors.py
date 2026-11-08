@@ -37,7 +37,14 @@ from ..constants import (
     TTS_MAX_TEXT,
 )
 from ..core.asr_engines import adapter_for, normalize_engine
-from ..core.errors import AsrBackendError, InsufficientVramError, SeparateBackendError
+from ..core.errors import (
+    AsrBackendError,
+    InsufficientVramError,
+    SeparateBackendError,
+    TranslateBackendError,
+)
+from ..core.translate import normalize_engine as normalize_translate_engine
+from ..core.translate import normalize_texts as normalize_translate_texts
 
 logger = logging.getLogger("localai.jobs.executors")
 
@@ -52,6 +59,7 @@ DEFAULT_ACTION = {
     "speaker": "speaker.identify",
     "separate": "separate.split",
     "media": "media.probe",
+    "translate": "translate.text",
 }
 
 #: 每种 kind 允许的 action。
@@ -61,6 +69,7 @@ KIND_ACTIONS = {
     "speaker": {"speaker.enroll", "speaker.identify", "speaker_for"},
     "separate": {"separate.split"},
     "media": {"media.probe", "media.to_wav", "media.frames", "media.audio"},
+    "translate": {"translate.text"},
 }
 
 _SPEAKER_OFF_VALUES = {"0", "false", "off", "no", "none", ""}
@@ -193,6 +202,36 @@ def prepare_payload(
             "timestamps": _flag(data.get("timestamps", False)),
             "source_format": file_path.suffix.lower(),
             "original_name": _text(data.get("original_name")) or file_path.name,
+        }
+
+    if kind == "translate":
+        if data.get("texts") is not None:
+            texts = normalize_translate_texts(data.get("texts"))
+        elif data.get("text") is not None:
+            texts = normalize_translate_texts(data.get("text"), single=True)
+        else:
+            raise ValueError("翻译任务缺少 texts（或 text）")
+        engine = normalize_translate_engine(data.get("engine"))
+        source = _text(data.get("source")) or "auto"
+        target = _text(data.get("target")) or "en"
+        try:
+            max_len = max(32, min(1024, int(data.get("max_len") or 400)))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"max_len 必须是整数：{data.get('max_len')!r}") from exc
+        try:
+            batch_size = max(
+                1,
+                min(64, int(data.get("batch_size") or cfg.translate_batch_size)),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"batch_size 必须是整数：{data.get('batch_size')!r}") from exc
+        return act, {
+            "texts": texts,
+            "source": source,
+            "target": target,
+            "engine": engine,
+            "max_len": max_len,
+            "batch_size": batch_size,
         }
 
     if kind == "separate":
@@ -443,6 +482,40 @@ async def _run_separate(payload: dict[str, Any], ctx: JobContext) -> dict[str, A
     }
 
 
+async def _run_translate(payload: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
+    """翻译任务：转发给 translate 适配器（懒加载 / 显存 LRU / 空闲卸载都由它管）。"""
+    adapter = ctx.registry.get("translate")
+    try:
+        outcome = await adapter.infer(
+            payload["texts"],
+            source=payload.get("source") or "auto",
+            target=payload.get("target") or "en",
+            batch_size=payload.get("batch_size"),
+            max_len=int(payload.get("max_len") or 400),
+        )
+    except (InsufficientVramError, TranslateBackendError):
+        raise
+    except Exception as exc:  # noqa: BLE001 - 统一成 503
+        raise TranslateBackendError(
+            f"NLLB 翻译失败：{type(exc).__name__}: {exc}",
+            detail=str(exc),
+        ) from exc
+
+    docs = outcome.get("docs") or []
+    return {
+        "ok": True,
+        "engine": outcome.get("engine") or "nllb",
+        "model": outcome.get("model"),
+        "source": outcome.get("source"),
+        "target": outcome.get("target"),
+        "texts": [doc.get("text") or "" for doc in docs],
+        "count": len(docs),
+        "chunks": outcome.get("chunks") or 0,
+        "elapsed_ms": outcome.get("elapsed_ms"),
+        "loaded": bool(outcome.get("loaded")),
+    }
+
+
 async def _run_speaker(
     action: str, payload: dict[str, Any], ctx: JobContext
 ) -> dict[str, Any]:
@@ -525,6 +598,8 @@ async def execute_job(job: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         return await _run_asr(payload, ctx)
     if kind == "separate":
         return await _run_separate(payload, ctx)
+    if kind == "translate":
+        return await _run_translate(payload, ctx)
     if kind == "speaker":
         return await _run_speaker(action, payload, ctx)
     if kind == "media":

@@ -9,6 +9,7 @@ VoiceNotFound           404     请求的音色不存在
 InsufficientVramError   507     显存不足（已按 LRU 腾过，仍不够）
 EngineBackendError      503     TTS 引擎加载/推理失败（部分参数错误为 400）
 AsrBackendError         503     ASR 引擎加载/识别失败
+TranslateBackendError   503     翻译引擎加载/推理失败（语言参数错误为 400）
 SpeakerBackendError     503     声纹引擎加载/计算失败（参数错误为 400）
 SeparateBackendError    503     人声分离引擎加载/推理失败
 ComfyError              502/504 ComfyUI 上游错误 / 等待超时
@@ -93,6 +94,13 @@ class AsrBackendError(LocalAIError):
 
     status_code = 503
     error_code = "asr_error"
+
+
+class TranslateBackendError(LocalAIError):
+    """翻译引擎加载/翻译失败；语言码不合法时用 400。"""
+
+    status_code = 503
+    error_code = "translate_error"
 
 
 class SpeakerBackendError(LocalAIError):

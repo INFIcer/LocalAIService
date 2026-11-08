@@ -576,20 +576,26 @@ def test_stats_fields_and_sync_endpoints_use_queue(tmp_path: Path) -> None:
         ):
             assert key in stats["scheduler"], key
         assert "aging_seconds" not in stats["scheduler"]
-        assert stats["scheduler"]["per_kind_parallel"] == {
-            "tts": 1,
-            "asr": 1,
-            "separate": 1,
-            "speaker": 1,
-            "media": 1,
+        per_kind = stats["scheduler"]["per_kind_parallel"]
+        # 翻译是新增能力；ASR 的实际并行度跟随配置（默认 2，可设 1）。
+        assert set(per_kind) == {
+            "tts",
+            "asr",
+            "separate",
+            "speaker",
+            "media",
+            "translate",
         }
+        assert per_kind["asr"] == cfg.asr_parallel_effective()
+        assert per_kind["translate"] == 1
         assert stats["scheduler"]["parallel_extra_mb"] == 600
         assert stats["by_kind"] == {"tts": 1, "asr": 1, "separate": 1}
         assert stats["avg_run_ms"] >= 0
 
         # /capabilities 里的 jobs 也换成新字段。
         caps = client.get("/capabilities").json()
-        assert caps["jobs"]["per_kind_parallel"]["asr"] == 1
+        assert caps["jobs"]["per_kind_parallel"]["asr"] == cfg.asr_parallel_effective()
+        assert caps["jobs"]["per_kind_parallel"]["translate"] == 1
         assert "aging_seconds" not in caps["jobs"]
 
         # /health 也带上队列信息。

@@ -63,3 +63,34 @@ class JobTtsRequest(TTSRequest):
     """POST /jobs/tts：TTS 参数 + 优先级。"""
 
     priority: int = 0
+
+
+class TranslateRequest(BaseModel):
+    """POST /translate：单条文本翻译。
+
+    长度/语言等业务校验在路由里做，保证超限返回 400 而不是 422。
+    """
+
+    text: str = Field(..., description="要翻译的文本（上限 5000 字）")
+    source: str = Field("auto", description="auto / zh / en / zho_Hans ...；auto 自动检测")
+    target: str = Field("en", description="目标语言：en / ja / eng_Latn ...")
+    engine: Optional[str] = Field("nllb", description="翻译引擎；目前只支持 nllb")
+    max_len: int = Field(400, ge=32, le=1024, description="每块最大 token 数")
+    batch_size: int = Field(8, ge=1, le=64, description="内部推理批大小")
+
+
+class TranslateBatchRequest(BaseModel):
+    """POST /translate/batch：一批文本翻译（内部批量推理）。"""
+
+    texts: list[str] = Field(..., description="待翻译文本列表（上限 500 条 / 20 万字）")
+    source: str = Field("auto", description="auto / zh / en / zho_Hans ...")
+    target: str = Field("en", description="目标语言")
+    engine: Optional[str] = Field("nllb", description="翻译引擎；目前只支持 nllb")
+    max_len: int = Field(400, ge=32, le=1024)
+    batch_size: int = Field(8, ge=1, le=64)
+
+
+class JobTranslateRequest(TranslateBatchRequest):
+    """POST /jobs/translate：超大批量进任务队列。"""
+
+    priority: int = 0
