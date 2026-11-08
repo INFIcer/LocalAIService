@@ -68,7 +68,7 @@ class WhisperAdapter(BaseAdapter):
                 "missing": [],
                 "loaded": False,
                 "load_seconds": None,
-                "model_dir": str(self.cfg.whisper_dir / size),
+                "model_dir": str(self.cfg.whisper_weights_dir(size)),
                 "model": f"faster-whisper-{size}",
                 "device": self.cfg.whisper_device,
                 "compute_type": self.cfg.whisper_compute,

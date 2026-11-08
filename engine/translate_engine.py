@@ -77,8 +77,9 @@ MODELS_ROOT = Path(
     os.environ.get("LOCALAI_TRANSLATE_DIR", str(SERVICE_ROOT / "models" / "nllb"))
 )
 
-#: 具体模型目录：``<MODELS_ROOT>/nllb-200-distilled-600M/``。
-MODEL_DIR = MODELS_ROOT / MODEL_ID
+#: 具体模型目录：adopt 的精确目录优先，否则 ``<MODELS_ROOT>/nllb-200-distilled-600M/``。
+_EXACT_MODEL_DIR = (os.environ.get("LOCALAI_TRANSLATE_MODEL_DIR") or "").strip()
+MODEL_DIR = Path(_EXACT_MODEL_DIR) if _EXACT_MODEL_DIR else (MODELS_ROOT / MODEL_ID)
 
 #: 安装日志：``<HOME>/logs/nllb_install.log``（每次尝试都追加）。
 LOGS_DIR = Path(os.environ.get("LOCALAI_LOGS_DIR", str(SERVICE_ROOT / "logs")))

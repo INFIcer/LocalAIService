@@ -2034,3 +2034,186 @@ curl.exe -s "http://127.0.0.1:7880/vision/frame?path=E:/LocalAIService/outputs/f
 - `agent` planner 的质量取决于小模型是否按协议输出 JSON；解析失败会退回
   `hybrid` 的确定性补抽，不会卡死。
 - 一次最多 10 张关键帧、12 轮；超过请分多次或先缩小视频区间。
+
+---
+
+## 16. 模型发现与采用（v2.5 新增）
+
+目标：用户机器上已经有模型（本服务的旧目录、ComfyUI 的 `models/`、别处下载的
+faster-whisper 等）时，不必重复下载。服务只做两件事：
+
+1. **只读扫描**：按文件名签名 + 大小区间 + 首尾 8MB 抽样哈希识别；
+2. **配置指向**：采用时只把目录写进本服务的 `config.json`，让引擎下次从该目录加载。
+
+> 不移动、不复制、不删除用户文件，**不创建 junction / symlink**。
+> 程序默认搜索路径是**空列表**；本机目录由调用方运行时添加，不写死在代码里。
+
+### 16.1 搜索路径
+
+```http
+GET /admin/models/search-paths
+```
+
+```json
+{"ok": true, "paths": [], "count": 0, "source": "config"}
+```
+
+`source` 为 `env` 表示启动时被 `LOCALAI_MODEL_SEARCH_PATHS` 覆盖（Windows 用
+`;` 分隔；也接受 `os.pathsep`）。
+
+修改支持两种写法（二选一）：
+
+```http
+PUT /admin/models/search-paths
+Content-Type: application/json
+
+{"paths": ["D:\\models", "E:\\ComfyUI\\models"]}
+```
+
+```json
+{"add": "D:\\models"}
+{"remove": "D:\\models"}
+```
+
+- 路径必须存在、是目录且可读，否则 400；
+- 自动转绝对路径、去重，最多 20 个；
+- 返回最新生效列表；如果该项由环境变量覆盖，会带 `warnings`，并仍以环境变量为准。
+- 设置页也能看到 `model_search_paths`（只读展示，由模型页管理）。
+
+### 16.2 后台扫描
+
+```http
+POST /admin/models/scan
+Content-Type: application/json
+
+{"paths": ["D:\\models"], "max_depth": 6}
+```
+
+`paths` 省略时使用已保存的搜索路径；空列表返回 400（提示先配置），不会默认扫全盘。
+同一时刻只允许一个扫描任务（再次提交返回 409）。
+
+```json
+{"ok": true, "task_id": "a1b2c3d4e5f6", "paths": ["D:\\models"], "max_depth": 6}
+```
+
+```http
+GET /admin/models/scan/{task_id}
+```
+
+```json
+{
+  "ok": true,
+  "task_id": "a1b2c3d4e5f6",
+  "status": "done",
+  "progress": {"visited_dirs": 26, "visited_files": 163, "matches": 12},
+  "result": {
+    "matches": [
+      {
+        "capability": "whisper",
+        "capability_title": "faster-whisper",
+        "model": "small",
+        "path": "E:\\LocalAIService\\models\\whisper\\small",
+        "size_mb": 463.7,
+        "files_found": ["model.bin", "config.json", "tokenizer.json", "vocabulary.txt"],
+        "missing": [],
+        "confidence": "exact",
+        "version_hint": "small",
+        "matched_by": "filename+size",
+        "hash_verified": true,
+        "detail": ""
+      }
+    ],
+    "errors": [],
+    "stats": {
+      "roots": ["E:\\LocalAIService\\models"],
+      "visited_dirs": 26,
+      "visited_files": 163,
+      "matches": 12,
+      "max_depth": 6,
+      "elapsed_seconds": 0.21,
+      "truncated": false
+    }
+  }
+}
+```
+
+- 跳过隐藏目录、`__pycache__`、`.git`、`node_modules`、`venv`、`site-packages`、
+  `hf_cache` 等噪音/辅助目录；不进入 junction / 符号链接，另有 realpath 集合防环；
+- `max_depth` 0–12（默认 6）；默认 `max_files=200000`、`timeout_sec=300`，
+  超出会提前结束并置 `truncated=true`，错误写进 `errors`；
+- 目录签名缓存 10 分钟（键含目录 mtime 与规则版本）。
+
+### 16.3 签名与置信度
+
+| 能力 | 关键签名文件 |
+| --- | --- |
+| TTS | `gpt.pth` + `s2mel.pth` + `codec.pth`（+ `config.yaml`） |
+| ASR | `model.pt` + `tokens.json` + `am.mvn` + `config.yaml` + BPE 模型 |
+| faster-whisper | `model.bin` + `config.json` + `tokenizer.json` + `vocabulary.txt` |
+| 翻译 | `config.json` + `tokenizer.json` + `sentencepiece.bpe.model` + 权重 |
+| 声纹 | `campplus_cn_common.bin` + `config.yaml` |
+| Demucs | 已知哈希名的 `.th` + 对应 `htdemucs*.yaml` |
+| VAD | `fsmn-vad` 目录下的 `model.pt` + `config.yaml` |
+| 视觉 | `*Qwen2.5-VL*.gguf`（或 >1.5GB 主 GGUF）+ `mmproj*.gguf` |
+
+- `exact`：签名文件齐全、主文件大小落在已知区间；若有已知样本哈希，抽样哈希也一致；
+- `partial`：缺签名文件、主文件大小明显不符，或抽样哈希与已知样本不一致；
+  `missing` 会列出缺什么，`detail` 给出原因。`partial` 仍可展示，采用时会拒绝缺文件者；
+- `matched_by=filename` / `filename+size` 说明判定依据；`hash_verified` 为
+  `true/false/null`（未算/无已知样本）。
+- 哈希只读文件首 8MB + 尾 8MB，不联网、不写用户目录。
+
+### 16.4 采用（配置指向）
+
+```http
+POST /admin/models/adopt
+Content-Type: application/json
+
+{"capability": "whisper", "path": "D:\\models\\faster-whisper-small", "name": "small"}
+```
+
+返回：
+
+```json
+{
+  "ok": true,
+  "capability": "whisper",
+  "model": "small",
+  "name": "small",
+  "path": "D:\\models\\faster-whisper-small",
+  "config_key": "whisper_model_dirs",
+  "value": "D:\\models\\faster-whisper-small",
+  "config_value": {"small": "D:\\models\\faster-whisper-small"},
+  "requires_restart": false,
+  "warnings": [],
+  "note": "已把 faster-whisper 指向 ... 下次加载使用新路径；如果该能力已有模型加载，请先卸载或等空闲卸载。未移动、复制或删除任何用户文件。"
+}
+```
+
+配置键映射：
+
+| capability | config.json 键 | 说明 |
+| --- | --- | --- |
+| `tts` | `tts_model_dir` | IndexTTS 权重目录 |
+| `asr` | `asr_model_dir` | SenseVoiceSmall 目录 |
+| `whisper` | `whisper_model_dirs` | 按档位映射；请求里的 `name` 必填或可从目录名推断 |
+| `translate` | `translate_model_dir` | 直接指向 NLLB 权重目录（不再拼模型名） |
+| `speaker` | `speaker_model_dir` | campplus 目录 |
+| `separate` | `demucs_repo` | 存放 `.th` 与 yaml 的目录 |
+| `vision` | `vision_model_dir` | GGUF + mmproj + llama-server 目录 |
+| `vad` | `vad_model_dir` | fsmn-vad 目录 |
+
+- 采用前会再校验一遍签名；缺文件返回 400，不写配置；
+- 只原子写 `<LOCALAI_HOME>/config.json`，文件里其它未知键原样保留；
+- 环境变量优先级仍是 **env > config.json > 默认值**；被 env 覆盖时会写入配置但给出 warning；
+- `requires_restart` 通常为 `false`：未加载的能力下次加载即用新路径；已加载的模型
+  不会被强制打断，提示“先卸载或等空闲卸载”。视觉引擎每次读取环境变量，天然热切。
+- 采用后 `/admin/models` 的 `path` 会立即反映新目录（文件仍在原处，服务只是指向它）。
+
+### 16.5 默认行为
+
+- 全新安装/换机器：`GET /admin/models/search-paths` 返回 `[]`；
+  `POST /admin/models/scan` 不带 `paths` 返回 400，**不会**默认扫描 `C:\`、`D:\`
+  或任何写死目录；
+- 启动仍是 0 模型；扫描和采用都不加载权重；
+- `localai doctor` 会打印搜索路径来源与每个路径是否可用；为空时只给提示，不算警告。

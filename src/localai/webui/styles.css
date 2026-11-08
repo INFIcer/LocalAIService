@@ -280,6 +280,47 @@ td.empty, .empty { color: var(--faint); text-align: center; padding: 18px; font-
 .actions { display: flex; gap: 6px; flex-wrap: wrap; }
 .task-progress { margin-top: 9px; }
 
+/* ---------------- 已有模型发现 ---------------- */
+.discovery-panel { border-color: rgba(77, 163, 255, 0.2); }
+.discovery-hint { margin: -4px 0 12px; }
+.search-path-list {
+  display: flex; flex-direction: column; gap: 7px;
+  margin-bottom: 10px;
+}
+.search-path-list .empty {
+  border: 1px dashed var(--line); border-radius: 9px;
+  padding: 14px; text-align: left;
+}
+.search-path-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 9px;
+  background: #101827;
+}
+.search-path-text {
+  flex: 1 1 auto; min-width: 0;
+  font-family: var(--mono); font-size: 11.5px;
+  color: #c8d8ec; word-break: break-all;
+}
+.search-path-add { display: flex; gap: 9px; flex-wrap: wrap; margin-bottom: 13px; }
+.search-path-add input { flex: 1 1 280px; }
+.scan-toolbar {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding-top: 12px; border-top: 1px solid var(--line-soft);
+}
+.scan-toolbar input[type="number"] { width: 72px; }
+.scan-table { margin-top: 12px; }
+.scan-table .path { max-width: 430px; }
+.scan-errors { margin-top: 10px; }
+.scan-errors summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+.readonly-value {
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.65;
+  color: #c8d8ec; word-break: break-all;
+  background: #0d1420; border: 1px solid var(--line-soft);
+  border-radius: 8px; padding: 8px 10px;
+}
+
 /* ---------------- 设置 ---------------- */
 .settings-group { margin-bottom: 16px; }
 .setting-row {
@@ -493,6 +534,9 @@ body.modal-open { overflow: hidden; }
   .topbar { flex-direction: column; }
   .top-actions { justify-content: flex-start; }
   .setting-row { grid-template-columns: 1fr; gap: 8px; }
+  .search-path-add { flex-direction: column; }
+  .search-path-add button { width: 100%; }
+  .scan-toolbar { align-items: flex-start; }
 }
 @media (max-width: 520px) {
   .cap-grid { grid-template-columns: 1fr; }

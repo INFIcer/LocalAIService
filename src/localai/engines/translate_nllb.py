@@ -72,7 +72,7 @@ class TranslateAdapter(BaseAdapter):
                 "missing": [],
                 "loaded": False,
                 "load_seconds": None,
-                "model_dir": str(self.cfg.translate_dir / self.model_name),
+                "model_dir": str(self.cfg.translate_weight_dir),
                 "model": self.model_name,
             }
 

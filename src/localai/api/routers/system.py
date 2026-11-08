@@ -209,7 +209,7 @@ async def capabilities(request: Request) -> dict[str, Any]:
                 "model": cfg.whisper_model,
                 "device": cfg.whisper_device,
                 "compute_type": cfg.whisper_compute,
-                "weights_dir": str(cfg.whisper_dir / cfg.whisper_model),
+                "weights_dir": str(cfg.whisper_weights_dir(cfg.whisper_model)),
                 "idle_unload_seconds": cfg.whisper_idle_unload,
             },
         },
@@ -252,7 +252,7 @@ async def capabilities(request: Request) -> dict[str, Any]:
         "translate": {
             "engine": "nllb",
             "model": "nllb-200-distilled-600M",
-            "weights_dir": str(cfg.translate_dir / "nllb-200-distilled-600M"),
+            "weights_dir": str(cfg.translate_weight_dir),
             "idle_unload_seconds": cfg.translate_idle_unload,
             "fp16": cfg.translate_fp16,
             "num_beams": cfg.translate_num_beams,

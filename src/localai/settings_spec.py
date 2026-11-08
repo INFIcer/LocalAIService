@@ -31,6 +31,7 @@ GROUP_TITLES: dict[str, str] = {
     "tts": "TTS",
     "asr": "ASR",
     "translate": "翻译",
+    "models": "模型发现",
     "media": "媒体",
 }
 
@@ -344,6 +345,20 @@ SETTINGS: tuple[Setting, ...] = (
         description="ffmpeg.exe 的完整路径；留空表示按「本机默认路径 → PATH」自动探测。",
         allow_empty=True,
     ),
+    # ---- 模型发现 -----------------------------------------------------
+    Setting(
+        key="model_search_paths",
+        group="models",
+        title="模型搜索路径",
+        type="list",
+        default=[],
+        env=("LOCALAI_MODEL_SEARCH_PATHS",),
+        description=(
+            "扫描已有模型时使用的目录（递归），默认空；由「模型」页管理。"
+            "只读扫描，不会移动、复制或建链接。"
+        ),
+        allow_empty=True,
+    ),
 )
 
 #: 键 -> 定义。
@@ -401,6 +416,23 @@ def coerce_value(item: Setting, raw: Any) -> Any:
                 return None
             raise ValueError(f"{item.title}（{item.key}）不能为空")
         return value
+
+    if item.type == "list":
+        if raw is None:
+            return []
+        if isinstance(raw, str):
+            parts = [
+                part.strip()
+                for part in raw.replace(os.pathsep, ";").split(";")
+                if part.strip()
+            ]
+        elif isinstance(raw, (list, tuple, set)):
+            parts = [str(part).strip() for part in raw if str(part).strip()]
+        else:
+            raise ValueError(f"{item.title}（{item.key}）必须是字符串列表")
+        if len(parts) > 20:
+            raise ValueError(f"{item.title}（{item.key}）最多 20 个路径")
+        return parts
 
     # str
     if raw is None:

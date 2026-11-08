@@ -244,7 +244,7 @@ def _doctor_models(cfg: Config) -> list[tuple[str, str, bool, str]]:
     )
 
     # faster-whisper（可选第二识别引擎）：权重缺失不影响启动，首次请求会自动下载。
-    whisper_dir = cfg.whisper_dir / cfg.whisper_model
+    whisper_dir = cfg.whisper_weights_dir(cfg.whisper_model)
     whisper_missing = _check_files(
         whisper_dir, ("model.bin", "config.json", "tokenizer.json", "vocabulary.txt")
     )[1]
@@ -262,7 +262,7 @@ def _doctor_models(cfg: Config) -> list[tuple[str, str, bool, str]]:
     )
 
     # 翻译（NLLB-200，可选能力）：权重缺失不影响启动，首次 /translate 会自动下载。
-    translate_dir = cfg.translate_dir / "nllb-200-distilled-600M"
+    translate_dir = cfg.translate_weight_dir
     translate_missing = _check_files(
         translate_dir,
         (
@@ -502,6 +502,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         else:
             print(f"       {WARN} {cfg.host}:{cfg.port} 被占用，且 /health 无响应")
             warnings += 1
+
+    print(f"\n{INFO} 模型搜索路径")
+    if cfg.model_search_paths:
+        source = "环境变量" if cfg.env_overrides.get("model_search_paths") else "config.json"
+        print(f"       {INFO} 来源：{source}（{len(cfg.model_search_paths)} 个）")
+        for path in cfg.model_search_paths:
+            mark = OK if Path(path).is_dir() else INFO
+            suffix = "" if Path(path).is_dir() else "（当前不可用）"
+            print(f"       {mark} {path}{suffix}")
+    else:
+        print(
+            f"       {INFO} 未配置（默认空）：可在 /ui 的「模型」页添加已有模型目录；"
+            "程序不会预置任何本机路径"
+        )
 
     print(f"\n{INFO} 配置提示")
     print(f"       LOCALAI_VRAM_MARGIN_MB={cfg.vram_margin_mb}")

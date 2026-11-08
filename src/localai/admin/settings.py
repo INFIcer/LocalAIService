@@ -54,6 +54,8 @@ def _item_value(item: Any, cfg: Config) -> Any:
         return str(cfg.ffmpeg) if cfg.ffmpeg else ""
     if item.key == "asr_parallel":
         return cfg.asr_parallel_effective()
+    if item.type == "list":
+        return list(getattr(cfg, item.key, item.default) or [])
     return getattr(cfg, item.key, item.default)
 
 
@@ -83,6 +85,9 @@ def settings_snapshot(cfg: Config) -> dict[str, Any]:
                 "secret": item.secret,
                 "env": list(item.env),
             }
+            if item.type == "list":
+                entry["readonly"] = True
+                entry["count"] = len(value or [])
             if item.min is not None:
                 entry["min"] = item.min
             if item.max is not None:
@@ -138,6 +143,8 @@ def _apply_runtime(cfg: Config, item_key: str, value: Any) -> None:
             cfg.ffmpeg_source = "missing"
     elif item_key == "token":
         cfg.token = str(value or "")
+    elif BY_KEY.get(item_key) is not None and BY_KEY[item_key].type == "list":
+        setattr(cfg, item_key, list(value or []))
     else:
         setattr(cfg, item_key, value)
 

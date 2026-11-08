@@ -13,6 +13,11 @@ const state = {
   settingsOriginal: {},
   downloadTask: null,
   downloadTimer: null,
+  searchPaths: [],
+  scanTask: null,
+  scanTimer: null,
+  scanResult: null,
+  scanRunning: false,
   jobs: [],
   system: null,
   restartPolling: false,
@@ -391,9 +396,233 @@ function renderRecentLogs(log) {
 /* 模型                                                               */
 /* ------------------------------------------------------------------ */
 async function loadModels() {
-  const data = await api("/admin/models");
+  const [data, pathData] = await Promise.all([
+    api("/admin/models"),
+    api("/admin/models/search-paths"),
+  ]);
   state.models = data.models || [];
+  state.searchPaths = pathData.paths || [];
   renderModels();
+  renderSearchPaths();
+  if (state.scanResult) renderScanResults(state.scanResult);
+}
+
+/* ------------------------- 已有模型发现 ------------------------- */
+function renderSearchPaths() {
+  const list = $("#search-paths-list");
+  if (!list) return;
+  const paths = state.searchPaths || [];
+  $("#search-paths-count").textContent = `${paths.length} 个路径`;
+  if (!paths.length) {
+    list.innerHTML = '<div class="empty">尚未配置，添加你已有的模型目录，例如 ComfyUI 的 models 目录</div>';
+    return;
+  }
+  list.innerHTML = paths.map((path) => `
+    <div class="search-path-item">
+      <span class="search-path-text" title="${escapeHtml(path)}">${escapeHtml(path)}</span>
+      <button class="small ghost" type="button" data-remove-path="${escapeHtml(path)}">移除</button>
+    </div>`).join("");
+  $$("#search-paths-list [data-remove-path]").forEach((button) => {
+    button.addEventListener("click", () => removeSearchPath(button.dataset.removePath));
+  });
+}
+
+async function addSearchPath() {
+  const input = $("#search-path-input");
+  const value = (input.value || "").trim();
+  if (!value) {
+    toast("请先填写目录路径", "error");
+    input.focus();
+    return;
+  }
+  const button = $("#search-path-add");
+  button.disabled = true;
+  try {
+    const data = await api("/admin/models/search-paths", {
+      method: "PUT",
+      body: JSON.stringify({ add: value }),
+    });
+    state.searchPaths = data.paths || [];
+    input.value = "";
+    renderSearchPaths();
+    toast(`已添加搜索路径（共 ${data.count} 个）`, "ok");
+    if (data.warnings && data.warnings.length) toast(data.warnings.join("；"), "error", 7000);
+  } catch (err) {
+    toast(`添加失败：${err.message || String(err)}`, "error", 7000);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function removeSearchPath(path) {
+  try {
+    const data = await api("/admin/models/search-paths", {
+      method: "PUT",
+      body: JSON.stringify({ remove: path }),
+    });
+    state.searchPaths = data.paths || [];
+    renderSearchPaths();
+    toast("已移除搜索路径", "ok");
+  } catch (err) {
+    toast(`移除失败：${err.message || String(err)}`, "error", 7000);
+  }
+}
+
+async function startScan() {
+  if (!state.searchPaths.length) {
+    toast("请先添加模型搜索路径，再用「扫描已有模型」", "error");
+    return;
+  }
+  const depthInput = $("#scan-depth");
+  let depth = Number(depthInput.value);
+  if (!Number.isInteger(depth) || depth < 0 || depth > 12) {
+    toast("递归深度必须是 0–12 的整数", "error");
+    depthInput.focus();
+    return;
+  }
+  const button = $("#scan-start");
+  button.disabled = true;
+  button.textContent = "扫描中…";
+  state.scanResult = null;
+  state.scanRunning = true;
+  $("#scan-result").classList.add("hidden");
+  $("#scan-progress").textContent = "正在启动扫描…";
+  try {
+    const data = await api("/admin/models/scan", {
+      method: "POST",
+      body: JSON.stringify({ paths: state.searchPaths, max_depth: depth }),
+    });
+    state.scanTask = data.task_id;
+    pollScan();
+  } catch (err) {
+    state.scanRunning = false;
+    button.disabled = false;
+    button.textContent = "扫描已有模型";
+    $("#scan-progress").textContent = "";
+    toast(`扫描启动失败：${err.message || String(err)}`, "error", 7000);
+  }
+}
+
+async function pollScan() {
+  clearTimeout(state.scanTimer);
+  if (!state.scanTask) return;
+  try {
+    const data = await api(`/admin/models/scan/${encodeURIComponent(state.scanTask)}`);
+    const progress = data.progress || {};
+    if (data.status === "running") {
+      $("#scan-progress").textContent =
+        `扫描中：已访问 ${progress.visited_dirs || 0} 个目录 / ${progress.visited_files || 0} 个文件，` +
+        `命中 ${progress.matches || 0} 个`;
+      state.scanTimer = setTimeout(pollScan, 700);
+      return;
+    }
+    state.scanRunning = false;
+    state.scanTask = null;
+    $("#scan-start").disabled = false;
+    $("#scan-start").textContent = "扫描已有模型";
+    if (data.status === "failed") {
+      $("#scan-progress").textContent = "扫描失败";
+      state.scanResult = { status: "failed", error: data.error, stats: {}, matches: [], errors: [] };
+      renderScanResults(state.scanResult);
+      toast(`扫描失败：${data.error || "未知错误"}`, "error", 8000);
+      return;
+    }
+    const result = data.result || {};
+    state.scanResult = {
+      status: "done",
+      matches: result.matches || [],
+      errors: result.errors || [],
+      stats: result.stats || {},
+    };
+    const stats = state.scanResult.stats;
+    $("#scan-progress").textContent =
+      `完成：${stats.visited_dirs || 0} 个目录 / ${stats.visited_files || 0} 个文件，` +
+      `${(state.scanResult.matches || []).length} 个命中，用时 ${stats.elapsed_seconds || 0} 秒`;
+    renderScanResults(state.scanResult);
+  } catch (err) {
+    state.scanRunning = false;
+    state.scanTask = null;
+    $("#scan-start").disabled = false;
+    $("#scan-start").textContent = "扫描已有模型";
+    $("#scan-progress").textContent = "";
+    toast(`扫描状态读取失败：${err.message || String(err)}`, "error", 7000);
+  }
+}
+
+function confidencePill(value) {
+  return value === "exact"
+    ? '<span class="pill ok">exact</span>'
+    : '<span class="pill warn">partial</span>';
+}
+
+function renderScanResults(data) {
+  const box = $("#scan-result");
+  if (!box) return;
+  box.classList.remove("hidden");
+  if (data.status === "failed") {
+    box.innerHTML = `<div class="banner error">扫描失败：${escapeHtml(data.error || "未知错误")}</div>`;
+    return;
+  }
+  const matches = data.matches || [];
+  const stats = data.stats || {};
+  if (!matches.length) {
+    box.innerHTML = `<div class="empty">没有找到可识别的模型。已扫描 ${stats.visited_dirs || 0} 个目录；` +
+      `可尝试把搜索路径指到模型根目录，或调大递归深度。</div>`;
+    return;
+  }
+  const rows = matches.map((item, index) => {
+    const missing = (item.missing || []).length
+      ? `<div class="missing">缺：${escapeHtml(item.missing.join("、"))}</div>`
+      : "";
+    const detail = item.detail ? `<div class="hint">${escapeHtml(item.detail)}</div>` : "";
+    return `
+      <tr>
+        <td>${escapeHtml(item.capability_title || item.capability)}<div class="path">${escapeHtml(item.capability)}</div></td>
+        <td><div class="model-name">${escapeHtml(item.model)}</div><div class="hint">${escapeHtml(item.version_hint || "")}</div></td>
+        <td><div class="path">${escapeHtml(item.path)}</div>${missing}${detail}</td>
+        <td>${escapeHtml(fmtMb(item.size_mb))}</td>
+        <td>${confidencePill(item.confidence)}<div class="hint">${escapeHtml(item.matched_by || "")}</div></td>
+        <td><button class="small primary" type="button" data-adopt-index="${index}">使用这个</button></td>
+      </tr>`;
+  }).join("");
+  const errors = (data.errors || []).length
+    ? `<details class="scan-errors"><summary>${data.errors.length} 个扫描错误/提示</summary>` +
+      `<pre class="log-box small">${escapeHtml(data.errors.map((item) => `${item.path}: ${item.error}`).join("\n"))}</pre></details>`
+    : "";
+  box.innerHTML = `
+    <div class="table-wrap"><table class="model-table scan-table">
+      <thead><tr><th>能力</th><th>模型</th><th>路径 / 缺失</th><th>大小</th><th>置信度</th><th>操作</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+    ${errors}`;
+  $$("#scan-result [data-adopt-index]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const item = matches[Number(button.dataset.adoptIndex)];
+      if (item) adoptScannedModel(item, button);
+    });
+  });
+}
+
+async function adoptScannedModel(item, button) {
+  const body = { capability: item.capability, path: item.path };
+  if (item.capability === "whisper" && item.model && item.model !== "unknown") {
+    body.name = item.model;
+  }
+  button.disabled = true;
+  button.textContent = "指向中…";
+  try {
+    const data = await api("/admin/models/adopt", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    toast(data.note || `已指向 ${item.path}`, "ok", 8000);
+    if (data.warnings && data.warnings.length) toast(data.warnings.join("；"), "error", 8000);
+    await loadModels();
+  } catch (err) {
+    button.disabled = false;
+    button.textContent = "使用这个";
+    toast(`采用失败：${err.message || String(err)}`, "error", 8000);
+  }
 }
 
 function modelActionButtons(item) {
@@ -566,7 +795,7 @@ function settingTags(item) {
   const labels = { env: "来源 env", file: "来源 file", default: "来源 default" };
   tags.push(`<span class="tag ${item.source}">${labels[item.source] || item.source}</span>`);
   if (item.requires_restart) tags.push('<span class="tag restart">需重启</span>');
-  if (item.default !== null && item.default !== undefined && item.default !== "" && item.type !== "path") {
+  if (item.default !== null && item.default !== undefined && item.default !== "" && item.type !== "path" && item.type !== "list") {
     const def = item.type === "bool" ? (item.default ? "true" : "false") : item.default;
     tags.push(`<span class="tag default">默认 ${escapeHtml(def)}</span>`);
   }
@@ -577,6 +806,12 @@ function settingTags(item) {
 function settingControl(item) {
   const key = escapeHtml(item.key);
   const value = item.value;
+  if (item.type === "list") {
+    const paths = Array.isArray(value) ? value : [];
+    return `<div class="readonly-value">${
+      paths.length ? paths.map((path) => `<div>${escapeHtml(path)}</div>`).join("") : '<span class="faint">尚未配置（由「模型」页管理）</span>'
+    }</div>`;
+  }
   if (item.secret) {
     return `<input data-setting-key="${key}" type="password" autocomplete="new-password" value="" placeholder="${item.enabled ? "已设置（留空不修改）" : "留空表示不鉴权"}">`;
   }
@@ -609,7 +844,7 @@ function renderSettings(data) {
           <div class="setting-meta">${settingTags(item)}</div>
         </div>
         <div class="setting-control">${settingControl(item)}</div>
-        <div class="hint">${item.source === "env" ? "环境变量优先" : item.requires_restart ? "重启后生效" : "保存即生效"}</div>
+        <div class="hint">${item.readonly ? "由模型页管理" : item.source === "env" ? "环境变量优先" : item.requires_restart ? "重启后生效" : "保存即生效"}</div>
       </div>`).join("");
     return `<div class="panel settings-group">
       <div class="panel-head"><h2>${escapeHtml(group.title)}</h2><span class="pill muted">${escapeHtml(group.group)}</span></div>
@@ -1518,6 +1753,14 @@ function bindEvents() {
   });
 
   $("#models-refresh").addEventListener("click", () => loadModels().catch((err) => toast(err.message, "error")));
+  $("#search-path-add").addEventListener("click", addSearchPath);
+  $("#search-path-input").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      addSearchPath();
+    }
+  });
+  $("#scan-start").addEventListener("click", startScan);
   $("#settings-reload").addEventListener("click", () => loadSettings().catch((err) => toast(err.message, "error")));
   $("#settings-save").addEventListener("click", saveSettings);
   $("#jobs-refresh").addEventListener("click", () => loadJobs().catch((err) => toast(err.message, "error")));

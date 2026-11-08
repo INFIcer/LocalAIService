@@ -18,6 +18,14 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from ...admin.discovery import (
+    DiscoveryError,
+    ModelScanner,
+    ScanBusy,
+    adopt_model,
+    search_path_snapshot,
+    update_search_paths,
+)
 from ...admin.models import (
     DownloadBusy,
     DownloadError,
@@ -62,6 +70,25 @@ class ModelDownloadRequest(BaseModel):
 class ModelActivateRequest(BaseModel):
     capability: str = Field(..., description="whisper / asr / translate")
     name: str = Field("", description="要切换到的档位或引擎名")
+
+
+class SearchPathsUpdateRequest(BaseModel):
+    """整体替换 ``paths``，或按 ``add`` / ``remove`` 增删，二者只能选一种。"""
+
+    paths: Optional[list[str]] = Field(None, description="新的完整搜索路径列表")
+    add: Optional[str | list[str]] = Field(None, description="要追加的一个或多个目录")
+    remove: Optional[str | list[str]] = Field(None, description="要移除的一个或多个目录")
+
+
+class ModelScanRequest(BaseModel):
+    paths: Optional[list[str]] = Field(None, description="省略则使用已保存的搜索路径")
+    max_depth: int = Field(6, ge=0, le=12, description="递归深度，默认 6")
+
+
+class ModelAdoptRequest(BaseModel):
+    capability: str = Field(..., description="tts/asr/whisper/translate/speaker/separate/vision/vad")
+    path: str = Field(..., description="已有模型所在目录（只读校验后写配置）")
+    name: str = Field("", description="whisper 档位；其它能力可留空")
 
 
 class AutostartRequest(BaseModel):
@@ -189,6 +216,65 @@ async def get_models(request: Request) -> dict[str, Any]:
         "models_root": str(cfg.home / "models"),
         "models": items,
     }
+
+
+@router.get("/models/search-paths", summary="读取已有模型的搜索路径（默认空）")
+async def get_model_search_paths(request: Request) -> dict[str, Any]:
+    return search_path_snapshot(get_cfg(request))
+
+
+@router.put("/models/search-paths", summary="保存搜索路径（校验存在/去重/最多 20 个）")
+async def put_model_search_paths(
+    payload: SearchPathsUpdateRequest, request: Request
+) -> dict[str, Any]:
+    cfg = get_cfg(request)
+    fields = payload.model_fields_set
+    try:
+        return update_search_paths(
+            cfg,
+            paths=payload.paths if "paths" in fields else None,
+            add=payload.add if "add" in fields else None,
+            remove=payload.remove if "remove" in fields else None,
+        )
+    except DiscoveryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/models/scan", summary="后台扫描已有模型目录（只读）")
+async def start_model_scan(payload: ModelScanRequest, request: Request) -> dict[str, Any]:
+    scanner: ModelScanner = request.app.state.model_scanner
+    try:
+        return scanner.start(
+            get_cfg(request), payload.paths, max_depth=payload.max_depth
+        )
+    except DiscoveryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ScanBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/models/scan/{task_id}", summary="查看模型扫描进度与结果")
+async def model_scan_status(task_id: str, request: Request) -> dict[str, Any]:
+    scanner: ModelScanner = request.app.state.model_scanner
+    snapshot = scanner.status(task_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail=f"扫描任务不存在：{task_id}")
+    return snapshot
+
+
+@router.post("/models/adopt", summary="采用已有模型（只写 config.json，建链接/不复制）")
+async def adopt_existing_model(
+    payload: ModelAdoptRequest, request: Request
+) -> dict[str, Any]:
+    try:
+        return adopt_model(
+            get_cfg(request),
+            payload.capability,
+            payload.path,
+            name=payload.name,
+        )
+    except DiscoveryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/models/download", summary="异步下载模型（同一时刻只允许一个任务）")

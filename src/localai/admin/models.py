@@ -149,7 +149,7 @@ def _files_size_mb(directory: Path, names: tuple[str, ...] | list[str]) -> float
 
 
 def _translate_dir(cfg: Config) -> Path:
-    return cfg.translate_dir / "nllb-200-distilled-600M"
+    return cfg.translate_weight_dir
 
 
 def _item(
@@ -222,7 +222,7 @@ def model_catalog(cfg: Config) -> list[dict[str, Any]]:
 
     # ---- faster-whisper（每档一行，方便单独下载/切换） -----------------
     for size in WHISPER_SIZES:
-        target = cfg.whisper_dir / size
+        target = cfg.whisper_weights_dir(size)
         _, missing = _check_files(target, WHISPER_REQUIRED)
         items.append(
             _item(
@@ -442,7 +442,7 @@ class ModelDownloader:
                 raise DownloadError(
                     f"whisper 档位必须是：{', '.join(WHISPER_SIZES)}（收到 {name!r}）"
                 )
-            return cap, lower, cfg.whisper_dir / lower
+            return cap, lower, cfg.whisper_weights_dir(lower)
 
         if cap == "asr":
             if lower not in ("", "sensevoice", "sensevoicesmall"):
@@ -586,7 +586,7 @@ def _missing_after(cfg: Config, capability: str, name: str) -> list[str]:
     if capability == "asr":
         return _check_files(cfg.asr_model_dir, MODEL_SPECS["asr"]["required"])[1]
     if capability == "whisper":
-        return _check_files(cfg.whisper_dir / name, WHISPER_REQUIRED)[1]
+        return _check_files(cfg.whisper_weights_dir(name), WHISPER_REQUIRED)[1]
     if capability == "translate":
         missing = _check_files(_translate_dir(cfg), TRANSLATE_MODEL_FILES)[1]
         target = _translate_dir(cfg)

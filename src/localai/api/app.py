@@ -23,6 +23,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from .. import __version__
+from ..admin.discovery import ModelScanner
 from ..admin.models import ModelDownloader
 from ..config import Config, ensure_directories, get_config
 from ..core.errors import (
@@ -135,7 +136,7 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
         logger.info("翻译引擎：%s", translate_status["detail"])
         logger.info(
             "翻译模型目录：%s（首次 /translate 请求时加载；空闲 %ds 卸载）",
-            translate_status.get("model_dir") or cfg.translate_dir,
+            translate_status.get("model_dir") or cfg.translate_weight_dir,
             cfg.translate_idle_unload,
         )
 
@@ -231,6 +232,7 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
     app.state.started_at = datetime.now().astimezone().isoformat(timespec="seconds")
     # 管理界面的模型下载任务管理器（单例；同一时刻只跑一个下载）。
     app.state.model_downloader = ModelDownloader()
+    app.state.model_scanner = ModelScanner()
     app.state.restart_task = None
 
     # ------------------------------------------------------------------

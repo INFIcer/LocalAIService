@@ -46,6 +46,10 @@
     LOCALAI_TRANSLATE_BATCH_SIZE 翻译默认批大小（默认 8，范围 1~32）
     LOCALAI_TRANSLATE_MAX_LEN  翻译默认单块 token 上限（默认 400，范围 32~1024）
     LOCALAI_TOKEN             可选的 Bearer 鉴权令牌（默认空=不鉴权）
+    LOCALAI_MODEL_SEARCH_PATHS 扫描已有模型的目录（; 分隔，默认空列表；
+                              只在显式设置时生效，程序不预置任何本机路径）
+    LOCALAI_WHISPER_MODEL_DIRS 按档位覆盖 whisper 目录（JSON：{"small":"D:\\..."}）
+    LOCALAI_TRANSLATE_MODEL_DIR NLLB 权重目录（直接指向模型目录，不再拼模型名）
 
 视觉 / 关键帧挑选（新增，见 ``docs/SERVICE_API.md``）::
 
@@ -139,6 +143,71 @@ def _pick_bool(default: bool, *names: str) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on", "y")
+
+
+def _clean_paths(values: Any) -> list[str]:
+    """去空、去重、展开用户目录；顺序保留，最多 20 个。"""
+    if values is None:
+        return []
+    if isinstance(values, str):
+        items = values.replace(os.pathsep, ";").split(";")
+    elif isinstance(values, (list, tuple, set)):
+        items = list(values)
+    else:
+        return []
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        raw = str(item or "").strip().strip('"')
+        if not raw:
+            continue
+        try:
+            path = Path(raw).expanduser()
+            # 不要求路径存在：环境变量里的路径可能暂时离线；扫描时再报错。
+            text = str(path)
+            key = os.path.normcase(os.path.abspath(text))
+        except (OSError, ValueError):
+            text = raw
+            key = raw.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(text)
+        if len(cleaned) >= 20:
+            break
+    return cleaned
+
+
+def _pick_paths(*names: str) -> list[str]:
+    raw = _pick(*names)
+    return _clean_paths(raw) if raw is not None else []
+
+
+def _parse_whisper_dirs(raw: Optional[str]) -> dict[str, str]:
+    """解析 ``LOCALAI_WHISPER_MODEL_DIRS``（JSON 对象）；坏值按空处理。"""
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        logger.warning("LOCALAI_WHISPER_MODEL_DIRS 不是合法 JSON，已忽略")
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    result: dict[str, str] = {}
+    for key, value in data.items():
+        size = str(key or "").strip().lower()
+        path = str(value or "").strip().strip('"')
+        if size in WHISPER_SIZES and path:
+            result[size] = str(Path(path).expanduser())
+    return result
+
+
+def _env_any(*names: str) -> bool:
+    return any(
+        os.environ.get(name) is not None and str(os.environ.get(name)).strip() != ""
+        for name in names
+    )
 
 
 def _default_home() -> Path:
@@ -278,6 +347,67 @@ def _apply_config_file(
             setattr(cfg, item.key, value)
 
 
+#: 「配置指向」写入的路径键 -> 对应的环境变量（环境变量优先）。
+PATH_CONFIG_ENV: dict[str, tuple[str, ...]] = {
+    "tts_model_dir": ("LOCALAI_MODEL_DIR", "INDEX_TTS_MODEL_DIR"),
+    "asr_model_dir": ("LOCALAI_ASR_MODEL_DIR", "INDEX_TTS_ASR_MODEL_DIR"),
+    "translate_model_dir": ("LOCALAI_TRANSLATE_MODEL_DIR",),
+    "speaker_model_dir": ("LOCALAI_CAMPPUS_DIR", "INDEX_TTS_CAMPPUS_DIR"),
+    "demucs_repo": ("LOCALAI_DEMUCS_REPO", "INDEX_TTS_DEMUCS_REPO"),
+    "vision_model_dir": ("LOCALAI_VISION_DIR",),
+    "vad_model_dir": ("LOCALAI_ASR_VAD_DIR",),
+    "whisper_model_dirs": ("LOCALAI_WHISPER_MODEL_DIRS",),
+}
+
+
+def _apply_path_overrides(cfg: "Config", home: Path) -> None:
+    """应用 config.json 里「采用已有模型」写入的路径。
+
+    这些键不在 /admin/settings 白名单里（由模型页的 adopt 接口管理），但必须和
+    普通设置一样遵守 **环境变量 > config.json > 代码默认值**。
+    """
+    data = load_config_file(home)
+    if not data:
+        return
+
+    def allowed(key: str) -> bool:
+        return not _env_any(*PATH_CONFIG_ENV.get(key, ()))
+
+    if "tts_model_dir" in data and allowed("tts_model_dir"):
+        raw = str(data["tts_model_dir"] or "").strip()
+        if raw:
+            cfg.model_dir = Path(raw).expanduser()
+    if "asr_model_dir" in data and allowed("asr_model_dir"):
+        raw = str(data["asr_model_dir"] or "").strip()
+        if raw:
+            cfg.asr_model_dir = Path(raw).expanduser()
+    if "translate_model_dir" in data and allowed("translate_model_dir"):
+        raw = str(data["translate_model_dir"] or "").strip()
+        cfg.translate_model_dir = Path(raw).expanduser() if raw else None
+    if "speaker_model_dir" in data and allowed("speaker_model_dir"):
+        raw = str(data["speaker_model_dir"] or "").strip()
+        if raw:
+            cfg.speaker_model_dir = Path(raw).expanduser()
+    if "demucs_repo" in data and allowed("demucs_repo"):
+        raw = str(data["demucs_repo"] or "").strip()
+        if raw:
+            cfg.demucs_repo = Path(raw).expanduser()
+    if "vision_model_dir" in data and allowed("vision_model_dir"):
+        raw = str(data["vision_model_dir"] or "").strip()
+        if raw:
+            cfg.vision_dir = Path(raw).expanduser()
+    if "vad_model_dir" in data and allowed("vad_model_dir"):
+        raw = str(data["vad_model_dir"] or "").strip()
+        if raw:
+            cfg.asr_vad_dir = Path(raw).expanduser()
+    if "whisper_model_dirs" in data and allowed("whisper_model_dirs"):
+        raw = data["whisper_model_dirs"]
+        if isinstance(raw, dict):
+            cfg.whisper_model_dirs = _parse_whisper_dirs(json.dumps(raw, ensure_ascii=False))
+        else:
+            logger.warning("忽略 config.json 里的非法 whisper_model_dirs：%r", raw)
+
+
 @dataclass(slots=True)
 class Config:
     """一次服务进程的完整配置。"""
@@ -298,12 +428,16 @@ class Config:
     asr_engine: str = "sensevoice"
     #: faster-whisper 权重根目录；每档权重在 ``<whisper_dir>/<size>/``。
     whisper_dir: Path = field(default_factory=Path)
+    #: 采用已有模型时按档位覆盖目录：``{"small": "D:\\..."}``。
+    whisper_model_dirs: dict[str, str] = field(default_factory=dict)
     whisper_model: str = "small"
     whisper_device: str = "cuda"
     whisper_compute: str = "int8_float16"
     whisper_idle_unload: int = 900
     #: 翻译（NLLB-200）权重根目录；权重在 ``<translate_dir>/nllb-200-distilled-600M/``。
     translate_dir: Path = field(default_factory=Path)
+    #: 采用已有模型时直接指向权重目录（不再拼模型名）；None=沿用 translate_dir。
+    translate_model_dir: Optional[Path] = None
     translate_idle_unload: int = 900
     translate_fp16: bool = True
     translate_num_beams: int = 4
@@ -354,6 +488,8 @@ class Config:
     ffprobe_source: str = "missing"
 
     token: str = ""
+    #: 已有模型扫描目录；默认空，程序不预置任何本机路径。
+    model_search_paths: list[str] = field(default_factory=list)
     log_level: str = "INFO"
     poll_interval: float = 0.4
     job_timeout: float = 180.0
@@ -379,6 +515,36 @@ class Config:
     asr_parallel: int = 2
 
     # ---- 派生目录 -------------------------------------------------------
+    @property
+    def tts_model_dir(self) -> Path:
+        """IndexTTS 权重目录（adopt 接口里的配置名，等价于 model_dir）。"""
+        return self.model_dir
+
+    @property
+    def vision_model_dir(self) -> Path:
+        """视觉模型目录（adopt 接口里的配置名，等价于 vision_dir）。"""
+        return self.vision_dir
+
+    @property
+    def vad_model_dir(self) -> Path:
+        """fsmn-vad 目录（adopt 接口里的配置名，等价于 asr_vad_dir）。"""
+        return self.asr_vad_dir
+
+    @property
+    def translate_weight_dir(self) -> Path:
+        """NLLB 实际权重目录：adopt 的精确目录优先，否则沿用根目录拼模型名。"""
+        if self.translate_model_dir is not None:
+            return self.translate_model_dir
+        return self.translate_dir / "nllb-200-distilled-600M"
+
+    def whisper_weights_dir(self, size: Optional[str] = None) -> Path:
+        """某档 whisper 实际权重目录（adopt 的按档映射优先）。"""
+        key = (size or self.whisper_model or "small").strip().lower()
+        override = str(self.whisper_model_dirs.get(key) or "").strip()
+        if override:
+            return Path(override).expanduser()
+        return self.whisper_dir / key
+
     @property
     def data_dir(self) -> Path:
         """任务库与上传文件的根目录：``<HOME>/data``（已被 .gitignore 排除）。"""
@@ -525,6 +691,9 @@ class Config:
                     default=str(root / "models" / "whisper"),
                 )
             ).expanduser(),
+            whisper_model_dirs=_parse_whisper_dirs(
+                _pick("LOCALAI_WHISPER_MODEL_DIRS")
+            ),
             whisper_model=whisper_model,
             whisper_device=(
                 _pick("LOCALAI_WHISPER_DEVICE", default="cuda") or "cuda"
@@ -539,6 +708,11 @@ class Config:
                     default=str(root / "models" / "nllb"),
                 )
             ).expanduser(),
+            translate_model_dir=(
+                Path(_pick("LOCALAI_TRANSLATE_MODEL_DIR")).expanduser()
+                if _pick("LOCALAI_TRANSLATE_MODEL_DIR")
+                else None
+            ),
             translate_idle_unload=_pick_int(900, "LOCALAI_TRANSLATE_IDLE_UNLOAD"),
             translate_fp16=_pick_bool(True, "LOCALAI_TRANSLATE_FP16"),
             translate_num_beams=max(
@@ -641,6 +815,7 @@ class Config:
             ffmpeg_source=ffmpeg_source,
             ffprobe_source=ffprobe_source,
             token=(_pick("LOCALAI_TOKEN") or ""),
+            model_search_paths=_pick_paths("LOCALAI_MODEL_SEARCH_PATHS"),
             log_level=(_pick("LOCALAI_LOG_LEVEL", default="INFO") or "INFO").upper(),
             poll_interval=float(_pick("LOCALAI_POLL", "INDEX_TTS_POLL", default="0.4") or 0.4),
             job_timeout=float(_pick("LOCALAI_TIMEOUT", "INDEX_TTS_TIMEOUT", default="180") or 180),
@@ -684,6 +859,13 @@ class Config:
 
         # 文件覆盖只对「没有被环境变量覆盖」的键生效。
         _apply_config_file(cfg, root, cfg.env_overrides)
+        # adopt 写入的路径覆盖（不在设置白名单里，但同样 env > file）。
+        _apply_path_overrides(cfg, root)
+        for key, names in PATH_CONFIG_ENV.items():
+            cfg.env_overrides[key] = _env_any(*names)
+        cfg.env_overrides["model_search_paths"] = env_present(
+            next(item for item in SETTINGS if item.key == "model_search_paths")
+        )
         return cfg
 
     # ---- 给原生引擎写回环境变量 -----------------------------------------
@@ -758,6 +940,30 @@ class Config:
             mapping["COMFY_BASE"] = self.comfy_base
         os.environ.update(mapping)
 
+        # 仅在不是「启动时由环境变量指定」时，才把 admin 写入的值同步回环境；
+        # 否则会覆盖调用方启动脚本里的显式设置，违背 env > config 约定。
+        if not self.env_overrides.get("translate_model_dir"):
+            if self.translate_model_dir is not None:
+                os.environ["LOCALAI_TRANSLATE_MODEL_DIR"] = str(
+                    self.translate_model_dir
+                )
+            else:
+                os.environ.pop("LOCALAI_TRANSLATE_MODEL_DIR", None)
+        if not self.env_overrides.get("whisper_model_dirs"):
+            if self.whisper_model_dirs:
+                os.environ["LOCALAI_WHISPER_MODEL_DIRS"] = json.dumps(
+                    self.whisper_model_dirs, ensure_ascii=False
+                )
+            else:
+                os.environ.pop("LOCALAI_WHISPER_MODEL_DIRS", None)
+        if not self.env_overrides.get("model_search_paths"):
+            if self.model_search_paths:
+                os.environ["LOCALAI_MODEL_SEARCH_PATHS"] = os.pathsep.join(
+                    self.model_search_paths
+                )
+            else:
+                os.environ.pop("LOCALAI_MODEL_SEARCH_PATHS", None)
+
     # ---- 诊断 -----------------------------------------------------------
     def summary(self) -> dict[str, Any]:
         """给 /capabilities、doctor、日志用的可打印摘要。"""
@@ -773,8 +979,10 @@ class Config:
             "asr_model_dir": str(self.asr_model_dir),
             "asr_engine": self.asr_engine,
             "asr_vad_dir": str(self.asr_vad_dir),
+            "model_search_paths": list(self.model_search_paths),
             "whisper": {
                 "dir": str(self.whisper_dir),
+                "model_dirs": dict(self.whisper_model_dirs),
                 "model": self.whisper_model,
                 "device": self.whisper_device,
                 "compute_type": self.whisper_compute,
@@ -782,6 +990,7 @@ class Config:
             },
             "translate": {
                 "dir": str(self.translate_dir),
+                "model_dir": str(self.translate_weight_dir),
                 "model": "nllb-200-distilled-600M",
                 "idle_unload": self.translate_idle_unload,
                 "fp16": self.translate_fp16,

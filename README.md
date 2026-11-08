@@ -1734,3 +1734,47 @@ curl http://127.0.0.1:7880/media/download/status
 
 接口参数、SSRF 策略、实测数据与已知限制见
 [`docs/SERVICE_API.md`](docs/SERVICE_API.md) 第 14 章。
+
+---
+
+## 19. 已经下过模型的用户怎么复用（v2.5 新增）
+
+不用重新下载。打开管理界面 `/ui` →「模型」页：
+
+1. **添加搜索路径**：例如 `D:\models`、`E:\ComfyUI\models`，或本服务以前的
+   `E:\LocalAIService\models`。程序会递归检查子目录，最多 20 个路径。默认是空列表，
+   不会写死任何本机目录；本机测试时在页面里临时添加即可。
+2. 点「扫描已有模型」，等进度结束；结果会列出能力 / 模型 / 路径 / 大小 / 置信度。
+3. 找到目标后点「使用这个」：服务只会把该目录写进 `config.json`（配置指向），
+   **不移动、不复制、不创建 junction / symlink**，也不会删除原文件。下次加载该能力时
+   直接从原目录读权重；已加载的旧模型不会被强行打断，可等空闲卸载或手动卸载。
+
+也可以直接调接口：
+
+```bash
+# 默认没有搜索路径，先添加（只接受存在且可读的目录）
+curl -X PUT http://127.0.0.1:7880/admin/models/search-paths \
+  -H "Content-Type: application/json" \
+  -d '{"add":"D:\\models"}'
+
+# 后台扫描（不传 paths 就用已保存的路径；空列表会 400）
+curl -X POST http://127.0.0.1:7880/admin/models/scan \
+  -H "Content-Type: application/json" -d '{"max_depth":6}'
+
+# 用任务 id 查进度和结果
+curl http://127.0.0.1:7880/admin/models/scan/<task_id>
+
+# 采用其中一条（示例：whisper small）
+curl -X POST http://127.0.0.1:7880/admin/models/adopt \
+  -H "Content-Type: application/json" \
+  -d '{"capability":"whisper","path":"D:\\models\\faster-whisper-small","name":"small"}'
+```
+
+- 环境变量 `LOCALAI_MODEL_SEARCH_PATHS`（`;` 分隔）优先于 `config.json`；
+- 采用写入的键：`tts_model_dir` / `asr_model_dir` / `whisper_model_dirs` /
+  `translate_model_dir` / `speaker_model_dir` / `demucs_repo` /
+  `vision_model_dir` / `vad_model_dir`，都只影响本服务配置；
+- 置信度 `partial` 说明缺文件或大小/哈希对不上（结果里有 `missing` / `detail`）；
+  缺签名文件时采用接口会 400，不会写入半截配置；
+- 详细签名表、接口字段与默认行为见
+  [`docs/SERVICE_API.md`](docs/SERVICE_API.md) 第 16 章。

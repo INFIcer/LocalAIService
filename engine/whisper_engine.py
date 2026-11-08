@@ -73,6 +73,29 @@ WEIGHTS_ROOT = Path(
     os.environ.get("LOCALAI_WHISPER_DIR", str(SERVICE_ROOT / "models" / "whisper"))
 )
 
+
+def _parse_size_dirs(raw: str) -> dict[str, Path]:
+    """解析按档位覆盖目录（JSON）；坏值按空处理，不影响默认布局。"""
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    result: dict[str, Path] = {}
+    for key, value in data.items():
+        size = str(key or "").strip().lower()
+        path = str(value or "").strip()
+        if size in SIZES and path:
+            result[size] = Path(path)
+    return result
+
+
+#: 采用已有模型时按档位覆盖：``{"small": "D:\\models\\faster-whisper-small"}``。
+SIZE_DIRS = _parse_size_dirs(os.environ.get("LOCALAI_WHISPER_MODEL_DIRS", ""))
+
 #: faster-whisper 在 HF / ModelScope 上的仓库名模板。
 REPO_TEMPLATE = "Systran/faster-whisper-{size}"
 
@@ -140,8 +163,9 @@ def normalize_size(size: Optional[str]) -> str:
 
 
 def weights_dir(size: Optional[str] = None) -> Path:
-    """某档模型的权重目录：``<WEIGHTS_ROOT>/<size>/``。"""
-    return WEIGHTS_ROOT / normalize_size(size)
+    """某档模型的权重目录：adopt 映射优先，否则 ``<WEIGHTS_ROOT>/<size>/``。"""
+    resolved = normalize_size(size)
+    return SIZE_DIRS.get(resolved) or (WEIGHTS_ROOT / resolved)
 
 
 def _missing_files(target: Path) -> list[str]:

@@ -85,6 +85,34 @@
       <!-- 模型 -->
       <section id="view-models" class="view">
         <div id="download-task" class="banner info hidden"></div>
+
+        <div class="panel discovery-panel">
+          <div class="panel-head">
+            <h2>使用已有模型</h2>
+            <span id="search-paths-count" class="pill muted">0 个路径</span>
+          </div>
+          <p class="hint discovery-hint">
+            添加你已有的模型根目录（会递归检查子目录）。这里只做只读扫描；采用时只把目录写进服务配置，
+            <b>不移动、不复制、不创建链接</b>。
+          </p>
+          <div id="search-paths-list" class="search-path-list">
+            <div class="empty">正在读取搜索路径…</div>
+          </div>
+          <div class="search-path-add">
+            <input id="search-path-input" type="text" spellcheck="false"
+                   placeholder="例如 D:\models 或 ComfyUI 的 models 目录">
+            <button id="search-path-add" class="primary" type="button">添加路径</button>
+          </div>
+          <div class="scan-toolbar">
+            <label class="field-inline">递归深度
+              <input id="scan-depth" type="number" min="0" max="12" step="1" value="6">
+            </label>
+            <button id="scan-start" class="primary" type="button">扫描已有模型</button>
+            <span id="scan-progress" class="hint"></span>
+          </div>
+          <div id="scan-result" class="hidden"></div>
+        </div>
+
         <div class="toolbar">
           <span id="models-summary" class="hint">正在读取模型清单…</span>
           <button id="models-refresh" class="ghost" type="button">刷新清单</button>
