@@ -34,6 +34,7 @@ class TranslateAdapter(BaseAdapter):
     DEFAULT_ESTIMATE_MB = TRANSLATE_ESTIMATE_MB
     #: 校准下限：fp16 权重约 1.2GB，加上生成时的 KV/中间张量，别被低估到危险值。
     MIN_ESTIMATE_MB = 600
+    MAX_ESTIMATE_MB: float = 1800
     ENDPOINTS = (
         "/translate",
         "/translate/batch",

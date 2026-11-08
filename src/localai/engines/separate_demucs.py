@@ -23,6 +23,7 @@ class SeparateAdapter(BaseAdapter):
     DEFAULT_ESTIMATE_MB = 1000
     # WDDM 下加载增量可能只统计到 140MB，但推理峰值约 0.9GB。
     MIN_ESTIMATE_MB = 800
+    MAX_ESTIMATE_MB: float = 1300
     ENDPOINTS = ("/separate", "/api/v1/separate", "/separate/status")
     # 实测并行 2 没有稳定收益（2 条 10 秒音频 0.86s -> 0.72~0.83s），
     # 且 engine/separator_engine.py 内部有 _INFER_LOCK，强制串行。

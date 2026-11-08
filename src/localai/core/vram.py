@@ -72,6 +72,8 @@ class ModelEntry:
     # 估算下限：个别大模型（TTS）的加载增量会被 WDDM 缓存复用低估，
     # 但推理峰值仍然很高，不能让校准把容量估算降到危险值。
     min_estimate_mb: float = 0.0
+    # 估算上限：防止一次错误的实测把估算撑到无法加载（例如 WDDM 把别的进程占用算进来）。
+    max_estimate_mb: float = 0.0
 
     # 运行状态
     last_used: Optional[float] = None          # time.time()，用于展示
@@ -124,6 +126,7 @@ class VramManager:
         is_loaded_fn: Optional[Callable[[], bool]] = None,
         infer_lock: Any = None,
         min_estimate_mb: float = 0.0,
+        max_estimate_mb: float = 0.0,
     ) -> None:
         """注册一个可卸载能力。
 
@@ -141,6 +144,8 @@ class VramManager:
             raise ValueError("能力名不能为空")
         saved = self._saved.get(name) or {}
         estimate = float(saved.get("estimate_mb") or estimate_mb)
+        if max_estimate_mb > 0:
+            estimate = min(estimate, float(max_estimate_mb))
         entry = ModelEntry(
             name=name,
             unload_fn=unload_fn,
@@ -149,6 +154,7 @@ class VramManager:
             is_loaded_fn=is_loaded_fn,
             infer_lock=infer_lock,
             min_estimate_mb=float(min_estimate_mb),
+            max_estimate_mb=float(max_estimate_mb),
             measured_mb=(
                 float(saved["last_measured_mb"])
                 if saved.get("last_measured_mb") is not None
@@ -656,6 +662,8 @@ class VramManager:
             high = old * 1.2
             new = min(high, max(low, measured))
             new = max(new, entry.min_estimate_mb)
+            if entry.max_estimate_mb > 0:
+                new = min(new, entry.max_estimate_mb)
             entry.estimate_mb = max(1.0, new)
             entry.measured_mb = measured
             entry.samples += 1
@@ -714,6 +722,7 @@ def register_adapters(registry: Any) -> VramManager:
             is_loaded_fn=adapter.loaded,
             infer_lock=adapter.infer_lock,
             min_estimate_mb=adapter.MIN_ESTIMATE_MB,
+        max_estimate_mb=getattr(adapter, "MAX_ESTIMATE_MB", 0),
         )
     logger.info(
         "显存管家就绪：margin=%dMB 估算文件=%s 初始估算=%s",

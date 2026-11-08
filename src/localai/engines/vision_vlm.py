@@ -36,6 +36,7 @@ class VisionAdapter(BaseAdapter):
     DEFAULT_ESTIMATE_MB = 3400
     #: 校准下限：Q4 权重约 1.93GB + mmproj 1.34GB，别被 WDDM 缓存低估。
     MIN_ESTIMATE_MB = 2400
+    MAX_ESTIMATE_MB: float = 4000
     ENDPOINTS = (
         "/vision/describe",
         "/vision/scan",

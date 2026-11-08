@@ -34,6 +34,7 @@ class WhisperAdapter(BaseAdapter):
     DEFAULT_ESTIMATE_MB = 600
     #: 校准下限：tiny 实测也有一百多 MB，留 100 避免被校准成 0。
     MIN_ESTIMATE_MB = 100
+    MAX_ESTIMATE_MB: float = 4000
     ENDPOINTS = ("/asr", "/asr/segments", "/asr/status")
     PARALLEL_NOTE = "CTranslate2 推理未实测可并发，强制串行（容量 1）"
 

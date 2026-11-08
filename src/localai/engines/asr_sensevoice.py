@@ -24,6 +24,7 @@ class AsrAdapter(BaseAdapter):
     DEFAULT_ESTIMATE_MB = 1200
     # 多次加载后实测增量会被 CUDA 缓存复用拉低；保留 900MB 下限。
     MIN_ESTIMATE_MB = 900
+    MAX_ESTIMATE_MB: float = 1300
     ENDPOINTS = ("/asr", "/api/v1/asr", "/asr/status")
     #: 实际是否可并发由「本次配置的容量」决定：容量 1 时强制串行，
     #: 容量 2~4 时引擎内部信号量也放行同样数量。详见 docs/SERVICE_API.md。

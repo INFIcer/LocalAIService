@@ -54,6 +54,7 @@ class TtsAdapter(BaseAdapter):
     DEFAULT_ESTIMATE_MB = 6400
     # TTS 的加载增量会被 WDDM 缓存复用低估，但推理峰值需要保守下限。
     MIN_ESTIMATE_MB = 6200
+    MAX_ESTIMATE_MB: float = 6400
     ENDPOINTS = ("/tts", "/v1/audio/speech", "/api/v1/tts/tasks")
     # 实测并行 2 无吞吐收益（4 条短句 8.53s -> 8.06s），且 engine/engine.py
     # 内部还有 _INFER_LOCK、随机种子是模块级状态，强制串行。

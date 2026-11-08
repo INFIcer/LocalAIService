@@ -14,7 +14,10 @@ from .base import BaseAdapter
 logger = logging.getLogger("localai.engines.speaker")
 
 
+
+
 class SpeakerAdapter(BaseAdapter):
+    MAX_ESTIMATE_MB: float = 300
     name = "speaker"
     title = "声纹识别（campplus）"
     model_name = "campplus"
