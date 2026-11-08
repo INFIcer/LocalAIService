@@ -1,15 +1,18 @@
-"""媒体路由：ffmpeg 探测 / 转 16k wav / 抽帧 / 抽音轨 / 场景检测。
+"""媒体路由：ffmpeg 探测 / 转 16k wav / 抽帧 / 抽音轨 / 场景检测 / 字幕。
 
-契约（全部 multipart，文件字段名统一叫 ``file``）：
+契约：
 
-- ``POST /media/probe``  -> ``{ok, duration, format, audio, video, ...}``
-- ``POST /media/to_wav`` -> audio/wav 二进制（16k 单声道 PCM16）
-- ``POST /media/frames`` -> ``{ok, count, dir, frames[], preview_b64}``
-- ``POST /media/audio``  -> audio/wav 或 audio/mpeg 二进制
-- ``POST /media/scenes`` -> ``{ok, count, scenes[{time,score}], json_path}``
+- ``POST /media/probe``  -> ``{ok, duration, format, audio, video, ...}``（multipart）
+- ``POST /media/to_wav`` -> audio/wav 二进制（16k 单声道 PCM16，multipart）
+- ``POST /media/frames`` -> ``{ok, count, dir, frames[], preview_b64}``（multipart）
+- ``POST /media/audio``  -> audio/wav 或 audio/mpeg 二进制（multipart）
+- ``POST /media/scenes`` -> ``{ok, count, scenes[{time,score}], mode, windows, warnings}``
+- ``POST /media/subtitles`` -> 内嵌 / 外挂软字幕列表（JSON 路径或 multipart 上传）
+- ``POST /media/subtitles/extract`` -> 抽成一个字幕源（segments 或 srt）
 
 临时文件处理完立即删除；抽帧结果留在 ``<OUTPUT>/frames/<时间戳>/``；
-场景检测结果（可选）落在 ``<OUTPUT>/scenes/<时间戳>.json``。
+场景检测结果（可选）落在 ``<OUTPUT>/scenes/<时间戳>.json``；
+抽取的 SRT 落在 ``<OUTPUT>/subtitles/<时间戳>.srt``。
 """
 
 from __future__ import annotations
@@ -223,40 +226,87 @@ async def media_audio_endpoint(
 
 
 @router.post("/media/scenes", summary="场景/镜头边界检测（ffmpeg scene 分数）")
-async def media_scenes_endpoint(
-    request: Request,
-    file: UploadFile = File(..., description="要检测的视频文件"),
-    threshold: float = Form(0.3, description="场景分数阈值 0~1，越大越严格"),
-    max_scenes: int = Form(200, description="最多返回多少个边界"),
-    min_gap: float = Form(1.0, description="最小间隔秒数（去抖）"),
-) -> dict[str, Any]:
-    """返回 ``{ok, count, scenes:[{time,score}], duration, json_path}``。
+async def media_scenes_endpoint(request: Request) -> dict[str, Any]:
+    """返回 ``{ok, count, scenes:[{time,score}], mode, windows, warnings}``。
 
-    结果同时落盘到 ``<OUTPUT>/scenes/<时间戳>.json``，方便二次处理。
+    multipart 上传字段 ``file``，或 JSON ``{"video_path": "..."}``（服务端本地
+    路径，便于直接测超大文件，不用上传几十 GB）。时长 > 15 分钟默认走采样
+    模式（8 个 60 秒窗口），避免整片跑满超时；结果同时落盘到
+    ``<OUTPUT>/scenes/<时间戳>.json``。
     """
     cfg = get_cfg(request)
     media = get_registry(request).get("media")
     started = time.perf_counter()
-    tmp_path = await save_media_upload(cfg, file, "scenes")
+
+    content_type = (request.headers.get("content-type") or "").lower()
+    upload = None
+    raw_path = ""
+    threshold = 0.3
+    max_scenes = 200
+    min_gap = 1.0
+    mode = "auto"
+    if content_type.startswith("multipart/form-data"):
+        form = await request.form()
+        upload = form.get("file")
+        raw_path = str(form.get("video_path") or "").strip()
+        try:
+            threshold = float(form.get("threshold") or 0.3)
+            max_scenes = int(form.get("max_scenes") or 200)
+            min_gap = float(form.get("min_gap") or 1.0)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=f"参数不是数字：{exc}") from exc
+        mode = str(form.get("mode") or "auto")
+    else:
+        try:
+            body = await request.json()
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=400,
+                detail="请求体必须是 multipart（file）或 JSON（video_path）",
+            ) from exc
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="JSON 请求体必须是对象")
+        raw_path = str(body.get("video_path") or "").strip()
+        try:
+            threshold = float(body.get("threshold", 0.3))
+            max_scenes = int(body.get("max_scenes", 200))
+            min_gap = float(body.get("min_gap", 1.0))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=f"参数不是数字：{exc}") from exc
+        mode = str(body.get("mode") or "auto")
+
+    tmp_path: Optional[Path] = None
+    if upload is not None and hasattr(upload, "read"):
+        tmp_path = await save_media_upload(cfg, upload, "scenes")  # type: ignore[arg-type]
+        target = tmp_path
+    elif raw_path:
+        target = Path(raw_path)
+        if not target.is_file():
+            raise HTTPException(status_code=400, detail=f"视频不存在：{target}")
+    else:
+        raise HTTPException(status_code=400, detail="必须上传 file 或给 video_path")
+    file_name = Path(getattr(upload, "filename", "") or target.name).name
     try:
         result = await media.call(
             "detect_scenes",
-            str(tmp_path),
+            str(target),
             threshold=threshold,
             max_scenes=max_scenes,
             min_gap=min_gap,
+            mode=mode,
             save_dir=str(cfg.scenes_dir),
         )
     finally:
-        tmp_path.unlink(missing_ok=True)
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
 
     elapsed_ms = round((time.perf_counter() - started) * 1000)
     logger.info(
-        "场景检测：%s -> %d 个边界（阈值 %.2f，最小间隔 %.2fs，耗时 %dms）",
-        Path(file.filename or "").name,
+        "场景检测：%s -> %d 个边界（mode=%s，阈值 %.2f，耗时 %dms）",
+        file_name,
         result.get("count", 0),
+        result.get("mode"),
         threshold,
-        min_gap,
         elapsed_ms,
     )
     return {
@@ -267,9 +317,155 @@ async def media_scenes_endpoint(
         "threshold": result.get("threshold"),
         "max_scenes": result.get("max_scenes"),
         "min_gap": result.get("min_gap"),
+        "mode": result.get("mode"),
+        "detector": result.get("detector"),
+        "windows": result.get("windows") or [],
+        "warnings": result.get("warnings") or [],
         "json_path": result.get("json_path"),
         "elapsed_ms": elapsed_ms,
     }
+
+
+# ---------------------------------------------------------------------------
+# 字幕：列软字幕 / 抽字幕
+# ---------------------------------------------------------------------------
+
+
+async def _subtitle_request_body(
+    request: Request, cfg: Any, tag: str
+) -> tuple[Optional[str], Optional[Path]]:
+    """兼容 JSON 与 multipart：返回 ``(video_path, 临时上传文件)``。
+
+    multipart 的 ``file`` 会落盘到 media_tmp，调用方负责删除；JSON 只接受
+    服务端本地路径，不在这里复制大文件。
+    """
+    content_type = (request.headers.get("content-type") or "").lower()
+    if content_type.startswith("multipart/form-data"):
+        form = await request.form()
+        raw_path = str(form.get("video_path") or "").strip()
+        upload = form.get("file")
+        if upload is None or not hasattr(upload, "read"):
+            if not raw_path:
+                raise HTTPException(
+                    status_code=400, detail="multipart 请求需要 file 或 video_path"
+                )
+            return raw_path, None
+        tmp_path = await save_media_upload(cfg, upload, tag)  # type: ignore[arg-type]
+        return raw_path or None, tmp_path
+    try:
+        body = await request.json()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=400,
+            detail="请求体必须是 JSON（video_path）或 multipart（file）",
+        ) from exc
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="JSON 请求体必须是对象")
+    raw_path = str(body.get("video_path") or "").strip()
+    if not raw_path:
+        raise HTTPException(status_code=400, detail="必须给 video_path 或上传 file")
+    return raw_path, None
+
+
+@router.post("/media/subtitles", summary="列出内嵌 / 外挂软字幕")
+async def media_subtitles_endpoint(request: Request) -> dict[str, Any]:
+    """探测一个视频有没有软字幕。
+
+    - 内嵌：ffprobe ``-select_streams s``，返回 codec / language / title / default；
+    - 外挂：同目录同名前缀的 ``.ass/.ssa/.srt/.vtt``（含 ``.scjp`` / ``.tcjp`` 等后缀）；
+    - 两者都没有时 ``has_soft_subtitle=false``、``hint="hardcoded_or_none"``，
+      调用方据此决定用 OCR 还是 ASR（Baha / ANi 硬字幕 MP4 就是这一类）。
+
+    JSON：``{"video_path": "..."}``；multipart：字段 ``file``（或 ``video_path``）。
+    """
+    cfg = get_cfg(request)
+    media = get_registry(request).get("media")
+    raw_path, tmp_path = await _subtitle_request_body(request, cfg, "subtitles")
+    target = tmp_path or Path(str(raw_path))
+    if not target.is_file():
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=f"视频不存在：{target}")
+    try:
+        result = await media.call("list_subtitles", str(target))
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+    logger.info(
+        "字幕探测：%s -> 内嵌=%d 外挂=%d hint=%s",
+        target.name,
+        len(result.get("embedded") or []),
+        len(result.get("sidecar") or []),
+        result.get("hint"),
+    )
+    if tmp_path is not None:
+        # 上传文件已被删除，响应用原始文件名而不是临时路径。
+        result["video"] = Path(str(raw_path or target.name)).name
+        result["uploaded"] = True
+    return result
+
+
+@router.post("/media/subtitles/extract", summary="抽取一个字幕源（segments / srt）")
+async def media_subtitles_extract_endpoint(request: Request) -> dict[str, Any]:
+    """抽内嵌字幕流（``video_path`` + ``index``）或外挂字幕（``sidecar``）。
+
+    请求体：``{"video_path":"...","index":2}`` 或 ``{"sidecar":"...ass"}``，
+    可选 ``format="segments"|"srt"``。默认返回 segments；``format=srt`` 时
+    另存到 ``<OUTPUT>/subtitles/<时间戳>.srt`` 并在响应里给 ``path``。
+    """
+    cfg = get_cfg(request)
+    media = get_registry(request).get("media")
+    try:
+        body = await request.json()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="JSON 请求体必须是对象")
+
+    raw_video = str(body.get("video_path") or "").strip()
+    raw_sidecar = str(body.get("sidecar") or "").strip()
+    if bool(raw_video) == bool(raw_sidecar):
+        raise HTTPException(
+            status_code=400,
+            detail="video_path（配 index）与 sidecar 必须二选一",
+        )
+    output_format = str(body.get("format") or "segments").strip().lower()
+    if output_format not in ("segments", "srt"):
+        raise HTTPException(status_code=400, detail="format 只支持 segments / srt")
+
+    index: Optional[int] = None
+    if raw_video:
+        if body.get("index") is None:
+            raise HTTPException(status_code=400, detail="抽内嵌字幕必须给 index")
+        try:
+            index = int(body.get("index"))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=f"index 必须是整数：{exc}") from exc
+        target = Path(raw_video)
+        if not target.is_file():
+            raise HTTPException(status_code=400, detail=f"视频不存在：{target}")
+    else:
+        target = Path(raw_sidecar)
+        if not target.is_file():
+            raise HTTPException(status_code=400, detail=f"字幕文件不存在：{target}")
+
+    result = await media.call(
+        "extract_subtitle_segments",
+        str(target) if raw_video else None,
+        index=index,
+        sidecar=None if raw_video else str(target),
+        fmt=output_format,
+        out_dir=str(cfg.output_dir / "subtitles"),
+    )
+    logger.info(
+        "字幕抽取：%s source=%s 段数=%d 格式=%s",
+        target.name,
+        result.get("source"),
+        result.get("count"),
+        output_format,
+    )
+    result["format"] = output_format
+    return result
 
 
 # ---------------------------------------------------------------------------

@@ -322,10 +322,16 @@ def prepare_payload(
                 f"不支持的 quality={quality!r}；可选：{', '.join(engine_module.QUALITY_CHOICES)}"
             )
         cookies = _text(data.get("cookies")) or None
+        raw_subtitles = data.get("subtitles", True)
+        if isinstance(raw_subtitles, str) and raw_subtitles.strip().lower() == "auto":
+            # "auto" 对下载仍表示「尝试站点字幕」，分析阶段再优先用软字幕。
+            subtitle_mode: Any = "auto"
+        else:
+            subtitle_mode = _flag(raw_subtitles)
         normalized = {
             "url": url,
             "quality": quality,
-            "subtitles": _flag(data.get("subtitles", True)),
+            "subtitles": subtitle_mode,
             "cookies": cookies,
         }
         if kind == "download":
@@ -829,6 +835,47 @@ def _site_segments(paths: list[str]) -> tuple[Optional[Path], list[dict[str, Any
     return chosen, parse_subtitle_file(chosen)
 
 
+async def _soft_subtitle_segments(
+    path: Path, ctx: JobContext
+) -> tuple[Optional[Path], list[dict[str, Any]], Optional[str]]:
+    """``subtitles="auto"``：用服务端能力探测并抽取内嵌/外挂字幕。
+
+    返回 ``(字幕文件路径, segments, "embedded"|"sidecar")``；没有软字幕时返回
+    ``(None, [], None)``。单条字幕损坏会继续试下一条，不在这里跑 ASR。
+    """
+    from ..core.subtitles import rank_soft_subtitle_sources
+
+    media = ctx.registry.get("media")
+    try:
+        listing = await media.call("list_subtitles", str(path))
+    except Exception as exc:  # noqa: BLE001 - 探测失败交给后面的站点字幕 / ASR
+        logger.warning("字幕探测失败（继续 ASR）：%s", exc)
+        return None, [], None
+    for candidate in rank_soft_subtitle_sources(listing):
+        try:
+            if candidate["source"] == "embedded":
+                result = await media.call(
+                    "extract_subtitle_segments",
+                    str(path),
+                    index=int(candidate["index"]),
+                )
+            else:
+                result = await media.call(
+                    "extract_subtitle_segments",
+                    None,
+                    sidecar=str(candidate["path"]),
+                )
+            segments = result.get("segments") or []
+            if segments:
+                source_path = Path(
+                    str(candidate.get("path") or path)
+                )
+                return source_path, segments, str(candidate["source"])
+        except Exception as exc:  # noqa: BLE001 - 换下一条字幕
+            logger.warning("字幕抽取失败（%s）：%s", candidate, exc)
+    return None, [], None
+
+
 async def _run_analyze(payload: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     """链接分析编排：下载 -> （站点字幕 | ASR）-> 场景边界 -> 可选抽帧。"""
     from datetime import datetime
@@ -843,10 +890,19 @@ async def _run_analyze(payload: dict[str, Any], ctx: JobContext) -> dict[str, An
     duration = downloaded.get("duration")
     ctx.report({"stage": "probe", "percent": 5, "status": "running"})
 
-    subtitles_from = "asr"
+    subtitles_from = "none"
     subtitle_path: Optional[Path] = None
     segments: list[dict[str, Any]] = []
-    if downloaded.get("subtitles"):
+    auto_subtitles = (
+        isinstance(payload.get("subtitles"), str)
+        and str(payload["subtitles"]).strip().lower() == "auto"
+    )
+    if auto_subtitles:
+        # auto：服务端软字幕优先；有就直接用，绝不重复跑 ASR。
+        subtitle_path, segments, soft_source = await _soft_subtitle_segments(path, ctx)
+        if segments:
+            subtitles_from = soft_source or "none"
+    if not segments and downloaded.get("subtitles"):
         subtitle_path, segments = _site_segments(list(downloaded["subtitles"]))
         if segments:
             subtitles_from = "site"
@@ -855,6 +911,7 @@ async def _run_analyze(payload: dict[str, Any], ctx: JobContext) -> dict[str, An
         ctx.report({"stage": "asr", "percent": 15, "status": "running"})
         asr_info = await _transcribe_segments(path, payload.get("engine") or "auto", ctx)
         segments = asr_info["segments"]
+        subtitles_from = "asr" if segments else "none"
         if duration is None:
             duration = asr_info.get("duration")
 

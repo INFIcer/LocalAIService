@@ -121,7 +121,13 @@ class MediaAnalyzeRequest(BaseModel):
     engine: str = Field("auto", description="whisper / sensevoice / auto（站点无字幕时用）")
     max_frames: int = Field(0, ge=0, le=200, description="0=不抽帧；>0 均匀+场景吸附抽帧")
     quality: str = Field("720p", description="720p / best / audio")
-    subtitles: bool = Field(True, description="优先使用站点字幕")
+    subtitles: bool | str = Field(
+        True,
+        description=(
+            "true=下载站点字幕（旧行为）；false=不下载；"
+            "str \"auto\"=下载后先探测内嵌/外挂软字幕，没有再 ASR"
+        ),
+    )
     filter: str = Field(
         "",
         description="可选 vision：分析完直接让 VLM 挑关键帧（不传保持旧行为）",
@@ -154,12 +160,19 @@ class VisionFramesRequest(BaseModel):
         "hybrid", description="hybrid=逐帧评分补抽（默认）/ agent=多轮代理协议"
     )
     effort: str = Field(
-        "medium",
-        description="分析力度 low/medium/high：决定候选数、轮数、VLM 与 clip 预算",
+        "auto",
+        description=(
+            "分析力度 auto（默认，按时长定档并加密分段）/ low / medium / high："
+            "决定候选数、轮数、VLM 与 clip 预算"
+        ),
     )
     max_rounds: int = Field(6, ge=1, le=12, description="最多补抽轮数（会被 effort 上限收紧）")
-    subtitles: Optional[list[dict[str, Any]]] = Field(
-        None, description="可选：[{start,end,text}]；不给就找同目录字幕或跑 ASR"
+    subtitles: Optional[list[dict[str, Any]] | str] = Field(
+        None,
+        description=(
+            "可选：[{start,end,text}] 或字幕文件路径；"
+            "传字符串 \"auto\" 时先走 /media/subtitles，有软字幕就不跑 ASR"
+        ),
     )
     scene_times: Optional[list[float]] = Field(
         None, description="可选：已知场景边界（秒）；不给就现场检测"

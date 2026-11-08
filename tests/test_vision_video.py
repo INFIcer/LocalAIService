@@ -149,9 +149,10 @@ def patched(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 def test_status_exposes_effort_budgets() -> None:
     with TestClient(create_app()) as client:
         data = client.get("/vision/status").json()
-    assert data["effort_default"] == "medium"
-    assert data["effort_choices"] == ["low", "medium", "high"]
+    assert data["effort_default"] == "auto"
+    assert data["effort_choices"] == ["auto", "low", "medium", "high"]
     budgets = data["effort_budgets"]
+    assert budgets["auto"]["effort"] == "auto"
     assert budgets["low"]["clip_limit"] == 0
     assert budgets["medium"]["vlm_limit"] == 16
     assert budgets["high"]["clip_limit"] == 2

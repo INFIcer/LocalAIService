@@ -476,7 +476,9 @@ multipart：
 
 ## 7. 媒体工具（ffmpeg）
 
-全部 multipart，字段名统一 `file`；上传上限 200MB。
+默认 multipart，字段名统一 `file`；上传上限 200MB。超大文件（例如本机 11GB
+电影）不要上传：`/media/scenes` 与 `/media/subtitles*` 也接受 JSON
+`{"video_path":"服务端本机路径"}`，只读不复制。
 
 ### `POST /media/probe`
 
@@ -505,15 +507,32 @@ multipart：
 ### `POST /media/scenes`（场景 / 镜头边界检测）
 
 multipart：`file`（视频）、`threshold`（默认 `0.3`）、`max_scenes`（默认 `200`）、
-`min_gap`（默认 `1.0` 秒）。
+`min_gap`（默认 `1.0` 秒）、`mode`（`auto` 默认 / `sampled` / `full`）；
+或 JSON：`{"video_path":"...","threshold":0.3,"mode":"auto"}`。
 
-实现：`ffmpeg -vf "select='gt(scene,TH)',metadata=mode=print:file=-,showinfo" -f null -`，
-解析 stderr 的 `pts_time` 与 stdout 的 `lavfi.scene_score`，再做「最小间隔去抖」
-（间隔小于 `min_gap` 的只保留前一个）。
+**采样策略**（`mode="auto"` 默认）：
+
+| 时长 | 行为 | 耗时 |
+| --- | --- | --- |
+| ≤15 分钟 | 整片 `ffmpeg select='gt(scene,TH)'`（旧行为） | 秒级 |
+| >15 分钟 | 8 个 60 秒窗口，避开片头片尾各 10 秒；单窗口 45 秒超时 | 20 秒左右（1080p） |
+| >40 分钟且 ≥4K | 8 个窗口只读**关键帧包**（ffprobe packet，不 decode） | 1~2 秒 |
+
+4K HEVC 长片全帧解码时，一个 60 秒窗口就要 15s+；实测 142 分钟电影 8 个窗口
+会跑 175 秒并触发 45 秒超时。因此这类素材改用「只 demux 关键帧包」，关键帧
+通常落在镜头切点上；响应 `detector="keyframe"`、`score` 固定 1.0。1080p 长片
+仍用真正的 ffmpeg scene 分数（`detector="ffmpeg_scene"`）。
+`mode="full"` 可强制整片检测，超时由 `LOCALAI_SCENE_TIMEOUT`（默认 300 秒）控制。
 
 ```bash
+# 小文件 multipart
 curl -X POST http://127.0.0.1:7880/media/scenes \
   -F "file=@cut.mp4" -F "threshold=0.3" -F "min_gap=1.0"
+
+# 超大文件：只给本机路径，不复制
+curl -X POST http://127.0.0.1:7880/media/scenes \
+  -H "Content-Type: application/json" \
+  -d "{\"video_path\":\"E:/片库/movie.mkv\",\"mode\":\"auto\"}"
 ```
 
 ```json
@@ -528,13 +547,18 @@ curl -X POST http://127.0.0.1:7880/media/scenes \
   "threshold": 0.3,
   "max_scenes": 200,
   "min_gap": 1.0,
+  "mode": "full",
+  "detector": "ffmpeg_scene",
+  "windows": [{"start": 0.0, "end": 4.56, "timeout_sec": 300.0}],
+  "warnings": [],
   "json_path": "E:\\LocalAIService\\outputs\\scenes\\20261108_173056_247.json",
   "elapsed_ms": 92
 }
 ```
 
-- 结果同时落盘到 `<OUTPUT>/scenes/<时间戳>.json`（含 source/threshold/scenes）；
-- `time` 单位秒，`score` 是 ffmpeg 的 scene 分数（0~1）；
+- 结果同时落盘到 `<OUTPUT>/scenes/<时间戳>.json`（含 mode/windows/scenes/warnings）；
+- `time` 单位秒，`score` 是 scene 分数（0~1；keyframe 模式固定 1.0）；
+- `windows` 给出实际采样范围与每窗口边界数，`warnings` 记录被跳过的窗口；
 - 没有视频流的文件返回 400；`threshold` 越界 / `max_scenes<=0` / `min_gap<0` 也返回 400。
 
 实测（合成 4.56 秒黑→白→蓝切换视频，真实切换点 1.50s / 3.00s）：
@@ -545,6 +569,89 @@ curl -X POST http://127.0.0.1:7880/media/scenes \
 | 3.04 s | 3.00 s | +0.04 s | 1.0 | — |
 
 > 误差来自帧级时间戳（25fps = 0.04s/帧），不是算法抖动。
+
+实测（142 分钟 4K HEVC 电影，JSON 路径）：
+
+| mode | detector | 边界数 | 耗时 | warnings |
+| --- | --- | --- | --- | --- |
+| `auto` | `keyframe` | 47 | **1.22 s** | 无 |
+
+---
+
+### `POST /media/subtitles`（列软字幕）
+
+请求：JSON `{"video_path":"..."}`，或 multipart 字段 `file`（≤200MB）。
+
+```bash
+curl -X POST http://127.0.0.1:7880/media/subtitles \
+  -H "Content-Type: application/json" -d "{\"video_path\":\"E:/片库/movie.mkv\"}"
+```
+
+```json
+{
+  "ok": true,
+  "video": "E:\\片库\\movie.mkv",
+  "duration": 1442.2,
+  "embedded": [
+    {"index": 39, "codec": "subrip", "language": "chi", "title": "Simplified",
+     "default": false, "forced": false, "hearing_impaired": false}
+  ],
+  "sidecar": [
+    {"path": "E:\\片库\\movie.scjp.ass", "format": "ass", "language_hint": "zh-ja"}
+  ],
+  "has_soft_subtitle": true,
+  "hint": "embedded"
+}
+```
+
+- 内嵌：ffprobe `-select_streams s`，`index` 是 ffprobe 的流序号（抽取时原样传回）；
+- 外挂：同目录同名前缀的 `.ass/.ssa/.srt/.vtt`（含 `.scjp`/`.tcjp`/`.zh` 等后缀）；
+- `hint`：`embedded` / `sidecar` / `hardcoded_or_none`；
+- **Baha / ANi 硬字幕 MP4 通常 `embedded=[]`、`sidecar=[]`、`hint=hardcoded_or_none`**，
+  这时没有软字幕，调用方应决定 OCR（画面）或 ASR（音轨），不要假设一定有字幕流。
+
+### `POST /media/subtitles/extract`（抽字幕）
+
+```json
+{"video_path":"E:/片库/movie.mkv","index":39}
+```
+
+或外挂：
+
+```json
+{"sidecar":"E:/片库/movie.scjp.ass","format":"srt"}
+```
+
+默认返回 segments：
+
+```json
+{
+  "ok": true,
+  "source": "embedded",
+  "segments": [
+    {"start": 12.595, "end": 13.93, "text": "乱马"},
+    {"start": 14.973, "end": 17.35, "text": "是良牙啊"}
+  ],
+  "count": 247,
+  "language": "chi",
+  "format": "segments"
+}
+```
+
+`format="srt"` 时另存到 `<OUTPUT>/subtitles/<时间戳>.srt`，响应多一个
+`"path"`（文件内容为 UTF-8）。解析支持 SRT / VTT / ASS / SSA：
+
+- ASS 去掉 `{...}` 样式、把 `\N` 还原为换行；
+- 双语（同事件日文+中文，或同一时间点两条独立事件）**只保留中文**；
+- 同一事件里完全重复的行去重，相邻重复文本合并。
+
+实测：
+
+| 素材 | 来源 | 结果 |
+| --- | --- | --- |
+| 142 分钟电影（ASS index 2，简中） | embedded | 2211 段，0.7 s |
+| Ranma S03E02（38 条字幕流，简中 index 39） | embedded | 247 段 |
+| 迷宫饭 01（`.scjp.ass` 简日双语） | sidecar | 504 段，只留中文，0.02 s |
 
 ---
 
@@ -881,9 +988,9 @@ failed / canceled）后默认删除，`LOCALAI_JOBS_KEEP_UPLOADS=1` 可保留。
 | 接口 | 说明 |
 | --- | --- |
 | `GET /jobs?state=&kind=&limit=&offset=` | 列表，创建时间倒序；`total` 为过滤后总数 |
-| `GET /jobs/{id}` | 详情（含 `result` / `error`） |
+| `GET /jobs/{id}` | 详情：完整记录（含 `payload` / `result` / `error` / `started_at` / `finished_at` / `attempts` / `client_ip` / `meta`） |
 | `POST /jobs/{id}/cancel` | queued 立即 `canceled`；running 标记 `cancel_requested`，跑完不写结果 |
-| `GET /jobs/{id}/result` | done 后取结果；TTS 这类音频直接返回文件，其它返回 JSON |
+| `GET /jobs/{id}/result` | done 后取结果：`result` 里 `path` / `output_path` / `output` / `audio_path` / `file` 指向的**已存在文件**统一按 MIME 下发（音频、图片、其它文件，`Content-Disposition: inline`）；没有文件时返回 JSON `result` |
 | `GET /jobs/stats` | 队列统计 + 调度器状态 |
 
 列表响应：
@@ -904,6 +1011,16 @@ failed / canceled）后默认删除，`LOCALAI_JOBS_KEEP_UPLOADS=1` 可保留。
 ```json
 {"ok": false, "id": "…", "state": "done", "error": "not_cancelable"}
 ```
+
+`/jobs/{id}/result` 的边界（WebUI 任务详情弹窗也依赖这些规则）：
+
+- 任务还没结束时返回 **409** `{"error": "job_not_done", "detail": "<error 或 任务尚未完成>"}`；
+- `result` 里有文件路径且文件存在时直接下发文件，`Content-Type` 按扩展名猜，
+  `Content-Disposition: inline`（浏览器里可直接播放/预览）；
+- 只允许读取 `<HOME>/outputs/`、`<HOME>/data/downloads/`、`<HOME>/data/uploads/`
+  之下的文件；越界（含 `..`、盘符外路径）返回 **403**
+  `{"error": "result_path_not_allowed"}`，不会 500，也不会泄漏任意文件；
+- 路径存在但文件已被清理时回退成 **200 + JSON** `result`，调用方按 JSON 处理即可。
 
 ### 12.7 `GET /jobs/stats`
 
@@ -1422,9 +1539,12 @@ curl -X POST http://127.0.0.1:7880/media/analyze \
   -d '{"url":"https://www.bilibili.com/video/BV1UY4G6pEJg","engine":"auto","max_frames":3}'
 ```
 
-编排：**下载 →（站点字幕 | ASR 分段）→ 场景边界 → 可选抽帧**。
+编排：**下载 →（软字幕 | 站点字幕 | ASR 分段）→ 场景边界 → 可选抽帧**。
 
-- `engine`：`whisper` / `sensevoice` / `auto`；只在站内没有可用字幕时使用；
+- `subtitles`：`true`（默认，下载站点字幕）/ `false`（不下载）/
+  `"auto"`（下载后先探测内嵌/外挂软字幕，有就直接解析，**不跑 ASR**；
+  没有再退站点字幕 / ASR）。
+- `engine`：`whisper` / `sensevoice` / `auto`；只在没有软字幕/站点字幕时使用；
   `auto` 在需要时间戳时选 `whisper`。
 - `max_frames`：0（默认，不抽帧）~ 200。抽帧点均匀分布，并吸附到最近的镜头
   边界（2 秒内）。
@@ -1449,7 +1569,8 @@ curl -X POST http://127.0.0.1:7880/media/analyze \
 }
 ```
 
-`subtitles_from` 取值：`site`（站点字幕）或 `asr`（识别结果）。
+`subtitles_from` 取值：`embedded`（内嵌软字幕）/ `sidecar`（外挂字幕）/
+`site`（站点字幕）/ `asr`（识别结果）/ `none`。
 `segments` 已保证升序、无重叠、`end > start`（与 `/asr/segments` 同一整理逻辑）。
 
 ### 14.6 限额与环境变量
@@ -1597,26 +1718,38 @@ curl.exe -s -X POST http://127.0.0.1:7880/vision/scan -H "Content-Type: applicat
   "video_path": "E:/LocalAIService/data/downloads/2026-11-08/xxx.mp4",
   "target_frames": 3,
   "planner": "hybrid",
-  "effort": "medium",
+  "effort": "auto",
   "max_rounds": 6,
-  "subtitles": [{"start": 0.08, "end": 0.68, "text": "本期盘点"}],
+  "subtitles": "auto",
   "scene_times": [1.52, 3.04]
 }
 ```
 
 ``video_path`` 与 ``job_id`` 二选一（``job_id`` 会从任务结果的 ``path`` 取视频）。
-``subtitles`` / ``scene_times`` 可选：不给就找同目录站点字幕（``*.zh.srt`` 等），
-没字幕再跑 ``/asr/segments`` 同款分段识别；场景点没给就现场 ``/media/scenes``。
-``effort`` 可选 ``low`` / ``medium``（默认）/ ``high``，预算见下表；
+``subtitles`` 可选：
+
+- 数组 ``[{start,end,text}]`` 或字幕文件路径：调用方已有，直接使用；
+- 字符串 ``"auto"``（推荐）：先走 ``/media/subtitles``，有内嵌/外挂软字幕就直接
+  解析，**不跑 ASR**；没有软字幕才跑 ``/asr/segments`` 同款识别；
+- 不传：旧行为（同目录站点字幕 → ASR）。
+
+``scene_times`` 不给就现场 ``/media/scenes``（自动走采样模式，超长片不会 300 秒超时）。
+``effort`` 可选 ``auto``（默认）/ ``low`` / ``medium`` / ``high``，预算见下表；
 ``max_rounds`` 只是上限，程序会再按 effort 收紧（取较小值）。
 
-**effort 预算表**
+**effort 预算表**（target=3 示例）
 
-| effort | 候选数 | 最多轮数 | VLM 调用上限 | clip 上限 | 行为 |
-| --- | --- | --- | --- | --- | --- |
-| `low` | `target×2`（最少 6） | 2 | 6 | 0 | 每段只取中点，不细看 |
-| `medium`（默认） | `target×4`（最少 6） | 4 | 16 | 1 | 覆盖 + 字幕关键词 + 无人声段 |
-| `high` | `target×6`（最少 6） | 6 | 32 | 2 | 再允许用 clip 细看「字幕密集但没看清」的段 |
+| effort | 档位 | 覆盖分段 K | 候选数 | 最多轮数 | VLM 上限 | clip | 行为 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `auto` | ≤10 分钟→low | `max(target×2,6)` | 至少 K | 2 | 6 | 0 | 短视频用 low |
+| `auto` | 10~40 分钟→medium | `max(target×2,8)` | 至少 K | 4 | 16 | 1 | 覆盖 + 关键词 |
+| `auto` | >40 分钟→high | `clamp(ceil(duration/300),8,24)` | 至少 K | 6 | 32 | 2 | 每约 5 分钟一段，142 分钟→24 段 |
+| `low` | — | `max(target×2,6)` | `target×2`（最少 6） | 2 | 6 | 0 | 每段只取中点，不细看 |
+| `medium` | — | `max(target×2,6)` | `target×4`（最少 6） | 4 | 16 | 1 | 覆盖 + 字幕关键词 + 无人声段 |
+| `high` | — | `max(target×2,6)` | `target×6`（最少 6） | 6 | 32 | 2 | 再允许用 clip 细看「字幕密集但没看清」的段 |
+
+> `auto` 的 high 只复用覆盖策略，**不会**像显式 `high` 那样主动重编码 4K clip；
+> 显式 `effort="high"` 才触发 clip。候选数会自动补齐到 K，保证每段至少 1 个候选。
 
 候选数指**规划候选点**；`clip` 抽出来的帧另计（`stats.clip_frames`），
 `stats.candidates` 是「实际预筛过的所有帧」= 规划抽帧 + clip 帧。
@@ -1629,9 +1762,12 @@ curl.exe -s -X POST http://127.0.0.1:7880/vision/scan -H "Content-Type: applicat
   "video": "...",
   "duration": 431.267,
   "target": 3,
-  "effort": "medium",
-  "budget": {"effort": "medium", "candidates": 12, "max_rounds": 4,
-             "vlm_limit": 16, "clip_limit": 1, "note": "..."},
+  "effort": "auto",
+  "effort_profile": "medium",
+  "coverage_segments": 8,
+  "budget": {"effort": "auto", "profile": "medium", "coverage_segments": 8,
+             "candidates": 12, "max_rounds": 4, "vlm_limit": 16,
+             "clip_limit": 1, "note": "..."},
   "rounds_used": 1,
   "frames": [
     {"time": 5.085, "path": "...", "score": 4, "kind": "chart",
@@ -1639,16 +1775,21 @@ curl.exe -s -X POST http://127.0.0.1:7880/vision/scan -H "Content-Type: applicat
   ],
   "silence_gaps": [{"start": 406.5, "end": 412.33}],
   "segments_seen": [{"index": 0, "extracted": 3, "picked": 1}],
+  "skipped_segments": [],
+  "uncovered_segments": [],
   "stats": {"candidates": 12, "planned_candidates": 12, "vlm_calls": 10,
             "blank_skipped": 0, "duplicates_skipped": 2, "elapsed_ms": 17560,
-            "planner": "hybrid", "effort": "medium", "max_rounds": 4,
+            "planner": "hybrid", "effort": "auto", "effort_profile": "medium",
+            "coverage_segments": 8, "max_rounds": 4,
             "subtitles": 209, "clip_calls": 0, "clip_frames": 0,
             "silence_gaps": 1, "vlm_limit": 16, "clip_limit": 1},
-  "subtitles_from": "site"
+  "subtitles_from": "embedded"
 }
 ```
 
 字段：``target`` 1~10；``planner`` ``hybrid``（默认）/``agent``；``max_rounds`` 1~12。
+``subtitles_from`` 取值：``embedded`` / ``sidecar`` / ``asr`` / ``provided`` /
+``site``（旧站点字幕）/ ``none``。
 凑不够时如实少给，并带 ``detail``/``stats.shortfall``；VLM 不可用时带
 ``degraded=true`` + ``degraded_reason``，帧仍来自确定性回退。
 ``confidence="low"`` 表示 VLM 的 summary 少于 6 个字或含「大概/可能」等模糊词，
@@ -1667,24 +1808,40 @@ curl.exe -s -X POST http://127.0.0.1:7880/vision/scan -H "Content-Type: applicat
 
 **算法（两条 planner 共用）**
 
-1. ffprobe 取时长；字幕按「调用方 > 同目录站点字幕 > ASR」；
-2. 从字幕算 `silence_gaps`（相邻字幕 ≥5 秒、首尾也算），**每个空档中点必进候选**
+1. ffprobe 取时长；`effort=auto` 按 10/40 分钟定档，并算出覆盖段数 K；
+2. 字幕按「`auto`：服务端软字幕（内嵌 > 外挂）→ 站点字幕 → ASR」；
+   有软字幕时**不跑 ASR**；
+3. 从字幕算 `silence_gaps`（相邻字幕 ≥5 秒、首尾也算），**每个空档中点必进候选**
    （除非与已有候选 <2 秒）；
-3. 全片等分成 `K = max(target×2, 6)` 段，**每段至少 1 个候选**；
-   候选返回顺序按段轮转，禁止沿时间顺序挤在开头；
-4. 生成候选点（空档中点 > 字幕关键词 > 场景切换 > 段覆盖/均匀补充，点间距 ≥3 秒）；
-5. 先抽候选，做**感知哈希去重**（dHash 汉明距离，默认阈值 6）+ **亮度/方差预筛**
+4. 全片等分成 K 段，**每段至少 1 个候选**；候选按段轮转，禁止沿时间顺序挤在开头；
+5. 生成候选点（空档中点 > 字幕关键词 > 场景切换 > 段覆盖/均匀补充，点间距 ≥3 秒）；
+6. **覆盖硬规则（代码强制，不靠模型）**：
+   - 只要还有段没抽过，本轮只从未覆盖段取，每段最多 1 个；
+   - 所有段都抽过 1 次之前，绝不从任何段抽第 2 个；
+   - agent 的 `extract` / `extract_clip` 在覆盖轮未完成时被强制改成未覆盖段抽帧；
+   - 最终 `target <= K` 时同一段最多贡献 1 帧；
+   - 最终首尾帧至少相距 1/3 时长，不够就按均匀摊段补抽，最多 2 轮；
+   - 某段抽回来全是空白/重复，自动换同段时间点重抽，最多 3 次；
+     仍失败写进 `skipped_segments`，不阻塞其它段；
+7. 先抽候选，做**感知哈希去重**（dHash 汉明距离，默认阈值 6）+ **亮度/方差预筛**
    （近纯色、低方差直接判 `blank`，不调 VLM）；
-6. 对非空白帧调 VLM 评分（无人声段会把 `silence_gap=true` 传给模型）；
+8. 对非空白帧调 VLM 评分（无人声段会把 `silence_gap=true` 传给模型）；
    同一张幻灯片按「感知哈希 / OCR 相似度 / summary」只留一张；
-7. 不够就补抽，**优先补还没有选中帧的段**；
-8. 最终选帧优先每个段一张，并在段数多于目标帧时按段均匀取（0/中/尾）；
-   若仍全落在同一段，**代码强制**再补抽其它段，最多 2 轮；
 9. VLM 连续失败两次提前终止，退回方差 + 场景点的确定性结果。
 
 抽帧宽度固定 768px（够看清幻灯片正文，又把视觉 token 控制在 ~1000）。
 结果图片落在 ``outputs/frames/vision_<时间戳>_<随机>/``；
 clip 帧落在同目录的 ``clips/`` 子目录。
+
+**长片实测（`effort=auto`、`target=3`、`subtitles=auto`）**
+
+| 素材 | 时长 | 档位 / K | 字幕来源 | 最终 3 帧（秒） | 段分布 | 耗时 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 超时空辉夜姬.mkv | 8523 s | high / 24 | embedded（ASS 简中） | 815.160 / 4439.167 / 8345.633 | 2 / 12 / 23 | 78.8 s |
+| Ranma S03E02.mkv | 1442 s | medium / 8 | embedded（subrip 简中） | 6.298 / 569.360 / 1332.476 | 0 / 3 / 7 | 28.0 s |
+
+142 分钟片首尾相距 7530.5 秒（≥ 1/3 时长 2841 秒），24 段全部抽过，
+`skipped_segments=[]`、`uncovered_segments=[]`。
 
 ### 15.5 `POST /jobs/vision`
 
@@ -1723,10 +1880,16 @@ curl.exe -s -X POST http://127.0.0.1:7880/jobs/vision -H "Content-Type: applicat
   "runtime": "llama.cpp", "runtime_version": "b12202", "port": 7891,
   "model_size_mb": 1840.5, "mmproj_size_mb": 805.6,
   "vram_estimate_mb": 3400, "planner_default": "hybrid",
-  "effort_default": "medium", "effort_choices": ["low", "medium", "high"],
-  "effort_budgets": {"low": {"candidates": 6, "max_rounds": 2, "vlm_limit": 6, "clip_limit": 0},
-                     "medium": {"candidates": 12, "max_rounds": 4, "vlm_limit": 16, "clip_limit": 1},
-                     "high": {"candidates": 18, "max_rounds": 6, "vlm_limit": 32, "clip_limit": 2}},
+  "effort_default": "auto", "effort_choices": ["auto", "low", "medium", "high"],
+  "effort_budgets": {
+    "auto": {"effort": "auto", "profile": "low", "coverage_segments": 6,
+             "candidates": 6, "max_rounds": 2, "vlm_limit": 6, "clip_limit": 0},
+    "low": {"candidates": 6, "max_rounds": 2, "vlm_limit": 6, "clip_limit": 0},
+    "medium": {"candidates": 12, "max_rounds": 4, "vlm_limit": 16, "clip_limit": 1},
+    "high": {"candidates": 18, "max_rounds": 6, "vlm_limit": 32, "clip_limit": 2}},
+  "auto_tiers": {"<=600s": "low，K=max(target×2,6)",
+                 "601~2400s": "medium，K=max(target×2,8)",
+                 ">2400s": "high 覆盖策略，K=clamp(ceil(duration/300),8,24)"},
   "prompts": {"dir": "...", "score": true, "agent": true, "plan": true, "video": true},
   "endpoints": ["/vision/describe", "/vision/scan", "/vision/frames", "/vision/video",
                 "/vision/frame", "/vision/status", "/jobs/vision"],

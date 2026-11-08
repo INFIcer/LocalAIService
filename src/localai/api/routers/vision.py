@@ -609,13 +609,19 @@ async def vision_status_endpoint(request: Request) -> dict[str, Any]:
         "effort_default": EFFORT_DEFAULT,
         "effort_choices": list(EFFORT_CHOICES),
         "effort_budgets": {
+            "auto": effort_budget(3, "auto", 0),
             "low": effort_budget(3, "low"),
             "medium": effort_budget(3, "medium"),
             "high": effort_budget(3, "high"),
         },
+        "auto_tiers": {
+            "<=600s": "low，K=max(target×2,6)",
+            "601~2400s": "medium，K=max(target×2,8)",
+            ">2400s": "high 覆盖策略，K=clamp(ceil(duration/300),8,24)",
+        },
         "effort_budget_note": (
-            "候选数 = target × factor（至少 6）；max_rounds/vlm_limit/clip_limit "
-            "为该 effort 的硬上限；target 不同时候选数按比例变化"
+            "auto 按时长定档；候选数至少补齐覆盖段 K；"
+            "max_rounds/vlm_limit/clip_limit 为该档硬上限"
         ),
         "vram_estimate_mb": estimates.get("vision", adapter.estimate_mb()),
         "idle_unload_seconds": cfg.vision_idle_unload,

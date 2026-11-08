@@ -20,7 +20,9 @@ ffmpeg 媒体工具（本地 AI 服务共用）
     extract_frames_window(src, start, end) 在 [start,end] 窗口内按 fps 抽帧，命名带绝对时间点
     clip(src, start, end, ...)          裁剪一段（默认重编码成 h264 mp4，时间点精确）
     extract_audio(src, out_dir, fmt=...) 只抽音轨（保留原采样率）
-    detect_scenes(src, ...)              场景/镜头边界检测（ffmpeg scene 分数）
+    list_subtitles(src)                  列内嵌/外挂软字幕
+    extract_subtitle_segments(...)       抽字幕为 segments / srt
+    detect_scenes(src, ...)              场景/镜头边界检测（长片自动采样）
 
 命令行自检：
     python ffmpeg_tool.py status
@@ -30,6 +32,9 @@ ffmpeg 媒体工具（本地 AI 服务共用）
     python ffmpeg_tool.py window D:\\a.mp4 --start 200 --end 260 --fps 1 --out D:\\frames
     python ffmpeg_tool.py clip   D:\\a.mp4 --start 200 --end 260 --out D:\\clips
     python ffmpeg_tool.py audio  D:\\a.mp4 --out D:\\audio --format mp3
+    python ffmpeg_tool.py scenes D:\\a.mp4 --mode auto
+    python ffmpeg_tool.py subtitles D:\\a.mkv
+    python ffmpeg_tool.py subs D:\\a.mkv --index 2 --format srt --out D:\\subs
 """
 
 from __future__ import annotations
@@ -926,6 +931,212 @@ def extract_audio(
 
 
 # ---------------------------------------------------------------------------
+# 字幕：列内嵌 / 外挂，抽取成 segments 或 srt
+# ---------------------------------------------------------------------------
+
+#: 支持的外挂字幕扩展名（和 core.subtitles.SIDECAR_EXTENSIONS 保持一致）。
+_SUBTITLE_SIDECAR_EXTENSIONS = (".ass", ".ssa", ".srt", ".vtt")
+
+
+def _subtitle_lib() -> Any:
+    """延迟导入 ``localai.core.subtitles``（引擎脚本单独跑时也能找到 src）。"""
+    try:
+        from localai.core import subtitles as module  # noqa: PLC0415
+    except ImportError:
+        src_dir = Path(__file__).resolve().parents[1] / "src"
+        if src_dir.is_dir() and str(src_dir) not in sys.path:
+            sys.path.insert(0, str(src_dir))
+        from localai.core import subtitles as module  # noqa: PLC0415
+
+    return module
+
+
+def _subtitle_streams(source: Path) -> tuple[list[dict[str, Any]], Optional[float]]:
+    """ffprobe 只取字幕流 + 时长，返回 ``(streams, duration)``。"""
+    proc = _run(
+        [
+            "-v", "error",
+            "-select_streams", "s",
+            "-show_streams",
+            "-show_format",
+            "-print_format", "json",
+            str(source),
+        ],
+        probe=True,
+    )
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise MediaError(f"ffprobe 字幕流返回的不是合法 JSON：{exc}") from exc
+    streams = []
+    for stream in data.get("streams") or []:
+        if (stream.get("codec_type") or "").lower() != "subtitle":
+            continue
+        tags = stream.get("tags") or {}
+        disposition = stream.get("disposition") or {}
+        streams.append(
+            {
+                "index": _as_int(stream.get("index")),
+                "codec": stream.get("codec_name"),
+                "codec_long_name": stream.get("codec_long_name"),
+                "language": (tags.get("language") or "und").strip() or "und",
+                "title": (tags.get("title") or "").strip() or None,
+                "default": bool(int(disposition.get("default") or 0)),
+                "forced": bool(int(disposition.get("forced") or 0)),
+                "hearing_impaired": bool(int(disposition.get("hearing_impaired") or 0)),
+            }
+        )
+    duration = _as_float((data.get("format") or {}).get("duration"))
+    return streams, duration
+
+
+def list_subtitles(path: str | Path) -> dict[str, Any]:
+    """列出一个视频的软字幕：内嵌流 + 同目录外挂字幕。
+
+    返回::
+
+        {
+          "video": "...", "duration": 1442.2,
+          "embedded": [{"index":2,"codec":"ass","language":"chi","title":"简中","default":true}],
+          "sidecar": [{"path":"...scjp.ass","format":"ass","language_hint":"zh-ja"}],
+          "has_soft_subtitle": true, "hint": "embedded|sidecar|hardcoded_or_none"
+        }
+
+    没有内嵌也没有外挂时 ``hint="hardcoded_or_none"``，调用方据此决定 OCR/ASR
+    （Baha / ANi 的硬字幕 MP4 通常就是这种情况）。
+    """
+    source = _require_file(path)
+    streams, duration = _subtitle_streams(source)
+    if duration is None:
+        info = probe(source)
+        duration = info.get("duration")
+    lib = _subtitle_lib()
+    sidecar = lib.find_sidecar_subtitles(source)
+    embedded = [
+        {
+            "index": item["index"],
+            "codec": item["codec"],
+            "language": item["language"],
+            "title": item["title"],
+            "default": item["default"],
+            "forced": item["forced"],
+            "hearing_impaired": item["hearing_impaired"],
+        }
+        for item in streams
+        if item.get("index") is not None
+    ]
+    hint = "embedded" if embedded else ("sidecar" if sidecar else "hardcoded_or_none")
+    return {
+        "ok": True,
+        "video": str(source),
+        "duration": None if duration is None else round(float(duration), 3),
+        "embedded": embedded,
+        "sidecar": sidecar,
+        "has_soft_subtitle": bool(embedded or sidecar),
+        "hint": hint,
+    }
+
+
+def _write_srt(segments: Sequence[dict[str, Any]], out_dir: str | Path) -> Path:
+    """把 segments 写成 SRT，文件名用「时间戳 + 毫秒」避免撞名。"""
+    lib = _subtitle_lib()
+    target_dir = Path(out_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    millis = int(time.time() * 1000) % 1000
+    target = target_dir / f"{stamp}_{millis:03d}.srt"
+    # 极小概率同一毫秒内两次请求：加序号兜底。
+    suffix = 1
+    while target.exists():
+        target = target_dir / f"{stamp}_{millis:03d}_{suffix}.srt"
+        suffix += 1
+    target.write_text(lib.format_srt(segments), encoding="utf-8")
+    return target
+
+
+def extract_subtitle_segments(
+    video: str | Path | None = None,
+    *,
+    index: int | None = None,
+    sidecar: str | Path | None = None,
+    fmt: str = "segments",
+    out_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """抽取一个字幕源，返回统一 segments；``fmt="srt"`` 时另存 SRT。
+
+    - ``sidecar``：直接解析外挂 srt / ass / ssa / vtt；
+    - ``video`` + ``index``：用 ffmpeg 把指定字幕流转成 srt 再解析。
+
+    返回 ``{ok, source, segments, count, language, path?}``；解析不到内容时抛
+    :class:`MediaError`。
+    """
+    if (video is None) == (sidecar is None):
+        raise MediaError("video/index 与 sidecar 必须二选一")
+    output_format = (fmt or "segments").strip().lower()
+    if output_format not in ("segments", "srt"):
+        raise MediaError(f"不支持的输出格式：{fmt}（只支持 segments / srt）")
+
+    lib = _subtitle_lib()
+    source_kind = "sidecar" if sidecar is not None else "embedded"
+    if sidecar is not None:
+        subtitle_path = _require_file(sidecar)
+        segments = lib.parse_subtitle_file(subtitle_path)
+        language = lib.language_hint(subtitle_path) or "und"
+    else:
+        source = _require_file(video)  # type: ignore[arg-type]
+        if index is None:
+            raise MediaError("抽取内嵌字幕必须给 index（ffprobe 的流序号）")
+        streams, _duration = _subtitle_streams(source)
+        selected = next(
+            (item for item in streams if int(item.get("index", -1)) == int(index)),
+            None,
+        )
+        if selected is None:
+            available = ", ".join(str(item.get("index")) for item in streams if item) or "无"
+            raise MediaError(f"视频里没有 index={index} 的字幕流（可用：{available}）")
+        temp_dir = Path(tempfile.mkdtemp(prefix="localai_sub_"))
+        subtitle_path = temp_dir / "embedded.srt"
+        try:
+            _run(
+                [
+                    "-v", "error",
+                    "-i", str(source),
+                    "-map", f"0:{int(index)}",
+                    "-c:s", "srt",
+                    "-f", "srt",
+                    str(subtitle_path),
+                ]
+            )
+            if not subtitle_path.is_file() or subtitle_path.stat().st_size == 0:
+                raise MediaError(f"ffmpeg 没有抽到字幕流 index={index}：{source}")
+            segments = lib.parse_subtitle_file(subtitle_path)
+        finally:
+            try:
+                subtitle_path.unlink(missing_ok=True)
+                temp_dir.rmdir()
+            except OSError:
+                pass
+        language = selected.get("language") or "und"
+
+    if not segments:
+        raise MediaError("字幕里没有解析出任何有效语句（可能是图形字幕 / 空字幕）")
+    result: dict[str, Any] = {
+        "ok": True,
+        "source": source_kind,
+        "segments": segments,
+        "count": len(segments),
+        "language": language,
+    }
+    if output_format == "srt":
+        target_dir = Path(out_dir) if out_dir is not None else (
+            Path(tempfile.gettempdir()) / "localai_subtitles"
+        )
+        result["path"] = str(_write_srt(segments, target_dir))
+        result["format"] = "srt"
+    return result
+
+
+# ---------------------------------------------------------------------------
 # 场景 / 镜头边界检测
 # ---------------------------------------------------------------------------
 
@@ -935,6 +1146,30 @@ SCENE_DEFAULT_THRESHOLD = 0.3
 SCENE_MAX_SCENES = 200
 #: 最小间隔（秒）：两次切换太近时只保留前一个，去掉抖动。
 SCENE_MIN_GAP = 1.0
+
+#: 超过这个时长（秒）默认改为「采样窗口」检测，避免超长片整片跑满超时。
+SCENE_SAMPLE_THRESHOLD_SECONDS = 15 * 60
+#: 采样窗口数量 / 每个窗口长度（秒）。
+SCENE_SAMPLE_WINDOWS = 8
+SCENE_WINDOW_SECONDS = 60.0
+#: 单窗口超时（秒）；失败只跳过该窗口。
+SCENE_WINDOW_TIMEOUT = 45.0
+#: 采样时避开片头 / 片尾的秒数。
+SCENE_EDGE_AVOID = 10.0
+#: 4K 超长片全帧解码太慢（实测 60 秒窗口就要 15s+），改用「只读关键帧包」：
+#: 只 demux 不 decode，8 个窗口合计通常 <5 秒，关键帧通常就落在镜头切点上。
+SCENE_KEYFRAME_FAST_WIDTH = 3000
+SCENE_KEYFRAME_FAST_SECONDS = 40 * 60
+
+
+def _scene_full_timeout() -> float:
+    """全片检测超时：``LOCALAI_SCENE_TIMEOUT``，默认 300 秒。"""
+    try:
+        value = float(os.environ.get("LOCALAI_SCENE_TIMEOUT", "300"))
+    except (TypeError, ValueError):
+        return 300.0
+    return value if value > 0 else 300.0
+
 
 #: 从 ffmpeg 日志里抠时间点 / 场景分数。
 _PTS_TIME_RE = re.compile(r"pts_time:\s*([0-9]+(?:\.[0-9]+)?)")
@@ -961,6 +1196,117 @@ def _debounce_scenes(
     return kept
 
 
+def _parse_scene_output(
+    proc: subprocess.CompletedProcess, *, offset: float = 0.0
+) -> list[tuple[float, float]]:
+    """从一条 ffmpeg 输出里解析 ``(pts_time + offset, scene_score)``。"""
+    pairs: list[tuple[float, float]] = []
+    pending_time: Optional[float] = None
+    for line in (proc.stdout or "").splitlines():
+        time_match = _PTS_TIME_RE.search(line)
+        if time_match:
+            pending_time = float(time_match.group(1))
+            continue
+        score_match = _SCENE_SCORE_RE.search(line)
+        if score_match:
+            score = float(score_match.group(1))
+            if pending_time is not None:
+                pairs.append((pending_time + offset, score))
+                pending_time = None
+
+    # stderr：showinfo 的 pts_time（stdout 没解析到时的兜底）。
+    if not pairs:
+        for line in (proc.stderr or "").splitlines():
+            if "Parsed_showinfo" not in line:
+                continue
+            match = _PTS_TIME_RE.search(line)
+            if match:
+                pairs.append((float(match.group(1)) + offset, 0.0))
+    return pairs
+
+
+def _scene_filter(threshold: float) -> str:
+    # 9 位小数足够把 ffmpeg 的 pts_time 原样带过来。
+    return (
+        f"select='gt(scene,{threshold:.6f})',"
+        "metadata=mode=print:file=-,showinfo"
+    )
+
+
+def _sample_windows(duration: float) -> tuple[list[dict[str, float]], list[str]]:
+    """把长视频均匀切成 N 个 60 秒窗口，避开片头片尾各 10 秒。"""
+    warnings: list[str] = []
+    usable_start = min(SCENE_EDGE_AVOID, max(0.0, duration / 4))
+    usable_end = max(usable_start, duration - SCENE_EDGE_AVOID)
+    span = usable_end - usable_start
+    if span <= 0:
+        return [], ["视频太短，无法在避开片头片尾后采样"]
+    window = min(SCENE_WINDOW_SECONDS, span)
+    count = max(1, int(SCENE_SAMPLE_WINDOWS))
+    # 窗口短于 60 秒时按可用区间等分，避免 8 个窗口完全重叠。
+    step = max(window, span / count)
+    windows: list[dict[str, float]] = []
+    for index in range(count):
+        center = usable_start + (index + 0.5) * (span / count)
+        start = _clamp_float(center - window / 2, usable_start, usable_end - window)
+        windows.append(
+            {
+                "start": round(start, 3),
+                "end": round(min(usable_end, start + window), 3),
+            }
+        )
+    if step <= 0:  # pragma: no cover - 防御性分支
+        return [], ["无法计算采样窗口"]
+    return windows, warnings
+
+
+def _clamp_float(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _detect_keyframe_window(
+    source: Path,
+    start: float,
+    end: float,
+    *,
+    timeout: float = SCENE_WINDOW_TIMEOUT,
+) -> list[tuple[float, float]]:
+    """只读关键帧包（不 decode），返回窗口内的 ``(pts_time, 1.0)``。
+
+    4K HEVC 长片全帧解码时，一个 60 秒窗口就要十几秒，8 个窗口会超过 90 秒。
+    这里用 ffprobe 的 ``packet`` 列表 + ``-read_intervals`` 限定窗口，只 demux
+    关键帧包；大多数压制组会在镜头切点插关键帧，因此边界质量够用，耗时通常
+    不到 1 秒/窗口。score 固定 1.0（没有逐帧 scene 分数）。
+    """
+    proc = _run(
+        [
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-read_intervals", f"{start:.3f}%{end:.3f}",
+            "-show_entries", "packet=pts_time,flags",
+            "-of", "csv=p=0",
+            str(source),
+        ],
+        probe=True,
+        timeout=timeout,
+    )
+    found: list[tuple[float, float]] = []
+    for line in (proc.stdout or "").splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 2:
+            continue
+        try:
+            point = float(parts[0])
+        except ValueError:
+            continue
+        flags = parts[1]
+        if "K" not in flags:
+            continue
+        if start - 0.05 <= point <= end + 0.05:
+            found.append((round(point, 3), 1.0))
+    return found
+
+
 def detect_scenes(
     src: str | Path,
     *,
@@ -969,31 +1315,23 @@ def detect_scenes(
     min_gap: float = SCENE_MIN_GAP,
     save_dir: str | Path | None = None,
     timeout: float | None = None,
+    mode: str = "auto",
 ) -> dict[str, Any]:
     """检测视频的镜头切换点（ffmpeg ``scene`` 分数）。
 
-    实现：``-vf "select='gt(scene,TH)',metadata=mode=print:file=-,showinfo"
-    -f null -``
+    ``mode``
+    --------
+    - ``auto``（默认）：时长 > 15 分钟时自动用**采样窗口**，否则全片检测；
+    - ``sampled``：强制采样（8 个 60 秒窗口，避开片头片尾各 10 秒）；
+    - ``full``：强制全片检测，超时用 ``LOCALAI_SCENE_TIMEOUT``（默认 300 秒）。
 
-    - ``showinfo`` 把每个被选中帧的 ``pts_time`` 打到 stderr；
-    - ``metadata=mode=print`` 把 ``lavfi.scene_score`` 打到 stdout；
-    - 两边按顺序对齐；万一 stdout 没解析到，就退回只用 stderr 的时间点、
-      分数记 0。
+    采样模式下每个窗口单独跑 ffmpeg，单窗口超时 45 秒；失败只跳过该窗口
+    并把原因写进 ``warnings``，不会让整个请求 504。返回里带 ``mode`` /
+    ``windows`` / ``warnings``，方便调用方判断覆盖范围。
 
-    参数
-    ----
-    threshold:  场景分数阈值，默认 0.3（越大越严格）。
-    max_scenes: 最多返回多少个边界，默认 200。
-    min_gap:    最小间隔（秒），默认 1.0；更近的只保留前一个。
-    save_dir:   给了就把结果写一份 ``<save_dir>/<时间戳>.json``。
-
-    返回::
-
-        {"count": 2, "scenes": [{"time": 1.52, "score": 1.0}, ...],
-         "duration": 4.56, "threshold": 0.3, "max_scenes": 200,
-         "min_gap": 1.0, "json_path": "...json"（可选）}
-
-    错误抛 :class:`MediaError`（文件不存在 / 没有视频流 / ffmpeg 失败）。
+    其它实现细节：``showinfo`` 把被选中帧的 ``pts_time`` 打到 stderr；
+    ``metadata=mode=print`` 把 ``lavfi.scene_score`` 打到 stdout；两边按顺序
+    对齐，stdout 没解析到就退回 stderr 的时间点（分数记 0）。
     """
     source = _require_file(src)
     try:
@@ -1012,57 +1350,105 @@ def detect_scenes(
     if min_gap < 0:
         raise MediaError(f"min_gap 不能是负数，收到 {min_gap}")
 
+    mode_name = (mode or "auto").strip().lower()
+    if mode_name not in ("auto", "sampled", "full"):
+        raise MediaError(f"mode 只支持 auto / sampled / full，收到 {mode!r}")
+
     info = probe(source)
     if not info.get("video"):
         raise MediaError(f"这个文件没有视频流，做不了场景检测：{source}")
-
-    # 9 位小数足够把 ffmpeg 的 pts_time 原样带过来。
-    scene_filter = (
-        f"select='gt(scene,{threshold:.6f})',"
-        "metadata=mode=print:file=-,showinfo"
+    duration = info.get("duration")
+    if not duration or float(duration) <= 0:
+        raise MediaError(f"读不出视频时长，做不了场景检测：{source}")
+    duration = float(duration)
+    use_sampled = mode_name == "sampled" or (
+        mode_name == "auto" and duration > SCENE_SAMPLE_THRESHOLD_SECONDS
     )
-    proc = _run(
-        ["-v", "info", "-i", str(source), "-vf", scene_filter, "-f", "null", "-"],
-        timeout=timeout,
+    video_info = info.get("video") or {}
+    width = _as_int(video_info.get("width")) or 0
+    fast_keyframes = (
+        use_sampled
+        and duration > SCENE_KEYFRAME_FAST_SECONDS
+        and width >= SCENE_KEYFRAME_FAST_WIDTH
     )
 
-    # stdout：成对的 pts_time / lavfi.scene_score（按帧顺序）。
     pairs: list[tuple[float, float]] = []
-    pending_time: Optional[float] = None
-    for line in (proc.stdout or "").splitlines():
-        time_match = _PTS_TIME_RE.search(line)
-        if time_match:
-            pending_time = float(time_match.group(1))
-            continue
-        score_match = _SCENE_SCORE_RE.search(line)
-        if score_match:
-            score = float(score_match.group(1))
-            if pending_time is not None:
-                pairs.append((pending_time, score))
-                pending_time = None
+    windows_payload: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    filter_expression = _scene_filter(threshold)
 
-    # stderr：showinfo 的 pts_time（stdout 没解析到时的兜底）。
-    if not pairs:
-        for line in (proc.stderr or "").splitlines():
-            if "Parsed_showinfo" not in line:
-                continue
-            match = _PTS_TIME_RE.search(line)
-            if match:
-                pairs.append((float(match.group(1)), 0.0))
+    if use_sampled:
+        windows, window_warnings = _sample_windows(duration)
+        warnings.extend(window_warnings)
+        for window in windows:
+            start = float(window["start"])
+            span = max(0.1, float(window["end"]) - start)
+            window_info: dict[str, Any] = {
+                "start": round(start, 3),
+                "end": round(min(duration, start + span), 3),
+                "timeout_sec": SCENE_WINDOW_TIMEOUT,
+                "count": 0,
+                "detector": "keyframe" if fast_keyframes else "ffmpeg_scene",
+            }
+            try:
+                if fast_keyframes:
+                    found = _detect_keyframe_window(source, start, start + span)
+                else:
+                    proc = _run(
+                        [
+                            "-v", "info",
+                            "-ss", f"{start:.3f}",
+                            "-i", str(source),
+                            "-t", f"{span:.3f}",
+                            "-vf", filter_expression,
+                            "-f", "null", "-",
+                        ],
+                        timeout=SCENE_WINDOW_TIMEOUT,
+                    )
+                    found = _parse_scene_output(proc, offset=start)
+                pairs.extend(found)
+                window_info["count"] = len(found)
+            except MediaError as exc:
+                message = (
+                    f"场景采样窗口 {start:.1f}~{start + span:.1f}s 失败，已跳过：{exc}"
+                )
+                warnings.append(message)
+                window_info["error"] = str(exc)[:300]
+            windows_payload.append(window_info)
+        actual_mode = "sampled"
+    else:
+        proc = _run(
+            [
+                "-v", "info",
+                "-i", str(source),
+                "-vf", filter_expression,
+                "-f", "null", "-",
+            ],
+            timeout=timeout if timeout is not None else _scene_full_timeout(),
+        )
+        pairs = _parse_scene_output(proc)
+        actual_mode = "full"
+        windows_payload = [
+            {"start": 0.0, "end": round(duration, 3), "timeout_sec": timeout or _scene_full_timeout()}
+        ]
 
     scenes = _debounce_scenes(pairs, min_gap=min_gap)[:max_scenes]
     result: dict[str, Any] = {
         "count": len(scenes),
         "scenes": [{"time": seconds, "score": score} for seconds, score in scenes],
-        "duration": info.get("duration"),
+        "duration": round(duration, 3),
         "threshold": threshold,
         "max_scenes": max_scenes,
         "min_gap": min_gap,
         "source": str(source),
+        "mode": actual_mode,
+        "detector": "keyframe" if fast_keyframes else ("ffmpeg_scene" if use_sampled else "ffmpeg_scene"),
+        "windows": windows_payload,
+        "warnings": warnings,
     }
 
     if save_dir is not None:
-        # 落盘文件名用「时间戳 + 毫秒 + 短随机」，既不撞名又一眼能看出时间。
+        # 落盘文件名用「时间戳 + 毫秒」，既不撞名又一眼能看出时间。
         target_dir = Path(save_dir)
         target_dir.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -1070,10 +1456,14 @@ def detect_scenes(
         json_path = target_dir / f"{stamp}_{millis:03d}.json"
         payload = {
             "source": str(source),
-            "duration": info.get("duration"),
+            "duration": result["duration"],
             "threshold": threshold,
             "max_scenes": max_scenes,
             "min_gap": min_gap,
+            "mode": actual_mode,
+            "detector": result["detector"],
+            "windows": windows_payload,
+            "warnings": warnings,
             "count": len(scenes),
             "scenes": result["scenes"],
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -1139,7 +1529,18 @@ def _main() -> int:
     scenes_parser.add_argument("--threshold", type=float, default=SCENE_DEFAULT_THRESHOLD)
     scenes_parser.add_argument("--max-scenes", type=int, default=SCENE_MAX_SCENES)
     scenes_parser.add_argument("--min-gap", type=float, default=SCENE_MIN_GAP)
+    scenes_parser.add_argument("--mode", default="auto", choices=("auto", "sampled", "full"))
     scenes_parser.add_argument("--out", default=None, help="结果 json 落盘目录（可选）")
+
+    subtitles_parser = sub.add_parser("subtitles", help="列内嵌/外挂软字幕")
+    subtitles_parser.add_argument("path")
+
+    subs_parser = sub.add_parser("subs", help="抽字幕为 segments / srt")
+    subs_parser.add_argument("path", nargs="?", default=None, help="视频路径（配合 --index）")
+    subs_parser.add_argument("--index", type=int, default=None, help="内嵌字幕流序号")
+    subs_parser.add_argument("--sidecar", default=None, help="外挂字幕路径")
+    subs_parser.add_argument("--format", default="segments", choices=("segments", "srt"))
+    subs_parser.add_argument("--out", default=None, help="srt 输出目录（可选）")
 
     args = parser.parse_args()
     if args.command == "status":
@@ -1156,7 +1557,23 @@ def _main() -> int:
             threshold=args.threshold,
             max_scenes=args.max_scenes,
             min_gap=args.min_gap,
+            mode=args.mode,
             save_dir=args.out,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "subtitles":
+        print(json.dumps(list_subtitles(args.path), ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "subs":
+        result = extract_subtitle_segments(
+            args.path,
+            index=args.index,
+            sidecar=args.sidecar,
+            fmt=args.format,
+            out_dir=args.out,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0

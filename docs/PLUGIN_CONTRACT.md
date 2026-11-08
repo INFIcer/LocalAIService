@@ -621,23 +621,45 @@ POST /media/download
 
 ```json
 POST /media/analyze
-{"url": "https://...", "engine": "whisper|sensevoice|auto", "max_frames": 0}
+{"url": "https://...", "engine": "whisper|sensevoice|auto",
+ "subtitles": "auto", "max_frames": 0}
 ```
 
 返回：
 
 ```json
 {"ok":true,"title":"…","duration":123.4,"path":"…",
- "subtitles_from":"site|asr",
+ "subtitles_from":"embedded|sidecar|site|asr|none",
  "segments":[{"start":0.08,"end":0.68,"text":"…"}],
  "scenes":[{"time":6.4,"score":1.0}],
  "frames":[]}
 ```
 
 - `segments` 已升序、无重叠，可直接做字幕轴/时间戳跳转；
-- `subtitles_from="site"` 表示站内字幕，`"asr"` 表示服务端识别；
+- `subtitles="auto"` 时服务端先探测内嵌/外挂软字幕，有就不跑 ASR；
+  `subtitles_from` 对应 `embedded` / `sidecar`；
+- 站点字幕是 `site`，服务端识别是 `asr`，都没有是 `none`；
 - `max_frames=0` 不抽帧；需要缩略图时给 1~200，返回 `frames[].path`；
 - `scenes` 是镜头切换点（`time` 秒 + `score`），可直接做章节/关键帧。
+
+### 12.4.1 字幕：优先用服务端，别自己 ASR
+
+**这是硬约定**：插件不要自己调 whisper / ffmpeg 抽字幕，也不要因为没有看到
+`subtitles` 数组就默认跑 ASR。
+
+推荐顺序：
+
+1. 已经有视频本地路径时，先 `POST /media/subtitles {"video_path":"..."}`：
+   - `has_soft_subtitle=true` → `POST /media/subtitles/extract` 拿 segments；
+   - `hint="hardcoded_or_none"` → 说明没有软字幕（Baha/ANi 硬字幕 MP4），
+     再由插件/服务决定 OCR 或 ASR；
+2. 需要「字幕 + 场景」一起要，直接 `POST /media/analyze {"subtitles":"auto"}`，
+   服务端会先软字幕、再站点字幕、最后 ASR，插件只看 `subtitles_from`；
+3. 要关键帧时 `POST /vision/frames {"subtitles":"auto"}`，服务端同样优先软字幕，
+   **不会重复 ASR**。
+
+插件自己已经有字幕数组时，可以继续通过 `subtitles:[{start,end,text}]` 传给
+`/vision/frames`；不要为了「统一」把服务端已经解析好的字幕再送去 ASR。
 
 ### 12.5 错误映射
 
@@ -677,7 +699,8 @@ POST /jobs/vision
   "video_path": "E:/LocalAIService/data/downloads/2026-11-08/xxx.mp4",
   "target_frames": 3,
   "planner": "hybrid",
-  "effort": "medium",
+  "effort": "auto",
+  "subtitles": "auto",
   "max_rounds": 6
 }
 ```
@@ -686,7 +709,8 @@ POST /jobs/vision
 
 ```json
 {"state":"done","result":{
-  "ok":true,"duration":431.267,"target":3,"effort":"medium","rounds_used":1,
+  "ok":true,"duration":431.267,"target":3,"effort":"auto","effort_profile":"medium",
+  "coverage_segments":8,"rounds_used":1,
   "frames":[{"time":5.085,"path":"...","score":4,"kind":"chart",
              "ocr_text":"...","summary":"...","why":"...","confidence":"normal"}],
   "stats":{"candidates":12,"vlm_calls":10,"clip_calls":0,"elapsed_ms":17560},
@@ -705,12 +729,15 @@ POST /jobs/vision
 
 - `target_frames`：1~10；封面/摘要一般 3，长教程最多 5~6；
 - `planner`：默认 `hybrid`（快、稳定）；视频里图表/演示很多时再试 `agent`；
-- `effort`：`low`（快、≤6 次 VLM、不 clip）/ `medium`（默认）/ `high`（允许 clip 细看，
-  最多 32 次 VLM）；预算表见 `/vision/status` 的 `effort_budgets`；
+- `effort`：推荐 `auto`（默认，≤10 分钟→low、10~40 分钟→medium、
+  >40 分钟→high 覆盖策略且每约 5 分钟一段，142 分钟自动 24 段）；
+  也可显式 `low` / `medium` / `high`；预算表见 `/vision/status` 的 `effort_budgets`；
 - `max_rounds`：默认 6；短视频 2~3 就够，长视频不要超过 8（会被 effort 上限收紧）；
-- `subtitles` / `scene_times`：如果插件自己已经有（例如 `/asr/segments`、
-  `/media/scenes` 的结果），直接传，能省一次识别/检测；
-- 不传 `subtitles` 时，服务端优先找视频同目录的 `*.srt/*.vtt`，其次跑 ASR。
+- `subtitles`：推荐 `"auto"`（服务端先软字幕、再 ASR；有软字幕不会跑 ASR）。
+  如果插件自己已经有（例如 `/media/subtitles/extract`、`/asr/segments` 的结果），
+  直接传数组，能省一次解析；
+- `scene_times`：如果插件已经有 `/media/scenes` 的结果可以直接传；不传则现场检测
+  （长片自动采样，不会 300 秒超时）。
 
 ### 13.4 结果怎么用
 

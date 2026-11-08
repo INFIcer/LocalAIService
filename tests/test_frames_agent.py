@@ -1,4 +1,4 @@
-﻿"""关键帧挑选代理的单元测试：全部用假 VLM / 假媒体，不加载任何模型。
+"""关键帧挑选代理的单元测试：全部用假 VLM / 假媒体，不加载任何模型。
 
 覆盖：
 - agent 协议（extract -> final）能终止；
@@ -283,6 +283,7 @@ async def test_hybrid_supplements_until_enough(
         video,
         target_frames=2,
         planner="hybrid",
+        effort="medium",
         max_rounds=4,
         subtitles=[{"start": 10.0, "end": 12.0, "text": "参数对比"}],
         scene_times=[20.0, 40.0],
@@ -406,11 +407,19 @@ def test_effort_budget_table() -> None:
     assert (low["candidates"], low["max_rounds"], low["vlm_limit"], low["clip_limit"]) == (6, 2, 6, 0)
     assert (medium["candidates"], medium["max_rounds"], medium["vlm_limit"], medium["clip_limit"]) == (12, 4, 16, 1)
     assert (high["candidates"], high["max_rounds"], high["vlm_limit"], high["clip_limit"]) == (18, 6, 32, 2)
-    # target 变小时候选数至少 6；非法 effort 回落 medium。
+    # target 变小时候选数至少 6；非法 effort 回落 auto。
     assert effort_budget(1, "low")["candidates"] == 6
-    assert effort_budget(3, "ultra")["effort"] == "medium"
+    assert effort_budget(3, "ultra")["effort"] == "auto"
     assert coverage_segment_count(3) == 6
     assert coverage_segment_count(5) == 10
+    # auto 档位：短/中/超长。
+    short = effort_budget(3, "auto", 600)
+    middle = effort_budget(3, "auto", 601)
+    long = effort_budget(3, "auto", 8520)
+    assert short["profile"] == "low" and short["coverage_segments"] == 6
+    assert middle["profile"] == "medium" and middle["coverage_segments"] == 8
+    assert long["profile"] == "high" and long["coverage_segments"] == 24
+    assert long["candidates"] >= long["coverage_segments"]
 
 
 @pytest.mark.asyncio

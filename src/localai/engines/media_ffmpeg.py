@@ -31,6 +31,8 @@ class MediaAdapter(BaseAdapter):
         "/media/frames",
         "/media/audio",
         "/media/scenes",
+        "/media/subtitles",
+        "/media/subtitles/extract",
     )
 
     def get_module(self) -> Any:
