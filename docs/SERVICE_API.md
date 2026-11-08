@@ -388,7 +388,7 @@ multipart：
 ## 10. 并发、超时与首次加载
 
 - 所有 TTS / ASR / 人声分离任务都进同一个持久化队列，由**单 worker 派发**；
-  默认每类并行度为 1（ASR 引擎的可配置并发见 12.2.1，默认仍是串行），
+  默认每类并行度为 1；ASR 引擎的可配置并发见 12.2.1（默认 2，可设 1 回到完全串行），
   所以默认实际仍是一条一条跑。声纹/媒体接口仍是直接调用。
 - 每个 GPU 能力的推理闸门容量可调；默认 1，语义与旧锁相同。
 - 加载前统一经过显存管家：按 LRU 卸载其它空闲模型，仍不够则 507。
@@ -478,7 +478,7 @@ current_kind 有效、且该 kind 队列非空
 | --- | --- | --- |
 | `LOCALAI_JOBS_PARALLEL_TTS` | `1` | TTS 同类并行上限 |
 | `LOCALAI_JOBS_PARALLEL_ASR` | `1` | ASR 同类并行上限（兼容旧名） |
-| `LOCALAI_ASR_PARALLEL` | `1` | ASR 引擎真实并发容量，范围 1~4；新名优先 |
+| `LOCALAI_ASR_PARALLEL` | `2` | ASR 引擎真实并发容量，范围 1~4；新名优先（设 1 = 完全串行） |
 | `LOCALAI_ASR_UNLOAD_TIMEOUT` | `30` | 卸载等待推理退出的超时（秒） |
 | `LOCALAI_JOBS_PARALLEL_SEPARATE` | `1` | 人声分离同类并行上限 |
 | `LOCALAI_JOBS_PARALLEL_EXTRA_MB` | `600` | 每新增一个并行任务，要求额外预留的显存 |
@@ -497,7 +497,7 @@ current_kind 有效、且该 kind 队列非空
 5. 撞 CUDA OOM：立即把该 kind 的并行**临时降到 1**、卸载其它模型腾空间、
    只重试这一条任务一次；仍失败则任务 `failed`，进程不崩。
 
-#### 识别并发（SenseVoice，默认 1 = 完全串行）
+#### 识别并发（SenseVoice，默认 2；设 1 = 完全串行）
 
 **开关与优先级**
 
@@ -571,8 +571,8 @@ ASR 闸门容量设回 1、把该 kind 记入 `parallel_degraded`、卸载其它
 **默认值结论**
 
 并行 2 稳定、可正确识别、吞吐提升 53%（>20%），技术上达到「可以默认开 2」的
-条件；但本项目的安全边界是**默认串行**，所以代码里的默认值仍为 1。
-需要批量转写、且确认显存够用时，显式设置 `LOCALAI_ASR_PARALLEL=2` 即可；
+条件（实测 +53%，10/10 结果一致、30/30 稳定、无显存泄漏），因此默认值已从 1 改为 **2**。
+想更保守/省显存：显式设置 `LOCALAI_ASR_PARALLEL=1` 回到完全串行即可；
 并行 3 不建议作为默认值。
 
 **已知风险**
@@ -581,7 +581,7 @@ ASR 闸门容量设回 1、把该 kind 记入 `parallel_degraded`、卸载其它
   此时调度器会降级重试；
 - 本机 10 条比对没有出现结果串扰，但并发能力依赖 SenseVoice/funasr 的线程安全；
   升级 funasr、torch 或替换模型后应重新跑 10 条比对和 30 条稳定性；
-- 默认 1 时没有任何行为变化；只有显式配置 >1 才会进入并发路径。
+- 默认 2 会走并发路径；设 1 时与旧行为完全一致（同一时刻只跑一条识别）。
 
 **回滚方式**
 
@@ -619,7 +619,7 @@ TTS / 人声分离的旧实测数据保留如下（它们仍固定为 1）：
 | `LOCALAI_JOBS_RECOVER` | `requeue` | 重启时 running 的处理方式 |
 | `LOCALAI_JOBS_MAX_PARALLEL` | `1` | 总并发硬上限（`1`=不额外限制） |
 | `LOCALAI_JOBS_PARALLEL_TTS` | `1` | TTS 同类并行上限 |
-| `LOCALAI_JOBS_PARALLEL_ASR` | `1` | ASR 同类并行上限（兼容旧名，跟随 `LOCALAI_ASR_PARALLEL`） |
+| `LOCALAI_JOBS_PARALLEL_ASR` | `2` | ASR 同类并行上限（兼容旧名，跟随 `LOCALAI_ASR_PARALLEL`） |
 | `LOCALAI_ASR_PARALLEL` | `1` | ASR 引擎真实并发容量，范围 1~4 |
 | `LOCALAI_ASR_UNLOAD_TIMEOUT` | `30` | 卸载等待推理退出的超时（秒） |
 | `LOCALAI_JOBS_PARALLEL_SEPARATE` | `1` | 分离同类并行上限 |

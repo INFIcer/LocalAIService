@@ -30,7 +30,7 @@
     LOCALAI_ASR_IDLE_UNLOAD
     LOCALAI_SPEAKER_IDLE_UNLOAD
     LOCALAI_SEPARATE_IDLE_UNLOAD
-    LOCALAI_ASR_PARALLEL      识别引擎并发容量（默认 1=串行，范围 1~4）
+    LOCALAI_ASR_PARALLEL      识别引擎并发容量（默认 2，范围 1~4；设 1 = 完全串行）
     LOCALAI_ASR_UNLOAD_TIMEOUT 识别引擎卸载等待推理退出的超时秒数（默认 30）
     LOCALAI_TOKEN             可选的 Bearer 鉴权令牌（默认空=不鉴权）
 
@@ -219,7 +219,7 @@ class Config:
     #: 识别引擎（SenseVoice）真实并发容量：1（默认）= 完全串行，范围 1~4。
     #: 这是原生引擎 ``LOCALAI_ASR_PARALLEL`` 的服务层投影；调度器与适配器
     #: 都从它对齐，避免「调度开 2、引擎仍串行」的两套配置打架。
-    asr_parallel: int = 1
+    asr_parallel: int = 2
 
     # ---- 派生目录 -------------------------------------------------------
     @property
@@ -302,7 +302,7 @@ class Config:
             min(
                 4,
                 _pick_int(
-                    1, "LOCALAI_ASR_PARALLEL", "LOCALAI_JOBS_PARALLEL_ASR"
+                    2, "LOCALAI_ASR_PARALLEL", "LOCALAI_JOBS_PARALLEL_ASR"
                 ),
             ),
         )
