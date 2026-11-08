@@ -1,0 +1,120 @@
+"""与部署位置无关的业务常量。
+
+这里只放「协议/能力本身」的固定值；凡是可能因机器而变的路径、端口、开关，
+全部在 :mod:`localai.config` 里。
+"""
+
+from __future__ import annotations
+
+# ---------------------------------------------------------------------------
+# TTS
+# ---------------------------------------------------------------------------
+
+# 与 IndexTTS 上游支持的语言一致。
+SUPPORTED_LANGUAGES = ("zh", "en", "ja", "es", "ar")
+
+# 主权重文件（与 engine/engine.py、IndexTTS 节点保持一致）。
+REQUIRED_MODEL_FILES = (
+    "config.yaml",
+    "gpt.pth",
+    "s2mel.pth",
+    "codec.pth",
+    "wav2vec2bert_stats.pt",
+    "feat1.pt",
+    "feat2.pt",
+    "multilingual_zh_ja_yue_char_del.tiktoken",
+)
+
+# 独立引擎还需要这些辅助模型；缺了上游会尝试联网下载。
+REQUIRED_AUX_FILES = (
+    r"hf_cache\w2v-bert-2.0\config.json",
+    r"hf_cache\w2v-bert-2.0\model.safetensors",
+    r"hf_cache\w2v-bert-2.0\preprocessor_config.json",
+    r"hf_cache\campplus_cn_common.bin",
+    r"hf_cache\bigvgan\config.json",
+    r"hf_cache\bigvgan\bigvgan_generator.pt",
+)
+
+# TTS 单条请求文本上限（与旧接口的 pydantic 校验一致）。
+TTS_MAX_TEXT = 5000
+
+# ---------------------------------------------------------------------------
+# 音频 / 媒体格式
+# ---------------------------------------------------------------------------
+
+# 参考音色与音频上传接受的扩展名。
+AUDIO_EXTENSIONS = {
+    ".wav", ".mp3", ".flac", ".ogg", ".opus", ".m4a", ".aac",
+}
+
+# ffmpeg 能解的音频容器。
+MEDIA_AUDIO_EXTENSIONS = AUDIO_EXTENSIONS | {".wma", ".amr", ".aiff", ".aif", ".ape", ".m4b"}
+
+# ffmpeg 能解的视频容器。
+MEDIA_VIDEO_EXTENSIONS = {
+    ".mp4", ".mkv", ".mov", ".avi", ".flv", ".webm", ".m4v", ".ts",
+    ".mpg", ".mpeg", ".wmv", ".3gp", ".rmvb", ".vob",
+}
+
+# /asr 与 /media/* 统一接受的扩展名。
+MEDIA_EXTENSIONS = MEDIA_AUDIO_EXTENSIONS | MEDIA_VIDEO_EXTENSIONS
+
+# 视频上传上限 200MB；音色/声纹上传上限 50MB。
+MEDIA_MAX_BYTES = 200 * 1024 * 1024
+AUDIO_MAX_BYTES = 50 * 1024 * 1024
+
+# ---------------------------------------------------------------------------
+# ASR
+# ---------------------------------------------------------------------------
+
+ASR_LANGUAGES = ("auto", "zh", "en", "ja", "ko", "yue", "nospeech")
+
+# ---------------------------------------------------------------------------
+# 人声分离
+# ---------------------------------------------------------------------------
+
+SEPARATE_MODELS = ("htdemucs", "htdemucs_ft", "htdemucs_6s")
+
+SEPARATE_STEMS = {
+    "htdemucs": ("vocals", "drums", "bass", "other"),
+    "htdemucs_ft": ("vocals", "drums", "bass", "other"),
+    "htdemucs_6s": ("vocals", "drums", "bass", "other", "guitar", "piano"),
+}
+
+# ---------------------------------------------------------------------------
+# 模型下载（ModelScope 优先）
+# ---------------------------------------------------------------------------
+
+MODEL_SPECS = {
+    "tts": {
+        "label": "IndexTTS-2.5",
+        "modelscope": "IndexTeam/IndexTTS-2.5",
+        "huggingface": "IndexTeam/IndexTTS-2.5",
+        "required": REQUIRED_MODEL_FILES,
+    },
+    "asr": {
+        "label": "SenseVoiceSmall",
+        "modelscope": "iic/SenseVoiceSmall",
+        "huggingface": "FunAudioLLM/SenseVoiceSmall",
+        "required": (
+            "model.pt",
+            "config.yaml",
+            "configuration.json",
+            "am.mvn",
+            "tokens.json",
+            "chn_jpn_yue_eng_ko_spectok.bpe.model",
+        ),
+    },
+    "speaker": {
+        "label": "campplus",
+        "modelscope": "iic/speech_campplus_sv_zh-cn_16k-common",
+        "huggingface": "funasr/campplus",
+        "required": ("campplus_cn_common.bin", "config.yaml"),
+    },
+    "separate": {
+        "label": "Demucs htdemucs / htdemucs_6s",
+        "modelscope": None,
+        "huggingface": None,
+        "required": (),
+    },
+}

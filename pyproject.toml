@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "localai-service"
+version = "2.2.0"
+description = "本地 AI 服务层：TTS / ASR / 声纹 / 人声分离 / 媒体工具，统一 HTTP 接口、懒加载与显存管理"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "LocalAIService" }]
+keywords = ["tts", "asr", "speaker", "demucs", "fastapi", "local-ai"]
+
+# 服务层本身的依赖：都是纯 Python / 轻量包，不含 torch。
+# torch、funasr、demucs、transformers 这些 GPU 推理依赖见
+# docs/INSTALL.md「安装 GPU 引擎依赖」——必须用 CUDA 轮子单独安装，
+# 直接写进这里会让普通 pip install 去拉 CPU 版 torch（几个 GB 且不能跑）。
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "httpx>=0.27",
+    "python-multipart>=0.0.9",
+    "pydantic>=2.5",
+    "soundfile>=0.12",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+# 开发/测试
+dev = ["pytest>=8"]
+# 下载模型时用；装了 modelscope 就优先走 ModelScope
+models = ["modelscope>=1.15", "huggingface_hub>=0.23"]
+# GPU 引擎（仍建议按 docs/INSTALL.md 用 cu 索引安装 torch）
+engines = [
+    "torch>=2.4",
+    "funasr>=1.1",
+    "demucs>=4.0",
+    "transformers>=4.40",
+]
+
+[project.scripts]
+localai = "localai.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
