@@ -15,20 +15,30 @@
 
 from __future__ import annotations
 
-import asyncio
+import json
 import logging
-import mimetypes
+import shutil
+import time
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import Response
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
-from ...core.frames_agent import FramesAgent, load_prompt, parse_json_loose
+from ...core.frames_agent import (
+    EFFORT_CHOICES,
+    EFFORT_DEFAULT,
+    FramesAgent,
+    effort_budget,
+    load_prompt,
+    parse_json_loose,
+    summary_confidence,
+)
 from ...core.vram import get_vram
 from ..deps import get_cfg, get_registry
-from ..schemas import VisionFramesRequest
+from ..schemas import VisionFramesRequest, VisionVideoRequest
 
 logger = logging.getLogger("localai.api.vision")
 
@@ -272,12 +282,313 @@ async def vision_frames_endpoint(
             path,
             target_frames=payload.target_frames,
             planner=payload.planner,
+            effort=payload.effort,
             max_rounds=payload.max_rounds,
             subtitles=payload.subtitles,
             scene_times=payload.scene_times,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# 按需取帧图片 / 段级看视频（只返回文字）
+# ---------------------------------------------------------------------------
+
+#: 全片一次最多看多少帧（接口硬上限，防止有人误传 100 帧）。
+VIDEO_MAX_FRAMES = 64
+#: 单段一次最多看多少帧（接口硬上限）。
+VIDEO_MAX_SEGMENT_FRAMES = 48
+#: 画质优先的单次帧数：小模型在 16 帧以上会明显忽略后半段，实测 16 帧最稳。
+VIDEO_QUALITY_FRAMES = 16
+#: /vision/video 抽帧宽度：为多帧同请求留出视觉 token 余量。
+VIDEO_FRAME_WIDTH = 640
+#: 多帧同请求时每张缩略图最长边（448 能看清大标题，又不爆 4096 上下文）。
+VIDEO_IMAGE_MAX_SIDE = 448
+
+
+def _frame_dirs(cfg: Any) -> list[Path]:
+    """``/vision/frame`` 允许读取的根目录：服务输出目录 + 下载目录。"""
+    dirs = []
+    for base in (Path(cfg.output_dir), Path(cfg.downloads_dir)):
+        try:
+            dirs.append(base.resolve())
+        except OSError:
+            continue
+    return dirs
+
+
+def _is_within(path: Path, base: Path) -> bool:
+    try:
+        path.relative_to(base)
+        return True
+    except ValueError:
+        return False
+
+
+def _safe_frame_path(cfg: Any, raw: str) -> Path:
+    """校验帧路径必须在 ``outputs/`` 或 ``data/downloads/`` 下，防目录穿越。
+
+    解析 ``..`` 和符号链接之后再比对根目录；``../../Windows/win.ini``、
+    ``C:\\Windows\\...`` 这类绝对路径外泄都会在这里被 400 掉。
+    """
+    text = (raw or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="必须给 path（帧的绝对路径）")
+    try:
+        resolved = Path(text).expanduser().resolve()
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=f"路径不合法：{exc}") from exc
+    dirs = _frame_dirs(cfg)
+    if not any(_is_within(resolved, base) for base in dirs):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "只允许读取服务输出目录（outputs/）或下载目录（data/downloads/）"
+                f"下的帧：{resolved}"
+            ),
+        )
+    if not resolved.is_file():
+        raise HTTPException(status_code=404, detail=f"帧文件不存在：{resolved}")
+    if resolved.suffix.lower() not in (".jpg", ".jpeg", ".png"):
+        raise HTTPException(
+            status_code=400, detail=f"只支持 jpg/png 帧，收到 {resolved.suffix or '(无扩展名)'}"
+        )
+    return resolved
+
+
+@router.get("/vision/frame", summary="按需取一张帧图片（仅限 outputs / downloads）")
+async def vision_frame_endpoint(request: Request, path: str) -> Response:
+    """返回帧的二进制（image/jpeg）；响应里不再塞 base64。
+
+    路径必须落在 ``LOCALAI_HOME/outputs/`` 或 ``LOCALAI_HOME/data/downloads/``
+    之下；其它位置（含 ``../../``、绝对路径外泄）一律 400。
+    """
+    cfg = get_cfg(request)
+    resolved = _safe_frame_path(cfg, path)
+    try:
+        data = resolved.read_bytes()
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"读取帧失败：{exc}") from exc
+    media_type = "image/png" if resolved.suffix.lower() == ".png" else "image/jpeg"
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={"Cache-Control": "no-store", "X-Frame-Time": ""},
+    )
+
+
+def _video_window(
+    payload: VisionVideoRequest, duration: float
+) -> tuple[float, float, bool]:
+    """归一 ``start/end``：都没给=全片；给一个就补另一个；非法窗口 400。"""
+    if payload.start is None and payload.end is None:
+        return 0.0, round(float(duration), 3), False
+    start = 0.0 if payload.start is None else float(payload.start)
+    end = round(float(duration), 3) if payload.end is None else float(payload.end)
+    if start < 0:
+        raise HTTPException(status_code=400, detail=f"start 不能是负数：{start}")
+    if end <= start:
+        raise HTTPException(status_code=400, detail=f"end 必须大于 start：{start}~{end}")
+    if end > float(duration) + 0.05:
+        raise HTTPException(
+            status_code=400,
+            detail=f"end={end:.3f}s 超出视频时长 {float(duration):.3f}s",
+        )
+    return round(start, 3), round(min(end, float(duration)), 3), True
+
+
+def _video_prompt(
+    payload: VisionVideoRequest,
+    times: Sequence[float],
+    start: float,
+    end: float,
+    fps: float,
+) -> str:
+    return json.dumps(
+        {
+            "window": {"start": start, "end": end},
+            "fps": round(fps, 3),
+            "frame_times": [round(float(item), 3) for item in times],
+            "question": (payload.question or "").strip() or None,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _image_max_side(count: int) -> int:
+    """多帧同请求时的缩略图尺寸：统一 448，画质与上下文取平衡。"""
+    return VIDEO_IMAGE_MAX_SIDE
+
+
+@router.post("/vision/video", summary="段级细看：多帧一次性看视频，只返回文字")
+async def vision_video_endpoint(
+    payload: VisionVideoRequest, request: Request
+) -> dict[str, Any]:
+    """``start/end`` 都不给看全片；给了就用 ``clip`` 只切这一段。
+
+    帧数上限：全片 64、单段 48；超了就自动降 fps 并在响应 ``note`` 里说明。
+    **响应只有文字**：``summary`` + ``key_moments``，不返回图片 / base64。
+    """
+    started = time.perf_counter()
+    cfg = get_cfg(request)
+    registry = get_registry(request)
+    media = registry.get("media")
+    vision = registry.get("vision")
+    path = Path(payload.video_path)
+    if not path.is_file():
+        raise HTTPException(status_code=400, detail=f"视频不存在：{path}")
+
+    info = await media.call("probe", str(path))
+    duration = info.get("duration")
+    if not duration or float(duration) <= 0:
+        raise HTTPException(status_code=400, detail=f"读不出视频时长：{path}")
+    duration = round(float(duration), 3)
+    if not info.get("video"):
+        raise HTTPException(status_code=400, detail=f"这个文件没有视频流：{path}")
+
+    start, end, is_segment = _video_window(payload, duration)
+    span = round(end - start, 3)
+    if span <= 0:
+        raise HTTPException(status_code=400, detail="时间窗口为空")
+    hard_cap = VIDEO_MAX_SEGMENT_FRAMES if is_segment else VIDEO_MAX_FRAMES
+    # 小模型实测超过 16 帧就会明显忽略后半段：画质优先，把有效帧数再压到 16。
+    cap = min(hard_cap, VIDEO_QUALITY_FRAMES)
+    requested_fps = max(0.5, min(3.0, float(payload.fps or 1.0)))
+    effective_fps = min(requested_fps, cap / span)
+    note = ""
+    if effective_fps < requested_fps - 0.01:
+        note = (
+            f"帧数上限 {cap}（接口硬上限 {hard_cap}，为保证小模型看清画面取 {VIDEO_QUALITY_FRAMES}），"
+            f"fps 已从 {requested_fps:g} 降到 {effective_fps:.3f}（窗口 {span:.1f}s）"
+        )
+
+    work_dir = cfg.frames_dir / f"video_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    clip_path: Optional[Path] = None
+    try:
+        if is_segment:
+            # 按需求「只切该段」：先 clip 成独立 mp4，再从 clip 里抽帧。
+            clip_dir = Path(cfg.output_dir) / "clips" / uuid.uuid4().hex[:8]
+            clip_dir.mkdir(parents=True, exist_ok=True)
+            clip_result = await media.call(
+                "clip", str(path), start, end, out=str(clip_dir / "segment.mp4")
+            )
+            clip_path = Path(clip_result["path"])
+            source = clip_path
+            source_duration = float(clip_result.get("duration") or span)
+        else:
+            source = path
+            source_duration = duration
+
+        if effective_fps >= 0.5:
+            frames = await media.call(
+                "extract_frames_window",
+                str(source),
+                0.0 if is_segment else start,
+                source_duration if is_segment else end,
+                fps=effective_fps,
+                width=VIDEO_FRAME_WIDTH,
+                out_dir=str(work_dir),
+            )
+            if is_segment:
+                for frame in frames:
+                    frame["time_sec"] = round(start + float(frame["time_sec"]), 3)
+        else:
+            # 窗口太长（例如 431 秒全片看 64 帧），fps 会低于 0.5：
+            # 用 count 模式做等效均匀抽帧，再把时间点换算到绝对时间轴。
+            frames = await media.call(
+                "extract_frames",
+                str(source),
+                str(work_dir),
+                count=cap,
+                width=VIDEO_FRAME_WIDTH,
+            )
+            if is_segment:
+                for frame in frames:
+                    frame["time_sec"] = round(start + float(frame["time_sec"]), 3)
+
+        # 硬上限：无论 ffmpeg 实际吐了多少张，交给 VLM 的绝不超过 cap。
+        frames = frames[:cap]
+        if not frames:
+            raise HTTPException(status_code=400, detail="没有抽到任何帧，无法看视频")
+        times = [round(float(item.get("time_sec") or 0.0), 3) for item in frames]
+        system_prompt = load_prompt(cfg, "vlm_video_watch.md")
+        user = _video_prompt(payload, times, start, end, effective_fps)
+        if not hasattr(vision, "describe_frames"):
+            raise HTTPException(
+                status_code=503, detail="当前视觉适配器不支持多帧一次性理解"
+            )
+        labels = [
+            f"第 {index + 1} 帧 time={times[index]}s" for index in range(len(frames))
+        ]
+        outcome = await vision.describe_frames(
+            [str(item["path"]) for item in frames],
+            user,
+            system_prompt=system_prompt,
+            max_tokens=600,
+            max_side=_image_max_side(len(frames)),
+            labels=labels,
+        )
+    finally:
+        if clip_path is not None:
+            try:
+                clip_path.unlink(missing_ok=True)
+                clip_path.parent.rmdir()
+            except OSError:
+                pass
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+    text = str(outcome.get("text") or "")
+    data = parse_json_loose(text)
+    if isinstance(data, dict):
+        summary = str(data.get("summary") or "").strip()
+        raw_moments = data.get("key_moments") or []
+    else:
+        summary = text.strip()
+        raw_moments = []
+    if not summary:
+        summary = text.strip()
+    key_moments: list[dict[str, Any]] = []
+    for item in raw_moments if isinstance(raw_moments, list) else []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            moment = float(item.get("time"))
+        except (TypeError, ValueError):
+            continue
+        if moment < start - 0.5 or moment > end + 0.5:
+            continue
+        what = str(item.get("what") or "").strip()
+        if not what:
+            continue
+        key_moments.append({"time": round(moment, 3), "what": what[:120]})
+    key_moments.sort(key=lambda row: row["time"])
+
+    elapsed_ms = round((time.perf_counter() - started) * 1000)
+    logger.info(
+        "段级看视频：%s 窗口=%.1f~%.1fs fps=%.3f 帧=%d 耗时=%dms",
+        path.name,
+        start,
+        end,
+        effective_fps,
+        len(frames),
+        elapsed_ms,
+    )
+    return {
+        "ok": True,
+        "duration": duration,
+        "window": {"start": start, "end": end, "seconds": span},
+        "fps": round(effective_fps, 3),
+        "fps_requested": requested_fps,
+        "frames_used": len(frames),
+        "summary": summary,
+        "key_moments": key_moments,
+        "confidence": summary_confidence(summary),
+        "elapsed_ms": elapsed_ms,
+        "note": note,
+        "model": outcome.get("model"),
+    }
 
 
 @router.get("/vision/status", summary="视觉模型状态（不加载模型）")
@@ -295,6 +606,17 @@ async def vision_status_endpoint(request: Request) -> dict[str, Any]:
         **status,
         "planner_default": cfg.vision_planner,
         "planners": ["hybrid", "agent"],
+        "effort_default": EFFORT_DEFAULT,
+        "effort_choices": list(EFFORT_CHOICES),
+        "effort_budgets": {
+            "low": effort_budget(3, "low"),
+            "medium": effort_budget(3, "medium"),
+            "high": effort_budget(3, "high"),
+        },
+        "effort_budget_note": (
+            "候选数 = target × factor（至少 6）；max_rounds/vlm_limit/clip_limit "
+            "为该 effort 的硬上限；target 不同时候选数按比例变化"
+        ),
         "vram_estimate_mb": estimates.get("vision", adapter.estimate_mb()),
         "idle_unload_seconds": cfg.vision_idle_unload,
         "phash_distance": cfg.vision_phash_distance,
@@ -303,7 +625,14 @@ async def vision_status_endpoint(request: Request) -> dict[str, Any]:
             "score": (prompts_dir / "vlm_frame_score.md").is_file(),
             "agent": (prompts_dir / "vlm_frame_agent.md").is_file(),
             "plan": (prompts_dir / "vlm_frame_plan.md").is_file(),
+            "video": (prompts_dir / "vlm_video_watch.md").is_file(),
         },
         "endpoints": list(adapter.ENDPOINTS),
-        "limits": {"target_frames": [1, 10], "max_rounds": [1, 12]},
+        "limits": {
+            "target_frames": [1, 10],
+            "max_rounds": [1, 12],
+            "video_frames_full": VIDEO_MAX_FRAMES,
+            "video_frames_segment": VIDEO_MAX_SEGMENT_FRAMES,
+            "video_quality_frames": VIDEO_QUALITY_FRAMES,
+        },
     }

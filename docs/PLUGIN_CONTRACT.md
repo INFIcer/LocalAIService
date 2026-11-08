@@ -677,6 +677,7 @@ POST /jobs/vision
   "video_path": "E:/LocalAIService/data/downloads/2026-11-08/xxx.mp4",
   "target_frames": 3,
   "planner": "hybrid",
+  "effort": "medium",
   "max_rounds": 6
 }
 ```
@@ -685,22 +686,28 @@ POST /jobs/vision
 
 ```json
 {"state":"done","result":{
-  "ok":true,"duration":431.267,"target":3,"rounds_used":1,
+  "ok":true,"duration":431.267,"target":3,"effort":"medium","rounds_used":1,
   "frames":[{"time":5.085,"path":"...","score":4,"kind":"chart",
-             "ocr_text":"...","summary":"...","why":"..."}],
-  "stats":{"candidates":12,"vlm_calls":8,"elapsed_ms":20653},
+             "ocr_text":"...","summary":"...","why":"...","confidence":"normal"}],
+  "stats":{"candidates":12,"vlm_calls":10,"clip_calls":0,"elapsed_ms":17560},
   "subtitles_from":"site"}}
 ```
 
 - 也可以直接 `POST /vision/frames` 同步等（讲解视频 20~60 秒，长视频更久）；
 - 刚跑完 `/jobs/analyze` 时，直接传 `{"job_id":"<id>","target_frames":3}`，
-  服务端会从上个任务结果的 `path` 取视频，不用自己拼路径。
+  服务端会从上个任务结果的 `path` 取视频，不用自己拼路径；
+- **插件要细看某一段（不是挑几张，而是问「这 60 秒到底在做什么」）用
+  `POST /vision/video`**：传 `start/end/fps`，拿回纯文字的 `summary` + `key_moments`；
+- 响应只回文字，要看某一帧的原图用 `GET /vision/frame?path=<帧路径>`（仅限服务端
+  `outputs/` 与 `data/downloads/` 下）。
 
 ### 13.3 参数怎么选
 
 - `target_frames`：1~10；封面/摘要一般 3，长教程最多 5~6；
 - `planner`：默认 `hybrid`（快、稳定）；视频里图表/演示很多时再试 `agent`；
-- `max_rounds`：默认 6；短视频 2~3 就够，长视频不要超过 8；
+- `effort`：`low`（快、≤6 次 VLM、不 clip）/ `medium`（默认）/ `high`（允许 clip 细看，
+  最多 32 次 VLM）；预算表见 `/vision/status` 的 `effort_budgets`；
+- `max_rounds`：默认 6；短视频 2~3 就够，长视频不要超过 8（会被 effort 上限收紧）；
 - `subtitles` / `scene_times`：如果插件自己已经有（例如 `/asr/segments`、
   `/media/scenes` 的结果），直接传，能省一次识别/检测；
 - 不传 `subtitles` 时，服务端优先找视频同目录的 `*.srt/*.vtt`，其次跑 ASR。

@@ -68,6 +68,53 @@ MAX_INITIAL = 16
 MIN_SUPPLEMENT = 4
 MAX_SUPPLEMENT = 8
 
+#: 分析力度可选值；默认 medium（和旧行为最接近）。
+EFFORT_CHOICES = ("low", "medium", "high")
+EFFORT_DEFAULT = "medium"
+
+#: 无人声空档判定阈值（秒）：相邻字幕间隔 ≥ 这个值就算「没人说话」。
+SILENCE_MIN_GAP = 5.0
+
+#: effort -> 预算。数字越小/越大都有明确含义，测试会逐项断言。
+EFFORT_BUDGETS: dict[str, dict[str, Any]] = {
+    "low": {
+        "candidate_factor": 2,
+        "min_candidates": 6,
+        "max_rounds": 2,
+        "vlm_limit": 6,
+        "clip_limit": 0,
+        "clip_fps": 1.0,
+        "fixed_segment_midpoint": True,
+        "note": "只做全片分段覆盖（每段中点 1 张），不细看",
+    },
+    "medium": {
+        "candidate_factor": 4,
+        "min_candidates": 6,
+        "max_rounds": 4,
+        "vlm_limit": 16,
+        "clip_limit": 1,
+        "clip_fps": 1.0,
+        "fixed_segment_midpoint": False,
+        "note": "覆盖 + 字幕关键词 + 无人声段",
+    },
+    "high": {
+        "candidate_factor": 6,
+        "min_candidates": 6,
+        "max_rounds": 6,
+        "vlm_limit": 32,
+        "clip_limit": 2,
+        "clip_fps": 2.0,
+        "fixed_segment_midpoint": False,
+        "note": "在 medium 基础上允许裁剪细看可疑段",
+    },
+}
+
+#: 单次 extract_clip 允许的最长窗口（秒），和提示词里的约定一致。
+MAX_CLIP_SECONDS = 60.0
+#: extract_clip 允许的 fps 范围。
+CLIP_MIN_FPS = 0.5
+CLIP_MAX_FPS = 3.0
+
 
 # ---------------------------------------------------------------------------
 # 小工具：JSON / 提示词 / 图片
@@ -214,6 +261,136 @@ def _subtitle_nearby(segments: Sequence[dict[str, Any]], time_sec: float) -> str
     return " ".join(picked)[:200]
 
 
+def normalize_effort(value: Any) -> str:
+    """把调用方给的 effort 归一成 ``low|medium|high``，非法值回落到默认。"""
+    text = str(value or "").strip().lower()
+    return text if text in EFFORT_CHOICES else EFFORT_DEFAULT
+
+
+def effort_budget(target_frames: int, effort: Any = EFFORT_DEFAULT) -> dict[str, Any]:
+    """按目标帧数 + effort 算出这一轮的所有预算。
+
+    返回字段（都会被写进响应的 ``stats.budget``，方便调用方核对）：
+
+    - ``candidates``：候选点数量 = ``target × candidate_factor``（至少 6）；
+    - ``max_rounds``：最多抽几轮（含首轮）；
+    - ``vlm_limit``：VLM 调用次数硬上限（含规划 / 评分 / 代理决策）；
+    - ``clip_limit``：``extract_clip`` 次数上限（low=0、medium=1、high=2）。
+    """
+    name = normalize_effort(effort)
+    preset = EFFORT_BUDGETS[name]
+    target = max(1, int(target_frames or 3))
+    candidates = max(
+        int(preset["min_candidates"]), target * int(preset["candidate_factor"])
+    )
+    return {
+        "effort": name,
+        "candidates": candidates,
+        "max_rounds": int(preset["max_rounds"]),
+        "vlm_limit": int(preset["vlm_limit"]),
+        "clip_limit": int(preset["clip_limit"]),
+        "clip_fps": float(preset["clip_fps"]),
+        "fixed_segment_midpoint": bool(preset["fixed_segment_midpoint"]),
+        "note": preset["note"],
+    }
+
+
+def coverage_segment_count(target_frames: int) -> int:
+    """覆盖分段数 K = max(target×2, 6)，全片等分。"""
+    return max(int(target_frames or 3) * 2, 6)
+
+
+def segment_index(time_sec: float, duration: float, count: int) -> int:
+    """时间点落在第几段（0-based）；时长非法时返回 0。"""
+    if not duration or duration <= 0 or count <= 0:
+        return 0
+    index = int(float(time_sec) / float(duration) * int(count))
+    return max(0, min(int(count) - 1, index))
+
+
+def silence_gaps(
+    segments: Sequence[dict[str, Any]],
+    duration: float,
+    *,
+    min_gap: float = SILENCE_MIN_GAP,
+) -> list[dict[str, float]]:
+    """从字幕算「没有人声」的空档（含片头片尾）。
+
+    规则：相邻字幕之间的间隔 ≥ ``min_gap``（默认 5 秒）就算空档；
+    第一条字幕之前、最后一条字幕之后也各自算（只要够长）。
+    没有字幕时整段视频就是一个人声空档（但太短的返回空列表）。
+    """
+    if not duration or duration <= 0:
+        return []
+    gaps: list[dict[str, float]] = []
+    ordered = [
+        item
+        for item in segments
+        if float(item.get("end", 0)) > float(item.get("start", 0))
+    ]
+    if not ordered:
+        if duration >= min_gap:
+            gaps.append({"start": 0.0, "end": round(float(duration), 3)})
+        return gaps
+
+    first_start = max(0.0, float(ordered[0]["start"]))
+    if first_start >= min_gap:
+        gaps.append({"start": 0.0, "end": round(first_start, 3)})
+    for previous, current in zip(ordered, ordered[1:]):
+        start = float(previous["end"])
+        end = float(current["start"])
+        if end - start >= min_gap:
+            gaps.append(
+                {"start": round(max(0.0, start), 3), "end": round(min(duration, end), 3)}
+            )
+    last_end = min(float(duration), float(ordered[-1]["end"]))
+    if duration - last_end >= min_gap:
+        gaps.append({"start": round(last_end, 3), "end": round(float(duration), 3)})
+    # 去掉零长度/越界的（字幕本身可能有点乱）。
+    return [gap for gap in gaps if gap["end"] - gap["start"] >= min_gap]
+
+
+def gap_midpoints(
+    gaps: Sequence[dict[str, Any]], duration: float
+) -> list[dict[str, Any]]:
+    """把每个空档换算成「中点候选」，带上起止秒数方便写提示词。"""
+    points: list[dict[str, Any]] = []
+    for gap in gaps:
+        try:
+            start = max(0.0, float(gap.get("start")))
+            end = min(float(duration), float(gap.get("end")))
+        except (TypeError, ValueError):
+            continue
+        if end <= start:
+            continue
+        middle = (start + end) / 2
+        if middle <= 0.2 or middle >= duration - 0.2:
+            continue
+        points.append(
+            {
+                "time": round(middle, 3),
+                "start": round(start, 3),
+                "end": round(end, 3),
+            }
+        )
+    return points
+
+
+def _summary_confidence(summary: str) -> str:
+    """判断 summary 是否「太短 / 太模糊」，供调用方决定要不要自己核对原图。"""
+    text = str(summary or "").strip()
+    normalized = re.sub(r"[\s\W_]+", "", text, flags=re.UNICODE)
+    vague = ("大概", "可能", "也许", "或许", "似乎", "应该是", "不确定", "看起来像")
+    if len(normalized) < 6 or any(word in text for word in vague):
+        return "low"
+    return "normal"
+
+
+def summary_confidence(summary: str) -> str:
+    """公开版本：``/vision/video`` 等外部模块复用同一套模糊词判定。"""
+    return _summary_confidence(summary)
+
+
 # ---------------------------------------------------------------------------
 # 确定性规划
 # ---------------------------------------------------------------------------
@@ -225,48 +402,156 @@ def plan_candidates(
     *,
     target_frames: int,
     limit: int = 40,
+    effort: Any = EFFORT_DEFAULT,
+    count: Optional[int] = None,
+    gaps: Optional[Sequence[dict[str, Any]]] = None,
 ) -> list[dict[str, Any]]:
-    """按「字幕关键词 > 场景切换 > 均匀补充」生成候选点。
+    """按「无人声空档 > 字幕关键词 > 场景切换 > 段覆盖/均匀补充」生成候选。
 
-    返回 ``[{time, priority, reason}]``，priority 越小越优先。
+    硬性保证（对应 ``vlm_frame_plan.md`` 的分层覆盖）：
+
+    1. 全片等分成 ``K = max(target×2, 6)`` 段，**每段至少 1 个候选**；
+    2. 每个无人声空档的中点都进候选（除非与已有候选 < 2 秒）；
+    3. 返回顺序按段轮转（round-robin），避免「第一批全在开头」；
+    4. ``low`` 档每段只取中点，不做关键词加密。
+
+    返回 ``[{time, priority, reason, segment}]``，priority 越小越优先。
     """
     if not duration or duration <= 0:
         return []
-    total = max(1, min(40, int(limit)))
+    total = max(1, min(40, int(count if count is not None else limit)))
+    effort_name = normalize_effort(effort)
+    budget = effort_budget(target_frames, effort_name)
+    k = coverage_segment_count(target_frames)
+    gaps = list(gaps) if gaps is not None else silence_gaps(segments, duration)
     # 短视频放宽最小间隔，否则凑不出足够候选。
     min_gap = 3.0 if duration >= 30 else max(1.0, duration / max(4, target_frames * 4))
 
-    scored: list[tuple[int, float, str]] = []
-    for item in segments:
-        text = str(item.get("text") or "")
-        hit = next((word for word in KEYWORDS if word in text), None)
-        if hit is None:
-            continue
-        point = (float(item["start"]) + float(item["end"])) / 2
-        scored.append((1, _clamp(point, 0.5, duration - 0.2), f"字幕出现「{hit}」"))
+    picked: list[dict[str, Any]] = []
+    seen: list[float] = []
 
-    for value in scene_times:
+    def push(
+        priority: int,
+        point: float,
+        reason: str,
+        *,
+        locked: bool = False,
+    ) -> None:
         try:
-            point = float(value)
+            value = float(point)
         except (TypeError, ValueError):
-            continue
-        scored.append((2, _clamp(point + 0.3, 0.5, duration - 0.2), "场景切换点"))
+            return
+        value = _clamp(value, 0.5, max(0.6, duration - 0.2))
+        # 空档中点是「必查项」，只避让 2 秒内的重复；其余按最小间隔去重。
+        gap_limit = 2.0 if locked else min_gap
+        if any(abs(value - other) < gap_limit for other in seen):
+            return
+        seen.append(value)
+        picked.append(
+            {
+                "time": round(value, 3),
+                "priority": int(priority),
+                "reason": reason,
+                "segment": segment_index(value, duration, k),
+                "locked": bool(locked),
+            }
+        )
 
-    count_uniform = max(target_frames * 4, 8)
-    step = duration / count_uniform
-    for index in range(count_uniform):
-        point = step * (index + 0.5)
-        scored.append((3, _clamp(point, 0.4, duration - 0.2), "均匀补充"))
+    # 1) 无人声空档中点：locked，后续裁剪也不会优先丢掉。
+    gap_points = gap_midpoints(gaps, duration)
+    for item in gap_points:
+        push(
+            1,
+            item["time"],
+            f"无人声空档中点（{item['start']:.1f}~{item['end']:.1f}s）",
+            locked=True,
+        )
 
-    scored.sort(key=lambda item: (item[0], item[1]))
-    result: list[dict[str, Any]] = []
-    for priority, point, reason in scored:
-        if any(abs(point - item["time"]) < min_gap for item in result):
+    # low：每段只取中点，不加密。
+    if budget["fixed_segment_midpoint"]:
+        for index in range(k):
+            middle = duration * (index + 0.5) / k
+            push(2, middle, f"第 {index + 1}/{k} 段中点（low 覆盖）")
+
+    # 2) 字幕关键词（priority 1）
+    if not budget["fixed_segment_midpoint"]:
+        for item in segments:
+            text = str(item.get("text") or "")
+            hit = next((word for word in KEYWORDS if word in text), None)
+            if hit is None:
+                continue
+            point = (float(item["start"]) + float(item["end"])) / 2
+            push(1, point, f"字幕出现「{hit}」")
+
+        # 3) 场景切换点（priority 2）
+        for value in scene_times:
+            try:
+                point = float(value) + 0.3
+            except (TypeError, ValueError):
+                continue
+            push(2, point, "场景切换点")
+
+        # 4) 均匀补充（priority 3）
+        count_uniform = max(target_frames * 4, 8)
+        step = duration / count_uniform
+        for index in range(count_uniform):
+            push(3, step * (index + 0.5), "均匀补充")
+
+    # 5) 段覆盖兜底：某段一个候选都没有时，补该段中点。
+    covered = {item["segment"] for item in picked}
+    for index in range(k):
+        if index in covered:
             continue
-        result.append({"time": round(point, 3), "priority": priority, "reason": reason})
-        if len(result) >= total:
+        middle = duration * (index + 0.5) / k
+        push(2, middle, f"补第 {index + 1}/{k} 段覆盖（该段此前无候选）")
+        covered.add(index)
+
+    # 6) 控制总数：locked（空档）与「每段至少一个」是硬约束，优先保留；
+    #    预算只约束额外加密点，绝不因为预算把某一段或空档挤掉。
+    if len(picked) > total:
+        locked_items = [item for item in picked if item.get("locked")]
+        rest = [item for item in picked if not item.get("locked")]
+        per_segment: dict[int, dict[str, Any]] = {}
+        for item in sorted(rest, key=lambda row: (row["priority"], row["time"])):
+            per_segment.setdefault(int(item["segment"]), item)
+        keep_ids = {id(item) for item in locked_items}
+        keep_ids.update(id(item) for item in per_segment.values())
+        base_count = len(keep_ids)
+        target_count = max(total, base_count)
+        for item in sorted(rest, key=lambda row: (row["priority"], row["time"])):
+            if len(keep_ids) >= target_count:
+                break
+            keep_ids.add(id(item))
+        picked = [item for item in picked if id(item) in keep_ids][:40]
+
+    # 7) 段轮转排序：第一批 N 个尽量每段一个，禁止沿时间顺序挤在开头。
+    buckets: dict[int, list[dict[str, Any]]] = {index: [] for index in range(k)}
+    for item in picked:
+        buckets.setdefault(int(item["segment"]), []).append(item)
+    for index in buckets:
+        buckets[index].sort(key=lambda row: (row["priority"], row["time"]))
+    ordered: list[dict[str, Any]] = []
+    while len(ordered) < len(picked):
+        added = False
+        for index in range(k):
+            bucket = buckets.get(index) or []
+            if not bucket:
+                continue
+            ordered.append(bucket.pop(0))
+            added = True
+            if len(ordered) >= len(picked):
+                break
+        if not added:
             break
-    return result
+    return [
+        {
+            "time": item["time"],
+            "priority": item["priority"],
+            "reason": item["reason"],
+            "segment": item["segment"],
+        }
+        for item in ordered
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +587,295 @@ class FramesAgent:
         value = (planner or self.cfg.vision_planner or "hybrid").strip().lower()
         return value if value in ("hybrid", "agent") else "hybrid"
 
+    # ---- effort 预算 / 覆盖统计 ---------------------------------------
+    @staticmethod
+    def _vlm_left(stats: dict[str, Any]) -> int:
+        """本次任务还剩多少次 VLM 调用；0 表示预算已用尽。"""
+        limit = int(stats.get("vlm_limit") or 0)
+        if limit <= 0:
+            return 999
+        return max(0, limit - int(stats.get("vlm_calls") or 0))
+
+    @staticmethod
+    def _clip_left(stats: dict[str, Any]) -> int:
+        limit = int(stats.get("clip_limit") or 0)
+        return max(0, limit - int(stats.get("clip_calls") or 0))
+
+    @staticmethod
+    def _mark_seen(
+        segments_seen: Sequence[dict[str, Any]],
+        batch: Sequence[dict[str, Any]],
+        duration: float,
+        count: int,
+    ) -> None:
+        """更新「每段抽了几次」：时间段、次数都记，供提示词和覆盖判断用。"""
+        for item in batch:
+            try:
+                index = segment_index(float(item["time"]), duration, count)
+            except (TypeError, ValueError, KeyError):
+                continue
+            if not 0 <= index < len(segments_seen):
+                continue
+            entry = segments_seen[index]
+            times = entry.setdefault("times", [])
+            times.append(round(float(item["time"]), 3))
+            if len(times) > 12:
+                del times[:-12]
+            entry["extracted"] = int(entry.get("extracted") or 0) + 1
+
+    @staticmethod
+    def _interleave_by_segment(
+        pool: Sequence[dict[str, Any]], duration: float, target: int
+    ) -> list[dict[str, Any]]:
+        """把候选按段轮转排序，保证前 K 个候选分布在 K 个不同段。"""
+        k = coverage_segment_count(target)
+        buckets: dict[int, list[dict[str, Any]]] = {index: [] for index in range(k)}
+        for item in pool:
+            index = item.get("segment")
+            if index is None:
+                index = segment_index(float(item["time"]), duration, k)
+            buckets.setdefault(int(index), []).append(dict(item))
+        for index in buckets:
+            buckets[index].sort(
+                key=lambda row: (int(row.get("priority") or 3), float(row["time"]))
+            )
+        ordered: list[dict[str, Any]] = []
+        total = len(pool)
+        while len(ordered) < total:
+            added = False
+            for index in range(k):
+                bucket = buckets.get(index) or []
+                if not bucket:
+                    continue
+                ordered.append(bucket.pop(0))
+                added = True
+                if len(ordered) >= total:
+                    break
+            if not added:
+                break
+        return ordered
+
+    def _ensure_coverage(
+        self,
+        pool: Sequence[dict[str, Any]],
+        duration: float,
+        target: int,
+        gaps: Sequence[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """VLM 规划的候选可能漏段/漏空档：这里补齐后再做段轮转排序。"""
+        items = [dict(item) for item in pool]
+        k = coverage_segment_count(target)
+        points = [float(item["time"]) for item in items]
+
+        def add(priority: int, point: float, reason: str) -> None:
+            if any(abs(point - value) < 2.0 for value in points):
+                return
+            value = _clamp(point, 0.5, max(0.6, duration - 0.2))
+            items.append(
+                {
+                    "time": round(value, 3),
+                    "priority": priority,
+                    "reason": reason,
+                    "segment": segment_index(value, duration, k),
+                }
+            )
+            points.append(value)
+
+        for gap in gap_midpoints(gaps, duration):
+            add(1, gap["time"], "无人声空档中点（程序补齐）")
+        covered = {int(item.get("segment", -1)) for item in items}
+        for index in range(k):
+            if index in covered:
+                continue
+            add(2, duration * (index + 0.5) / k, f"补第 {index + 1}/{k} 段覆盖")
+        return self._interleave_by_segment(items, duration, target)
+
+    def _supplement_times(
+        self,
+        pool: Sequence[dict[str, Any]],
+        duration: float,
+        target: int,
+        used: Sequence[float],
+        results: Sequence[dict[str, Any]],
+        count: int,
+        *,
+        gaps: Sequence[dict[str, Any]] = (),
+    ) -> list[float]:
+        """补抽时间点：优先没被最终选中的段，其次才是普通候选。"""
+        k = coverage_segment_count(target)
+        picked_segments = {
+            segment_index(float(item["time"]), duration, k) for item in results
+        }
+        candidates = [
+            item
+            for item in pool
+            if all(abs(float(item["time"]) - value) >= 2.0 for value in used)
+        ]
+        uncovered = [
+            item
+            for item in candidates
+            if segment_index(float(item["time"]), duration, k) not in picked_segments
+        ]
+        ordered = uncovered + candidates
+        times = self._take_times(ordered, used, count)
+
+        # 候选池不够时，直接按「未覆盖段」的中点补。
+        if len(times) < count:
+            for index in range(k):
+                if index in picked_segments:
+                    continue
+                middle = round(duration * (index + 0.5) / k, 3)
+                if any(abs(middle - value) < 2.0 for value in used):
+                    continue
+                if any(abs(middle - value) < 2.0 for value in times):
+                    continue
+                times.append(middle)
+                if len(times) >= count:
+                    break
+        return times
+
+    @staticmethod
+    def _dense_subtitle_window(
+        segments: Sequence[dict[str, Any]],
+        duration: float,
+        target: int,
+        results: Sequence[dict[str, Any]],
+    ) -> Optional[tuple[float, float]]:
+        """找一个「字幕最密、但还没有可用帧」的段，返回 30 秒左右的窗口。"""
+        k = coverage_segment_count(target)
+        picked = {segment_index(float(item["time"]), duration, k) for item in results}
+        density: dict[int, int] = {index: 0 for index in range(k)}
+        for item in segments:
+            middle = (float(item["start"]) + float(item["end"])) / 2
+            density[segment_index(middle, duration, k)] += len(
+                str(item.get("text") or "")
+            )
+        candidates = [
+            (score, index)
+            for index, score in density.items()
+            if index not in picked and score > 0
+        ]
+        if not candidates:
+            return None
+        candidates.sort(reverse=True)
+        _score, index = candidates[0]
+        center = duration * (index + 0.5) / k
+        span = min(30.0, duration, duration / k * 2)
+        start = _clamp(center - span / 2, 0.0, max(0.0, duration - span))
+        end = min(duration, start + span)
+        if end - start < 3.0:
+            return None
+        return round(start, 3), round(end, 3)
+
+    async def _hybrid_clip_probe(
+        self,
+        *,
+        results: list[dict[str, Any]],
+        media: Any,
+        path: Path,
+        out_dir: Path,
+        duration: float,
+        target: int,
+        segments: Sequence[dict[str, Any]],
+        used_times: list[float],
+        history: list[dict[str, Any]],
+        stats: dict[str, Any],
+        deferred: list[str],
+        segments_seen: Sequence[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """hybrid 在 high 档主动 clip 一次「字幕密集但还没看清」的段。"""
+        if str(stats.get("effort")) != "high" or self._clip_left(stats) <= 0:
+            return results
+        if self._vlm_left(stats) <= 0:
+            return results
+        window = self._dense_subtitle_window(segments, duration, target, results)
+        if window is None:
+            return results
+        start, end = window
+        batch = await self._extract_clip(
+            media,
+            path,
+            out_dir,
+            start,
+            end,
+            float((stats.get("budget") or {}).get("clip_fps") or 1.0),
+            stats,
+            deferred,
+        )
+        if not batch:
+            return results
+        self._mark_seen(segments_seen, batch, duration, coverage_segment_count(target))
+        used_times.extend(item["time"] for item in batch)
+        scored = await self._score_batch(batch, segments, duration, stats, deferred)
+        history.extend(scored)
+        return self._accepted(history, target, duration)
+
+    async def _enforce_coverage(
+        self,
+        *,
+        results: list[dict[str, Any]],
+        media: Any,
+        path: Path,
+        out_dir: Path,
+        duration: float,
+        target: int,
+        used_times: list[float],
+        history: list[dict[str, Any]],
+        segments: Sequence[dict[str, Any]],
+        gaps: Sequence[dict[str, Any]],
+        stats: dict[str, Any],
+        deferred: list[str],
+        segments_seen: Sequence[dict[str, Any]],
+        check_cancel: Callable[[], None],
+    ) -> list[dict[str, Any]]:
+        """最终选帧若全落在同一段，强制补抽其它段（最多 2 轮）。
+
+        这是**代码强制**，不依赖 VLM 听话：模型再偏爱开头，最终结果也不会
+        三张全挤在前 1/6。
+        """
+        if not results:
+            return results
+        k = coverage_segment_count(target)
+        picked_segments = {
+            segment_index(float(item["time"]), duration, k) for item in results
+        }
+        if len(picked_segments) > 1:
+            return results
+
+        for _attempt in range(2):
+            check_cancel()
+            if self._vlm_left(stats) <= 0:
+                break
+            times = self._supplement_times(
+                [],
+                duration,
+                target,
+                used_times,
+                results,
+                max(2, min(4, target)),
+                gaps=gaps,
+            )
+            # 直接按未覆盖段的中点补（不看候选池，保证一定有位置可抽）。
+            if not times:
+                break
+            batch = await self._extract_and_screen(
+                media, path, out_dir, times, stats, deferred
+            )
+            used_times.extend(item["time"] for item in batch)
+            self._mark_seen(segments_seen, batch, duration, k)
+            scored = await self._score_batch(
+                batch, segments, duration, stats, deferred
+            )
+            history.extend(scored)
+            results = self._accepted(history, target, duration)
+            picked_segments = {
+                segment_index(float(item["time"]), duration, k)
+                for item in results
+            }
+            if len(picked_segments) > 1:
+                break
+        return results
+
     # ---- 主流程 -------------------------------------------------------
     async def run(
         self,
@@ -309,6 +883,7 @@ class FramesAgent:
         *,
         target_frames: int = 3,
         planner: Optional[str] = None,
+        effort: Any = EFFORT_DEFAULT,
         max_rounds: Optional[int] = None,
         subtitles: Any = None,
         scene_times: Optional[Sequence[float]] = None,
@@ -318,7 +893,11 @@ class FramesAgent:
     ) -> dict[str, Any]:
         started = time.perf_counter()
         target = max(1, min(10, int(target_frames or 3)))
-        rounds_limit = max(1, min(12, int(max_rounds or 6)))
+        effort_name = normalize_effort(effort)
+        budget = effort_budget(target, effort_name)
+        # 调用方显式给的 max_rounds 只能「收紧」，不能突破 effort 的轮数上限。
+        rounds_limit = int(max_rounds) if max_rounds else budget["max_rounds"]
+        rounds_limit = max(1, min(12, min(rounds_limit, int(budget["max_rounds"]))))
         mode = self._planner(planner)
         path = Path(video_path)
         if not path.is_file():
@@ -336,8 +915,16 @@ class FramesAgent:
             "duplicates_skipped": 0,
             "elapsed_ms": 0,
             "planner": mode,
+            "effort": effort_name,
             "max_rounds": rounds_limit,
             "subtitles": 0,
+            "clip_calls": 0,
+            "clip_frames": 0,
+            "planned_candidates": 0,
+            "silence_gaps": 0,
+            "vlm_limit": int(budget["vlm_limit"]),
+            "clip_limit": int(budget["clip_limit"]),
+            "budget": budget,
         }
         deferred: list[str] = []
 
@@ -382,6 +969,15 @@ class FramesAgent:
                 subtitles_from = "none"
         stats["subtitles"] = len(segments)
 
+        # 1.5) 无人声空档：从字幕算，gap 中点必须进候选（代码强制，不靠模型自觉）。
+        gaps = silence_gaps(segments, duration)
+        stats["silence_gaps"] = len(gaps)
+        k_segments = coverage_segment_count(target)
+        segments_seen: list[dict[str, Any]] = [
+            {"index": index, "times": [], "extracted": 0, "picked": 0}
+            for index in range(k_segments)
+        ]
+
         # 2) 场景边界（有就复用，没有才跑 ffmpeg）
         report(stage="scenes", percent=12, status="running")
         scenes = list(scene_times or [])
@@ -402,31 +998,61 @@ class FramesAgent:
         history: list[dict[str, Any]] = []
         results: list[dict[str, Any]] = []
 
-        # 3) 预筛一批候选（8~16 张）
+        # 3) 预筛一批候选（按 effort 预算决定数量；顺序是段轮转，天然分散）
         report(stage="candidates", percent=18, status="running")
         pool = plan_candidates(
-            duration, segments, scenes, target_frames=target, limit=40
+            duration,
+            segments,
+            scenes,
+            target_frames=target,
+            limit=40,
+            effort=effort_name,
+            count=int(budget["candidates"]),
+            gaps=gaps,
         )
-        if mode == "agent":
-            planned = await self._vlm_plan(duration, target, segments, scenes, stats)
+        if mode == "agent" and self._vlm_left(stats) > 0:
+            planned = await self._vlm_plan(duration, target, segments, scenes, stats, gaps)
             if planned:
                 pool = self._merge_pools(planned, pool)
-        initial_count = min(
-            MAX_INITIAL, max(MIN_INITIAL, target * 4), max(4, len(pool))
-        )
+                pool = self._ensure_coverage(pool, duration, target, gaps)
+        stats["planned_candidates"] = len(pool)
+        initial_count = min(int(budget["candidates"]), max(4, len(pool)))
+        if mode == "agent":
+            # 给规划 / 代理决策留出至少 2 次调用，别首轮就把预算烧光。
+            initial_count = min(
+                initial_count, max(3, int(budget["candidates"]) - 2)
+            )
         initial_times = self._take_times(pool, used_times, initial_count)
         batch = await self._extract_and_screen(
             media, path, out_dir, initial_times, stats, deferred
         )
         used_times.extend(item["time"] for item in batch)
+        self._mark_seen(segments_seen, batch, duration, k_segments)
         check_cancel()
 
         # 4) 首轮评分
         report(stage="scoring", percent=25, status="running")
         scored = await self._score_batch(batch, segments, duration, stats, deferred)
         history.extend(scored)
-        results = self._accepted(scored, target)
+        results = self._accepted(scored, target, duration)
         rounds_used = 1
+
+        # 4.5) high 档 hybrid 主动细看一段「字幕密集但还没看清」的段（clip 预算内）。
+        if mode == "hybrid" and effort_name == "high":
+            results = await self._hybrid_clip_probe(
+                results=results,
+                media=media,
+                path=path,
+                out_dir=out_dir,
+                duration=duration,
+                target=target,
+                segments=segments,
+                used_times=used_times,
+                history=history,
+                stats=stats,
+                deferred=deferred,
+                segments_seen=segments_seen,
+            )
 
         # 5) 循环补抽，直到够数或轮数用尽
         if mode == "agent":
@@ -447,6 +1073,8 @@ class FramesAgent:
                 deferred=deferred,
                 report=report,
                 check_cancel=check_cancel,
+                gaps=gaps,
+                segments_seen=segments_seen,
             )
         else:
             while len(results) < target and rounds_used < rounds_limit:
@@ -459,7 +1087,16 @@ class FramesAgent:
                     picked=len(results),
                 )
                 need = min(MAX_SUPPLEMENT, max(MIN_SUPPLEMENT, target))
-                times = self._take_times(pool, used_times, need)
+                # 优先补「还没选到帧的段」，避免一直往同一段抽。
+                times = self._supplement_times(
+                    pool,
+                    duration,
+                    target,
+                    used_times,
+                    results,
+                    need,
+                    gaps=gaps,
+                )
                 if not times:
                     times = self._uniform_unseen(duration, used_times, need)
                 if not times:
@@ -474,12 +1111,31 @@ class FramesAgent:
                         media, path, out_dir, times, stats, deferred
                     )
                 used_times.extend(item["time"] for item in batch)
+                self._mark_seen(segments_seen, batch, duration, k_segments)
                 scored = await self._score_batch(
                     batch, segments, duration, stats, deferred
                 )
                 history.extend(scored)
-                results = self._accepted(history, target)
+                results = self._accepted(history, target, duration)
                 rounds_used += 1
+
+        # 5.5) 覆盖均衡强制：若最终帧全挤在同一段，补抽其它段（最多 2 轮）。
+        results = await self._enforce_coverage(
+            results=results,
+            media=media,
+            path=path,
+            out_dir=out_dir,
+            duration=duration,
+            target=target,
+            used_times=used_times,
+            history=history,
+            segments=segments,
+            gaps=gaps,
+            stats=stats,
+            deferred=deferred,
+            segments_seen=segments_seen,
+            check_cancel=check_cancel,
+        )
 
         # 6) 去重 + 降级 + 输出
         results = self._dedup_results(results, target)
@@ -497,8 +1153,13 @@ class FramesAgent:
         if deferred and not results:
             degraded_reason = "；".join(deferred[-3:])
 
+        # 覆盖统计：最终每段选了几张（写进响应，方便核对「没有全挤在前 1/3」）。
+        for item in results:
+            index = segment_index(float(item["time"]), duration, k_segments)
+            if 0 <= index < len(segments_seen):
+                segments_seen[index]["picked"] += 1
+
         stats["elapsed_ms"] = round((time.perf_counter() - started) * 1000)
-        stats["vlm_calls"] = stats["vlm_calls"]
         if len(results) < target:
             stats["shortfall"] = target - len(results)
         report(stage="done", percent=100, status="done")
@@ -507,8 +1168,19 @@ class FramesAgent:
             "video": str(path),
             "duration": duration,
             "target": target,
+            "effort": effort_name,
+            "budget": budget,
             "rounds_used": rounds_used,
             "frames": results,
+            "silence_gaps": gaps,
+            "segments_seen": [
+                {
+                    "index": item["index"],
+                    "extracted": item["extracted"],
+                    "picked": item["picked"],
+                }
+                for item in segments_seen
+            ],
             "stats": stats,
         }
         if subtitles_from:
@@ -616,6 +1288,12 @@ class FramesAgent:
             deferred.append(f"抽帧失败：{type(exc).__name__}: {exc}")
             return []
 
+        return self._screen_frames(frames, stats)
+
+    def _screen_frames(
+        self, frames: Sequence[dict[str, Any]], stats: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """对抽回来的帧做亮度/方差 + 感知哈希预筛（抽帧来源无关）。"""
         kept: list[dict[str, Any]] = []
         threshold = int(self.cfg.vision_phash_distance or DEFAULT_PHASH_DISTANCE)
         for frame in frames:
@@ -669,6 +1347,61 @@ class FramesAgent:
             kept.append(item)
         return kept
 
+    async def _extract_clip(
+        self,
+        media: Any,
+        video: Path,
+        out_dir: Path,
+        start: float,
+        end: float,
+        fps: float,
+        stats: dict[str, Any],
+        deferred: list[str],
+    ) -> list[dict[str, Any]]:
+        """``extract_clip`` 工具：在 ``[start,end]`` 内按 fps 连续抽帧并预筛。
+
+        预算受 ``stats["clip_limit"]`` 限制；窗口超过 60 秒或次数用尽时
+        不调用 ffmpeg，直接把原因写进 warnings（由上层决定是否改成普通抽帧）。
+        """
+        if self._clip_left(stats) <= 0:
+            deferred.append("clip 次数已达 effort 上限，跳过")
+            return []
+        try:
+            start_value = float(start)
+            end_value = float(end)
+            rate = float(fps)
+        except (TypeError, ValueError):
+            deferred.append(f"extract_clip 参数不是数字：start={start!r} end={end!r} fps={fps!r}")
+            return []
+        if end_value <= start_value or start_value < 0:
+            deferred.append(f"extract_clip 时间窗口非法：{start_value}~{end_value}")
+            return []
+        if end_value - start_value > MAX_CLIP_SECONDS:
+            deferred.append(
+                f"extract_clip 窗口太长（{end_value - start_value:.1f}s > {MAX_CLIP_SECONDS:.0f}s）"
+            )
+            return []
+        rate = _clamp(rate or 1.0, CLIP_MIN_FPS, CLIP_MAX_FPS)
+        clip_dir = out_dir / "clips"
+        try:
+            frames = await media.call(
+                "extract_frames_window",
+                str(video),
+                start_value,
+                end_value,
+                fps=rate,
+                width=FRAME_WIDTH,
+                out_dir=str(clip_dir),
+            )
+        except Exception as exc:  # noqa: BLE001 - 窗口抽帧失败不致命
+            logger.warning("extract_clip 失败：%s", exc)
+            deferred.append(f"extract_clip 失败：{type(exc).__name__}: {exc}")
+            return []
+        stats["clip_calls"] = int(stats.get("clip_calls") or 0) + 1
+        batch = self._screen_frames(frames, stats)
+        stats["clip_frames"] = int(stats.get("clip_frames") or 0) + len(batch)
+        return batch
+
     # ---- VLM 调用 -----------------------------------------------------
     async def _vlm_plan(
         self,
@@ -677,8 +1410,11 @@ class FramesAgent:
         segments: Sequence[dict[str, Any]],
         scenes: Sequence[float],
         stats: dict[str, Any],
+        gaps: Sequence[dict[str, Any]] = (),
     ) -> list[dict[str, Any]]:
         """用 vlm_frame_plan.md 让模型规划一批候选时间点（纯文本）。"""
+        if self._vlm_left(stats) <= 0:
+            return []
         try:
             vision = self._vision()
             prompt = load_prompt(self.cfg, "vlm_frame_plan.md")
@@ -686,7 +1422,12 @@ class FramesAgent:
                 {
                     "duration_sec": duration,
                     "target_frames": target,
+                    "effort": stats.get("effort") or EFFORT_DEFAULT,
                     "subtitles": _trim_subtitles(segments, limit=24, text_limit=60),
+                    "silence_gaps": [
+                        {"start": item["start"], "end": item["end"]}
+                        for item in list(gaps)[:12]
+                    ],
                     "scene_times": [round(float(item), 2) for item in list(scenes)[:30]],
                 },
                 ensure_ascii=False,
@@ -715,6 +1456,9 @@ class FramesAgent:
                         "time": round(point, 3),
                         "priority": max(1, min(3, priority)),
                         "reason": str(item.get("reason") or "VLM 规划")[:60],
+                        "segment": segment_index(
+                            point, duration, coverage_segment_count(target)
+                        ),
                     }
                 )
                 if len(planned) >= 40:
@@ -737,6 +1481,21 @@ class FramesAgent:
         failures = 0
         for item in batch:
             if item.get("prefiltered"):
+                scored.append(item)
+                continue
+            if self._vlm_left(stats) <= 0:
+                # effort 预算用尽：剩下的帧不再调 VLM，按「未评分」交给降级逻辑。
+                item.update(
+                    {
+                        "usable": False,
+                        "kind": "other",
+                        "score": 0,
+                        "ocr_text": "",
+                        "summary": "VLM 调用预算已用尽，本帧未评分",
+                        "why": f"effort={stats.get('effort')} 的 VLM 上限为 {stats.get('vlm_limit')}",
+                        "budget_exhausted": True,
+                    }
+                )
                 scored.append(item)
                 continue
             if failures >= 2:
@@ -785,11 +1544,21 @@ class FramesAgent:
     ) -> dict[str, Any]:
         vision = self._vision()
         prompt = load_prompt(self.cfg, "vlm_frame_score.md")
+        nearby = _subtitle_nearby(segments, item["time"])
         user = json.dumps(
             {
                 "time": item["time"],
                 "duration_sec": duration,
-                "subtitle_nearby": _subtitle_nearby(segments, item["time"]),
+                "subtitle_nearby": nearby,
+                # 无人声段提示：明确告诉模型「没字幕不代表没内容」，
+                # 和 vlm_frame_score.md 的判定规则第 4 条一致。
+                "silence_gap": not nearby,
+                "gap_note": (
+                    "该时间点位于无人声空档：画面可能在演示操作/展示成品/放图表，"
+                    "无人声不等于没内容，请按真实画面判定"
+                    if not nearby
+                    else ""
+                ),
             },
             ensure_ascii=False,
         )
@@ -820,10 +1589,15 @@ class FramesAgent:
         deferred: list[str],
         report: Callable[..., None],
         check_cancel: Callable[[], None],
+        gaps: Sequence[dict[str, Any]] = (),
+        segments_seen: Sequence[dict[str, Any]] = (),
     ) -> tuple[list[dict[str, Any]], int, int]:
-        """多轮代理：模型输出 extract/final，程序执行后把画面描述回灌。"""
+        """多轮代理：模型输出 extract / extract_clip / final，程序执行后回灌画面描述。"""
         vision = self._vision()
         prompt = load_prompt(self.cfg, "vlm_frame_agent.md")
+        effort_name = str(stats.get("effort") or EFFORT_DEFAULT)
+        budget = stats.get("budget") or effort_budget(target, effort_name)
+        k = coverage_segment_count(target)
         extra = 0
         # 即使首轮候选已经够数，也至少让代理做一次 final 决策：
         # 这样 agent planner 真的走了协议，而不是悄悄退化成 hybrid。
@@ -835,6 +1609,9 @@ class FramesAgent:
         while rounds_used < max_rounds and (len(results) < target or first_decision):
             first_decision = False
             check_cancel()
+            if self._vlm_left(stats) <= 0:
+                deferred.append("VLM 调用预算已用尽，代理提前结束")
+                break
             report(
                 stage="agent",
                 percent=min(90, 30 + rounds_used * 10),
@@ -844,10 +1621,28 @@ class FramesAgent:
             user = json.dumps(
                 {
                     "duration_sec": duration,
+                    "effort": effort_name,
+                    "effort_note": budget.get("note"),
                     "subtitles": _trim_subtitles(segments, limit=30, text_limit=60),
+                    "silence_gaps": [
+                        {"start": item["start"], "end": item["end"]}
+                        for item in list(gaps)[:12]
+                    ],
+                    "segments_seen": [
+                        {
+                            "index": item["index"],
+                            "times": (item.get("times") or [])[-6:],
+                            "picked": int(item.get("picked") or 0),
+                        }
+                        for item in segments_seen
+                    ],
                     "target_frames": target,
                     "max_rounds": max_rounds,
                     "round": rounds_used + 1,
+                    "clip_budget": {
+                        "limit": int(budget.get("clip_limit") or 0),
+                        "used": int(stats.get("clip_calls") or 0),
+                    },
                     "already_picked": [
                         {
                             "time": item["time"],
@@ -874,6 +1669,57 @@ class FramesAgent:
                 deferred.append("VLM agent 返回无法解析的 JSON")
                 break
             action = str(data.get("action") or "").strip().lower()
+
+            if action == "extract_clip":
+                # 代理协议扩展：{action:"extract_clip", start, end, fps}
+                clip_start = data.get("start")
+                clip_end = data.get("end")
+                clip_fps = data.get("fps", budget.get("clip_fps") or 1.0)
+                batch = await self._extract_clip(
+                    media,
+                    path,
+                    out_dir,
+                    float(clip_start) if clip_start is not None else -1.0,
+                    float(clip_end) if clip_end is not None else -1.0,
+                    float(clip_fps or 1.0),
+                    stats,
+                    deferred,
+                )
+                if not batch:
+                    # clip 不可用（次数用尽/窗口非法/ffmpeg 失败）：退回中点抽帧。
+                    fallback = []
+                    try:
+                        middle = (float(clip_start) + float(clip_end)) / 2
+                        fallback = [round(middle, 3)]
+                    except (TypeError, ValueError):
+                        fallback = []
+                    if fallback:
+                        batch = await self._extract_and_screen(
+                            media, path, out_dir, fallback, stats, deferred
+                        )
+                if not batch:
+                    break
+                self._mark_seen(segments_seen, batch, duration, k)
+                used_times.extend(item["time"] for item in batch)
+                scored = await self._score_batch(
+                    batch, segments, duration, stats, deferred
+                )
+                history.extend(scored)
+                results = self._accepted(history, target, duration)
+                rounds_used += 1
+                extra += 1
+                last_round = {
+                    "action": "extract_clip",
+                    "window": [clip_start, clip_end],
+                    "requested_times": [item["time"] for item in batch],
+                    "frames": [
+                        _agent_frame_brief(item)
+                        for item in scored
+                        if not item.get("prefiltered")
+                    ],
+                }
+                continue
+
             if action == "final":
                 wanted = data.get("frames") or []
                 chosen: list[dict[str, Any]] = []
@@ -891,6 +1737,7 @@ class FramesAgent:
                             media, path, out_dir, [point], stats, deferred
                         )
                         used_times.extend(item["time"] for item in batch)
+                        self._mark_seen(segments_seen, batch, duration, k)
                         scored = await self._score_batch(
                             batch, segments, duration, stats, deferred
                         )
@@ -903,7 +1750,7 @@ class FramesAgent:
                         picked["why"] = str(entry.get("why") or picked.get("why") or "")[:80]
                         chosen.append(picked)
                 if chosen:
-                    results = self._accepted(chosen + results, target)
+                    results = self._accepted(chosen + results, target, duration)
                 break
 
             # 继续抽：extract
@@ -915,10 +1762,22 @@ class FramesAgent:
             )
             if not times:
                 deferred.append("VLM agent 的 extract 时间点非法，改用确定性补抽")
-                times = self._take_times(
-                    plan_candidates(duration, segments, scenes, target_frames=target),
+                times = self._supplement_times(
+                    plan_candidates(
+                        duration,
+                        segments,
+                        scenes,
+                        target_frames=target,
+                        effort=effort_name,
+                        count=int(budget.get("candidates") or 12),
+                        gaps=gaps,
+                    ),
+                    duration,
+                    target,
                     used_times,
+                    results,
                     min(4, max(2, target)),
+                    gaps=gaps,
                 )
             if not times:
                 break
@@ -926,11 +1785,12 @@ class FramesAgent:
                 media, path, out_dir, times, stats, deferred
             )
             used_times.extend(item["time"] for item in batch)
+            self._mark_seen(segments_seen, batch, duration, k)
             scored = await self._score_batch(
                 batch, segments, duration, stats, deferred
             )
             history.extend(scored)
-            results = self._accepted(history, target)
+            results = self._accepted(history, target, duration)
             rounds_used += 1
             extra += 1
             last_round = {
@@ -988,8 +1848,17 @@ class FramesAgent:
             point += step
         return picked
 
-    def _accepted(self, history: Sequence[dict[str, Any]], target: int) -> list[dict[str, Any]]:
-        """按「usable 且 score>=3」筛，按分数降序取前 N（同一幻灯片只留一张）。"""
+    def _accepted(
+        self,
+        history: Sequence[dict[str, Any]],
+        target: int,
+        duration: Optional[float] = None,
+    ) -> list[dict[str, Any]]:
+        """按「usable 且 score>=3」筛，优先不同段，再按分数取前 N。
+
+        第一轮每个覆盖段最多选 1 张（保证 3 张不会全挤在同一个 1/6 区间）；
+        段数不够时才允许同段补第二张。同一张幻灯片仍然只留一张。
+        """
         threshold = int(self.cfg.vision_phash_distance or DEFAULT_PHASH_DISTANCE)
         valid = [
             item
@@ -999,13 +1868,43 @@ class FramesAgent:
             and not item.get("prefiltered")
         ]
         valid.sort(key=lambda item: (-int(item.get("score") or 0), item["time"]))
+        k = coverage_segment_count(target)
         chosen: list[dict[str, Any]] = []
-        for item in valid:
+        chosen_segments: set[int] = set()
+
+        def take(item: dict[str, Any]) -> bool:
             if any(_same_frame(item, other, threshold) for other in chosen):
-                continue
+                return False
             chosen.append(item)
-            if len(chosen) >= target:
-                break
+            if duration:
+                chosen_segments.add(segment_index(float(item["time"]), duration, k))
+            return True
+
+        if duration:
+            # 第一轮：每段只留分数最高的一张；段数多于目标帧时按段均匀取，
+            # 保证 3 帧是「全片 0/中间/结尾」而不是「最早的三段」。
+            per_segment: dict[int, dict[str, Any]] = {}
+            for item in valid:
+                index = segment_index(float(item["time"]), duration, k)
+                per_segment.setdefault(index, item)
+            available = sorted(per_segment)
+            if target > 1 and len(available) > target:
+                spread = [
+                    round(position * (len(available) - 1) / (target - 1))
+                    for position in range(target)
+                ]
+                for position in spread:
+                    take(per_segment[available[int(position)]])
+            else:
+                for index in available:
+                    if take(per_segment[index]) and len(chosen) >= target:
+                        break
+        if len(chosen) < target:
+            for item in valid:
+                if item in chosen:
+                    continue
+                if take(item) and len(chosen) >= target:
+                    break
         chosen.sort(key=lambda item: item["time"])
         return [_public_frame(item) for item in chosen]
 
@@ -1053,6 +1952,7 @@ class FramesAgent:
                     "ocr_text": "",
                     "summary": "确定性回退帧（方差较高，未调用 VLM）",
                     "why": "VLM 不可用，按画面方差 + 场景点回退",
+                    "confidence": "low",
                     "degraded": True,
                 }
             )
@@ -1135,18 +2035,22 @@ def _normalize_score(data: dict[str, Any], time_sec: float) -> dict[str, Any]:
         "ocr_text": str(data.get("ocr_text") or "")[:1000],
         "summary": str(data.get("summary") or "")[:120],
         "why": str(data.get("why") or "")[:120],
+        # 摘要太短或带「大概/可能」等模糊词 -> low，调用方可以自己再看原图。
+        "confidence": _summary_confidence(str(data.get("summary") or "")),
     }
 
 
 def _public_frame(item: dict[str, Any]) -> dict[str, Any]:
+    summary = item.get("summary") or ""
     return {
         "time": round(float(item["time"]), 3),
         "path": item["path"],
         "score": int(item.get("score") or 0),
         "kind": item.get("kind") or "other",
         "ocr_text": item.get("ocr_text") or "",
-        "summary": item.get("summary") or "",
+        "summary": summary,
         "why": item.get("why") or "",
+        "confidence": item.get("confidence") or _summary_confidence(summary),
     }
 
 

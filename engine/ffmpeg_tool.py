@@ -17,6 +17,8 @@ ffmpeg 媒体工具（本地 AI 服务共用）
     probe(path)                          媒体信息（时长、容器、音频参数、视频分辨率/帧率）
     to_wav16k(src, dst=None)             任意音视频 -> 16kHz 单声道 PCM16 wav（ASR 用）
     extract_frames(src, out_dir, ...)    抽帧（按数量 / 时间点 / fps），返回文件与尺寸
+    extract_frames_window(src, start, end) 在 [start,end] 窗口内按 fps 抽帧，命名带绝对时间点
+    clip(src, start, end, ...)          裁剪一段（默认重编码成 h264 mp4，时间点精确）
     extract_audio(src, out_dir, fmt=...) 只抽音轨（保留原采样率）
     detect_scenes(src, ...)              场景/镜头边界检测（ffmpeg scene 分数）
 
@@ -25,6 +27,8 @@ ffmpeg 媒体工具（本地 AI 服务共用）
     python ffmpeg_tool.py probe  D:\\a.mp4
     python ffmpeg_tool.py wav16k D:\\a.mp4 --out D:\\a.wav
     python ffmpeg_tool.py frames D:\\a.mp4 --out D:\\frames --count 3
+    python ffmpeg_tool.py window D:\\a.mp4 --start 200 --end 260 --fps 1 --out D:\\frames
+    python ffmpeg_tool.py clip   D:\\a.mp4 --start 200 --end 260 --out D:\\clips
     python ffmpeg_tool.py audio  D:\\a.mp4 --out D:\\audio --format mp3
 """
 
@@ -662,6 +666,209 @@ def extract_frames(
 
 
 # ---------------------------------------------------------------------------
+# 裁剪一段 + 窗口抽帧（细看某段）
+# ---------------------------------------------------------------------------
+
+#: 窗口抽帧允许的 fps 范围（太小看不出连续性，太大 token 爆）。
+WINDOW_MIN_FPS = 0.5
+WINDOW_MAX_FPS = 3.0
+#: 单次窗口抽帧最多输出多少张（防止窗口 + fps 组合把磁盘写满）。
+WINDOW_MAX_FRAMES = 120
+
+
+def _validate_window(
+    src: str | Path, start: Any, end: Any
+) -> tuple[Path, dict[str, Any], float, float]:
+    """校验 ``0 <= start < end <= duration``，返回归一后的窗口。
+
+    时间点允许 50ms 的浮点误差（调用方常用 round 后的秒数）。
+    """
+    source = _require_file(src)
+    info = probe(source)
+    if not info.get("video"):
+        raise MediaError(f"这个文件没有视频流：{source}")
+    duration = info.get("duration")
+    if not duration or float(duration) <= 0:
+        raise MediaError(f"读不出视频时长，无法裁剪/抽窗口帧：{source}")
+    try:
+        start_value = float(start)
+        end_value = float(end)
+    except (TypeError, ValueError) as exc:
+        raise MediaError(f"start/end 必须是数字，收到 {start!r} / {end!r}") from exc
+    if start_value < 0:
+        raise MediaError(f"start 不能是负数，收到 {start_value}")
+    if end_value <= start_value:
+        raise MediaError(f"end 必须大于 start（start={start_value}, end={end_value}）")
+    if end_value > float(duration) + 0.05:
+        raise MediaError(
+            f"end={end_value:.3f}s 超出视频时长 {float(duration):.3f}s"
+        )
+    end_value = min(end_value, float(duration))
+    return source, info, round(start_value, 3), round(end_value, 3)
+
+
+def clip(
+    src: str | Path,
+    start: float,
+    end: float,
+    *,
+    out: str | Path | None = None,
+    reencode: bool = True,
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    """把 ``[start, end]`` 剪成一段独立视频，时间点精确到裁剪位置。
+
+    - 默认**重编码**成 h264 mp4（``libx264 -preset veryfast -crf 23`` + aac），
+      这样 ``-ss`` 能按解码时间精确切，不依赖关键帧位置；
+    - ``reencode=False`` 时走 ``-c copy``（很快，但会从最近的关键帧开始，
+      实际时长可能比请求的长）；
+    - ``out`` 不给时落到系统临时目录 ``localai_clips/``，文件名带起止秒数。
+
+    返回 ``{"path", "start", "end", "duration", "size_mb"}``；
+    失败抛 :class:`MediaError`，message 里带 ffmpeg stderr 尾部（由 ``_run`` 负责）。
+    """
+    source, _info, start_value, end_value = _validate_window(src, start, end)
+    span = round(end_value - start_value, 3)
+    if span <= 0:
+        raise MediaError(f"裁剪窗口为空（start={start_value}, end={end_value}）")
+
+    if out is None:
+        target_dir = Path(tempfile.gettempdir()) / "localai_clips"
+        target = target_dir / (
+            f"{source.stem}_clip_{start_value:.3f}-{end_value:.3f}.mp4"
+        )
+    else:
+        target = Path(out)
+        if target.suffix == "":
+            target = target.with_suffix(".mp4")
+        target.parent.mkdir(parents=True, exist_ok=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    # -ss 放在 -i 前面：重编码时会先跳到最近关键帧再解码丢弃，速度与精度兼顾；
+    # -t 用窗口长度而不是 -to，避免部分容器时间基准不一致。
+    args = [
+        "-v", "error",
+        "-ss", f"{start_value:.3f}",
+        "-i", str(source),
+        "-t", f"{span:.3f}",
+        "-map", "0:v:0",
+        "-map", "0:a:0?",
+        "-sn", "-dn",
+    ]
+    if reencode:
+        args += [
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-movflags", "+faststart",
+        ]
+    else:
+        args += ["-c", "copy", "-avoid_negative_ts", "make_zero"]
+    args.append(str(target))
+    _run(args, timeout=timeout)
+
+    if not target.is_file() or target.stat().st_size == 0:
+        raise MediaError(f"ffmpeg 没有生成裁剪结果：{target}")
+    out_info = probe(target)
+    out_duration = out_info.get("duration")
+    if out_duration is None:
+        out_duration = span
+    return {
+        "path": str(target),
+        "start": start_value,
+        "end": end_value,
+        "duration": round(float(out_duration), 3),
+        "size_mb": round(target.stat().st_size / 1024**2, 2),
+    }
+
+
+def extract_frames_window(
+    src: str | Path,
+    start: float,
+    end: float,
+    *,
+    fps: float = 1.0,
+    width: int | None = None,
+    out_dir: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """在 ``[start, end]`` 窗口内按 ``fps`` 抽帧，文件名带**绝对时间点**。
+
+    和 :func:`extract_frames` 的 ``fps`` 模式不同，这里只处理一个窗口，
+    并且把 ffmpeg 输出的相对序号换算成 ``start + index / fps``，
+    返回 ``[{"path", "time_sec", "width", "height"}]``，供「细看某段」直接使用。
+
+    ``fps`` 限制在 0.5~3；窗口时长 × fps 超过 ``WINDOW_MAX_FRAMES`` 时直接拒绝，
+    避免一次抽几百张把 VLM 上下文和磁盘都撑爆。
+    """
+    source, _info, start_value, end_value = _validate_window(src, start, end)
+    span = end_value - start_value
+    try:
+        rate = float(fps)
+    except (TypeError, ValueError) as exc:
+        raise MediaError(f"fps 必须是数字，收到 {fps!r}") from exc
+    if not WINDOW_MIN_FPS <= rate <= WINDOW_MAX_FPS:
+        raise MediaError(
+            f"fps 必须在 {WINDOW_MIN_FPS}~{WINDOW_MAX_FPS} 之间，收到 {rate}"
+        )
+    estimated = int(span * rate) + 1
+    if estimated > WINDOW_MAX_FRAMES:
+        raise MediaError(
+            f"窗口 {span:.1f}s × fps={rate} 预计 {estimated} 张，"
+            f"超过上限 {WINDOW_MAX_FRAMES}；请调小 fps 或缩短窗口"
+        )
+    if width is not None and int(width) <= 0:
+        raise MediaError(f"width 必须是正整数，收到 {width}")
+
+    target_dir = Path(out_dir) if out_dir is not None else (
+        Path(tempfile.gettempdir()) / "localai_windows"
+    )
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    # 每次调用一个唯一前缀：并发/连续裁剪时不会互相抢 raw 文件。
+    token = f"{int(time.time() * 1000):013d}_{os.getpid()}_{id(src) % 10000:04d}"
+    pattern = target_dir / f"raw_win_{token}_%05d.jpg"
+    filters = [f"fps={rate}"]
+    if width:
+        filters.append(f"scale={int(width)}:-2")
+    args = [
+        "-v", "error",
+        "-ss", f"{start_value:.3f}",
+        "-i", str(source),
+        "-t", f"{span:.3f}",
+        "-an", "-sn", "-dn",
+        "-vf", ",".join(filters),
+        "-q:v", "3",
+        str(pattern),
+    ]
+    _run(args, timeout=None)
+
+    raw_files = sorted(target_dir.glob(f"raw_win_{token}_*.jpg"))
+    if not raw_files:
+        raise MediaError(
+            f"窗口 {start_value:.3f}~{end_value:.3f}s 内没有抽到画面：{source}"
+        )
+
+    frames: list[dict[str, Any]] = []
+    for index, raw_path in enumerate(raw_files):
+        seconds = round(start_value + index / rate, 3)
+        final_path = target_dir / f"window_{index + 1:04d}_{seconds:.3f}s.jpg"
+        raw_path.replace(final_path)
+        frame_width, frame_height = _image_size(final_path)
+        frames.append(
+            {
+                "path": str(final_path),
+                "time_sec": seconds,
+                "width": frame_width,
+                "height": frame_height,
+            }
+        )
+    return frames
+
+
+# ---------------------------------------------------------------------------
 # 只抽音轨
 # ---------------------------------------------------------------------------
 
@@ -912,6 +1119,21 @@ def _main() -> int:
     audio_parser.add_argument("--out", required=True)
     audio_parser.add_argument("--format", default="wav", choices=("wav", "mp3"))
 
+    window_parser = sub.add_parser("window", help="在 [start,end] 窗口内按 fps 抽帧")
+    window_parser.add_argument("path")
+    window_parser.add_argument("--start", type=float, required=True)
+    window_parser.add_argument("--end", type=float, required=True)
+    window_parser.add_argument("--fps", type=float, default=1.0)
+    window_parser.add_argument("--width", type=int, default=None)
+    window_parser.add_argument("--out", required=True)
+
+    clip_parser = sub.add_parser("clip", help="裁剪一段（默认重编码 mp4）")
+    clip_parser.add_argument("path")
+    clip_parser.add_argument("--start", type=float, required=True)
+    clip_parser.add_argument("--end", type=float, required=True)
+    clip_parser.add_argument("--out", default=None)
+    clip_parser.add_argument("--copy", action="store_true", help="不重编码（快但不精确）")
+
     scenes_parser = sub.add_parser("scenes", help="场景/镜头边界检测")
     scenes_parser.add_argument("path")
     scenes_parser.add_argument("--threshold", type=float, default=SCENE_DEFAULT_THRESHOLD)
@@ -958,6 +1180,29 @@ def _main() -> int:
             fmt=args.format,
         )
         print(json.dumps({"count": len(frames), "frames": frames}, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "window":
+        frames = extract_frames_window(
+            args.path,
+            args.start,
+            args.end,
+            fps=args.fps,
+            width=args.width,
+            out_dir=args.out,
+        )
+        print(json.dumps({"count": len(frames), "frames": frames}, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "clip":
+        result = clip(
+            args.path,
+            args.start,
+            args.end,
+            out=args.out,
+            reencode=not args.copy,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
 
     result = extract_audio(args.path, args.out, fmt=args.format)

@@ -359,6 +359,10 @@ def prepare_payload(
         if not 1 <= target_frames <= 10:
             raise ValueError("target_frames 必须在 1~10 之间")
         normalized["target_frames"] = target_frames
+        # filter=vision 时的分析力度；旧请求没带就是 medium（和之前行为最接近）。
+        from ..core.frames_agent import normalize_effort  # noqa: PLC0415
+
+        normalized["effort"] = normalize_effort(data.get("effort"))
         return act, normalized
 
     if kind == "vision":
@@ -387,6 +391,9 @@ def prepare_payload(
         planner = (_text(data.get("planner")) or "hybrid").lower()
         if planner not in ("hybrid", "agent"):
             raise ValueError("planner 只支持 hybrid / agent")
+        from ..core.frames_agent import normalize_effort  # noqa: PLC0415
+
+        effort = normalize_effort(data.get("effort"))
         try:
             max_rounds = int(data.get("max_rounds") or 6)
         except (TypeError, ValueError) as exc:
@@ -408,6 +415,7 @@ def prepare_payload(
             "job_id": job_id or None,
             "target_frames": target_frames,
             "planner": planner,
+            "effort": effort,
             "max_rounds": max_rounds,
             "subtitles": subtitles,
             "scene_times": scene_times,
@@ -883,6 +891,7 @@ async def _run_analyze(payload: dict[str, Any], ctx: JobContext) -> dict[str, An
             path,
             target_frames=int(payload.get("target_frames") or 3),
             planner=payload.get("planner") or cfg.vision_planner,
+            effort=payload.get("effort") or "medium",
             max_rounds=int(payload.get("max_rounds") or 6),
             subtitles=segments,
             scene_times=[float(item.get("time") or 0) for item in scenes],
@@ -906,8 +915,10 @@ async def _run_analyze(payload: dict[str, Any], ctx: JobContext) -> dict[str, An
         "vision": (
             {
                 "planner": (vision_result or {}).get("stats", {}).get("planner"),
+                "effort": (vision_result or {}).get("effort"),
                 "rounds_used": vision_result.get("rounds_used"),
                 "vlm_calls": (vision_result or {}).get("stats", {}).get("vlm_calls"),
+                "clip_calls": (vision_result or {}).get("stats", {}).get("clip_calls"),
                 "degraded": bool(vision_result.get("degraded")),
                 "degraded_reason": vision_result.get("degraded_reason"),
             }
@@ -967,6 +978,7 @@ async def _run_vision(payload: dict[str, Any], ctx: JobContext) -> dict[str, Any
         video_path,
         target_frames=int(payload.get("target_frames") or 3),
         planner=payload.get("planner") or "hybrid",
+        effort=payload.get("effort") or "medium",
         max_rounds=int(payload.get("max_rounds") or 6),
         subtitles=payload.get("subtitles"),
         scene_times=payload.get("scene_times"),

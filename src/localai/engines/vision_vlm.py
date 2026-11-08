@@ -40,6 +40,8 @@ class VisionAdapter(BaseAdapter):
         "/vision/describe",
         "/vision/scan",
         "/vision/frames",
+        "/vision/video",
+        "/vision/frame",
         "/vision/status",
         "/jobs/vision",
     )
@@ -169,6 +171,42 @@ class VisionAdapter(BaseAdapter):
             "texts": texts,
             "elapsed_ms": round((time.perf_counter() - started) * 1000),
             "model": self.model_name,
+        }
+
+    async def describe_frames(
+        self,
+        images: Sequence[str | Path],
+        prompt: str,
+        *,
+        system_prompt: str | None = None,
+        max_tokens: int = 768,
+        max_side: int = 256,
+        temperature: float = 0.0,
+        labels: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        """多帧一次性理解（``/vision/video`` 用）；返回 ``{ok,text,elapsed_ms}``。
+
+        所有帧塞进同一个请求，模型能横向比较整段画面的变化；
+        ``max_side`` 控制每帧缩略图尺寸，``labels`` 给每帧加时间标签，
+        避免小模型只盯第一帧。
+        """
+        started = time.perf_counter()
+        text = await self._run(
+            "describe_frames",
+            [str(item) for item in images],
+            prompt,
+            system_prompt=system_prompt,
+            max_tokens=max_tokens,
+            max_side=max_side,
+            temperature=temperature,
+            labels=list(labels) if labels is not None else None,
+        )
+        return {
+            "ok": True,
+            "text": text,
+            "elapsed_ms": round((time.perf_counter() - started) * 1000),
+            "model": self.model_name,
+            "loaded": self.loaded(),
         }
 
     async def describe_text(

@@ -1537,10 +1537,16 @@ B站字幕抽查（与音频内容一致）：
 | --- | --- | --- |
 | POST | `/vision/describe` | 单张图片理解（multipart），默认用单帧评分提示词 |
 | POST | `/vision/scan` | 多图批量：multipart 上传或 JSON 路径列表；`task=score/caption/ocr` |
-| POST | `/vision/frames` | 按字幕 + 场景 + VLM 循环抽帧，凑够 N 张 |
+| POST | `/vision/frames` | 按字幕 + 场景 + VLM 循环抽帧，凑够 N 张（支持 `effort`） |
+| POST | `/vision/video` | **段级细看**：只切一段 / 全片多帧看视频，**只返回文字** |
+| GET | `/vision/frame` | **按需取帧图片**（仅限 outputs/ 与 data/downloads/，防目录穿越） |
 | POST | `/jobs/vision` | 异步版 `/vision/frames`（kind=vision，可查进度/取消） |
-| GET | `/vision/status` | 模型、进程、显存估算、默认 planner、提示词文件 |
-| POST | `/media/analyze` | 旧接口新增可选 `filter="vision"` + `target_frames` |
+| GET | `/vision/status` | 模型、进程、显存估算、默认 planner、effort 预算、提示词文件 |
+| POST | `/media/analyze` | 旧接口新增可选 `filter="vision"` + `target_frames` + `effort` |
+
+> **所有 `/vision/*` 响应都不含 base64 / preview 图片**。`frames` 里只有
+> `{time,path,score,kind,ocr_text,summary,why,confidence}`，要看图请用
+> `GET /vision/frame?path=...`。
 
 ### 15.2 `POST /vision/describe`
 
@@ -1591,6 +1597,7 @@ curl.exe -s -X POST http://127.0.0.1:7880/vision/scan -H "Content-Type: applicat
   "video_path": "E:/LocalAIService/data/downloads/2026-11-08/xxx.mp4",
   "target_frames": 3,
   "planner": "hybrid",
+  "effort": "medium",
   "max_rounds": 6,
   "subtitles": [{"start": 0.08, "end": 0.68, "text": "本期盘点"}],
   "scene_times": [1.52, 3.04]
@@ -1600,6 +1607,19 @@ curl.exe -s -X POST http://127.0.0.1:7880/vision/scan -H "Content-Type: applicat
 ``video_path`` 与 ``job_id`` 二选一（``job_id`` 会从任务结果的 ``path`` 取视频）。
 ``subtitles`` / ``scene_times`` 可选：不给就找同目录站点字幕（``*.zh.srt`` 等），
 没字幕再跑 ``/asr/segments`` 同款分段识别；场景点没给就现场 ``/media/scenes``。
+``effort`` 可选 ``low`` / ``medium``（默认）/ ``high``，预算见下表；
+``max_rounds`` 只是上限，程序会再按 effort 收紧（取较小值）。
+
+**effort 预算表**
+
+| effort | 候选数 | 最多轮数 | VLM 调用上限 | clip 上限 | 行为 |
+| --- | --- | --- | --- | --- | --- |
+| `low` | `target×2`（最少 6） | 2 | 6 | 0 | 每段只取中点，不细看 |
+| `medium`（默认） | `target×4`（最少 6） | 4 | 16 | 1 | 覆盖 + 字幕关键词 + 无人声段 |
+| `high` | `target×6`（最少 6） | 6 | 32 | 2 | 再允许用 clip 细看「字幕密集但没看清」的段 |
+
+候选数指**规划候选点**；`clip` 抽出来的帧另计（`stats.clip_frames`），
+`stats.candidates` 是「实际预筛过的所有帧」= 规划抽帧 + clip 帧。
 
 响应：
 
@@ -1609,14 +1629,21 @@ curl.exe -s -X POST http://127.0.0.1:7880/vision/scan -H "Content-Type: applicat
   "video": "...",
   "duration": 431.267,
   "target": 3,
+  "effort": "medium",
+  "budget": {"effort": "medium", "candidates": 12, "max_rounds": 4,
+             "vlm_limit": 16, "clip_limit": 1, "note": "..."},
   "rounds_used": 1,
   "frames": [
     {"time": 5.085, "path": "...", "score": 4, "kind": "chart",
-     "ocr_text": "...", "summary": "...", "why": "..."}
+     "ocr_text": "...", "summary": "...", "why": "...", "confidence": "normal"}
   ],
-  "stats": {"candidates": 12, "vlm_calls": 8, "blank_skipped": 0,
-            "duplicates_skipped": 4, "elapsed_ms": 20653,
-            "planner": "hybrid", "max_rounds": 6, "subtitles": 209},
+  "silence_gaps": [{"start": 406.5, "end": 412.33}],
+  "segments_seen": [{"index": 0, "extracted": 3, "picked": 1}],
+  "stats": {"candidates": 12, "planned_candidates": 12, "vlm_calls": 10,
+            "blank_skipped": 0, "duplicates_skipped": 2, "elapsed_ms": 17560,
+            "planner": "hybrid", "effort": "medium", "max_rounds": 4,
+            "subtitles": 209, "clip_calls": 0, "clip_frames": 0,
+            "silence_gaps": 1, "vlm_limit": 16, "clip_limit": 1},
   "subtitles_from": "site"
 }
 ```
@@ -1624,45 +1651,56 @@ curl.exe -s -X POST http://127.0.0.1:7880/vision/scan -H "Content-Type: applicat
 字段：``target`` 1~10；``planner`` ``hybrid``（默认）/``agent``；``max_rounds`` 1~12。
 凑不够时如实少给，并带 ``detail``/``stats.shortfall``；VLM 不可用时带
 ``degraded=true`` + ``degraded_reason``，帧仍来自确定性回退。
+``confidence="low"`` 表示 VLM 的 summary 少于 6 个字或含「大概/可能」等模糊词，
+调用方可以自己用 `/vision/frame` 核对原图。
 
 **两种 planner 的区别**
 
 | | `hybrid`（默认） | `agent` |
 | --- | --- | --- |
-| 规划 | 字幕关键词 + 场景点 + 均匀补充（确定性） | 先用 `vlm_frame_plan.md` 让模型规划，再按代理协议循环 |
-| 评分 | 每帧一次 `vlm_frame_score.md`，取 `usable && score>=3` 的前 N | 同左；模型每轮输出 `{"action":"extract","times":[...]}` 或 `{"action":"final","frames":[...]}` |
+| 规划 | 字幕关键词 + 场景点 + 均匀补充（确定性，按段轮转） | 先用 `vlm_frame_plan.md` 让模型规划，再按代理协议循环 |
+| 评分 | 每帧一次 `vlm_frame_score.md`，取 `usable && score>=3` 的前 N | 同左；模型每轮输出 `{"action":"extract","times":[...]}`、`{"action":"extract_clip","start":..,"end":..,"fps":..}` 或 `{"action":"final","frames":[...]}` |
 | 轮数 | 分数不够就补抽 4~8 个新点，最多 `max_rounds` | 模型自己决定下一批点；`round>=max_rounds` 强制结束 |
+| clip | `high` 档会主动对「字幕最密、还没选到帧」的段 clip 一次 | 模型请求 `extract_clip` 时执行（受 `clip_limit` 限制） |
 | 速度 | 快、可控 | 多几次纯文本调用，适合复杂讲解视频 |
 | 解析容错 | 去 markdown 围栏 + 第一个 `{` 到最后一个 `}` + 容忍尾逗号 | 同左 |
 
 **算法（两条 planner 共用）**
 
 1. ffprobe 取时长；字幕按「调用方 > 同目录站点字幕 > ASR」；
-2. 生成候选点（字幕关键词位 > 场景切换点 > 均匀补充，点间距 ≥3 秒）；
-3. 先抽 8~16 张，做**感知哈希去重**（dHash 汉明距离，默认阈值 6）+ **亮度/方差预筛**
+2. 从字幕算 `silence_gaps`（相邻字幕 ≥5 秒、首尾也算），**每个空档中点必进候选**
+   （除非与已有候选 <2 秒）；
+3. 全片等分成 `K = max(target×2, 6)` 段，**每段至少 1 个候选**；
+   候选返回顺序按段轮转，禁止沿时间顺序挤在开头；
+4. 生成候选点（空档中点 > 字幕关键词 > 场景切换 > 段覆盖/均匀补充，点间距 ≥3 秒）；
+5. 先抽候选，做**感知哈希去重**（dHash 汉明距离，默认阈值 6）+ **亮度/方差预筛**
    （近纯色、低方差直接判 `blank`，不调 VLM）；
-4. 对非空白帧调 VLM 评分；同一张幻灯片按「感知哈希 / OCR 相似度 / summary」
-   只留一张；
-5. 不够就补抽；VLM 连续失败两次提前终止，退回方差 + 场景点的确定性结果。
+6. 对非空白帧调 VLM 评分（无人声段会把 `silence_gap=true` 传给模型）；
+   同一张幻灯片按「感知哈希 / OCR 相似度 / summary」只留一张；
+7. 不够就补抽，**优先补还没有选中帧的段**；
+8. 最终选帧优先每个段一张，并在段数多于目标帧时按段均匀取（0/中/尾）；
+   若仍全落在同一段，**代码强制**再补抽其它段，最多 2 轮；
+9. VLM 连续失败两次提前终止，退回方差 + 场景点的确定性结果。
 
 抽帧宽度固定 768px（够看清幻灯片正文，又把视觉 token 控制在 ~1000）。
-结果图片落在 ``outputs/frames/vision_<时间戳>_<随机>/``。
+结果图片落在 ``outputs/frames/vision_<时间戳>_<随机>/``；
+clip 帧落在同目录的 ``clips/`` 子目录。
 
 ### 15.5 `POST /jobs/vision`
 
-请求体同 `/vision/frames`，额外 ``priority``；提交后轮询 ``GET /jobs/{id}``。
+请求体同 `/vision/frames`（含 `effort`），额外 ``priority``；提交后轮询 ``GET /jobs/{id}``。
 ``kind=vision`` 在队列里固定同类并行 1；进度写 ``meta.progress``（stage/percent），
 ``POST /jobs/{id}/cancel`` 在下一轮检查点退出。
 
 ```powershell
 curl.exe -s -X POST http://127.0.0.1:7880/jobs/vision -H "Content-Type: application/json" `
-  -d "{\"video_path\":\"E:/.../a.mp4\",\"target_frames\":3,\"planner\":\"hybrid\"}"
+  -d "{\"video_path\":\"E:/.../a.mp4\",\"target_frames\":3,\"planner\":\"hybrid\",\"effort\":\"high\"}"
 ```
 
 ### 15.6 `/media/analyze` 的 `filter="vision"`
 
 ```json
-{"url": "https://...", "filter": "vision", "target_frames": 3}
+{"url": "https://...", "filter": "vision", "target_frames": 3, "effort": "medium"}
 ```
 
 在「下载 -> 字幕/ASR -> 场景边界」之后，直接复用当前字幕与场景点挑关键帧，
@@ -1670,8 +1708,8 @@ curl.exe -s -X POST http://127.0.0.1:7880/jobs/vision -H "Content-Type: applicat
 
 ```json
 "vision_frames": [{"time": 5.085, "path": "...", "score": 4, "kind": "chart", "...": "..."}],
-"vision": {"planner": "hybrid", "rounds_used": 1, "vlm_calls": 8,
-           "degraded": false, "degraded_reason": null}
+"vision": {"planner": "hybrid", "effort": "medium", "rounds_used": 1, "vlm_calls": 10,
+           "clip_calls": 0, "degraded": false, "degraded_reason": null}
 ```
 
 不传 ``filter``（或传空）时行为与旧版完全一致，``frames`` 仍是原来的均匀抽帧。
@@ -1685,16 +1723,71 @@ curl.exe -s -X POST http://127.0.0.1:7880/jobs/vision -H "Content-Type: applicat
   "runtime": "llama.cpp", "runtime_version": "b12202", "port": 7891,
   "model_size_mb": 1840.5, "mmproj_size_mb": 805.6,
   "vram_estimate_mb": 3400, "planner_default": "hybrid",
-  "prompts": {"dir": "...", "score": true, "agent": true, "plan": true},
-  "endpoints": ["/vision/describe", "/vision/scan", "/vision/frames",
-                "/vision/status", "/jobs/vision"],
-  "limits": {"target_frames": [1, 10], "max_rounds": [1, 12]}
+  "effort_default": "medium", "effort_choices": ["low", "medium", "high"],
+  "effort_budgets": {"low": {"candidates": 6, "max_rounds": 2, "vlm_limit": 6, "clip_limit": 0},
+                     "medium": {"candidates": 12, "max_rounds": 4, "vlm_limit": 16, "clip_limit": 1},
+                     "high": {"candidates": 18, "max_rounds": 6, "vlm_limit": 32, "clip_limit": 2}},
+  "prompts": {"dir": "...", "score": true, "agent": true, "plan": true, "video": true},
+  "endpoints": ["/vision/describe", "/vision/scan", "/vision/frames", "/vision/video",
+                "/vision/frame", "/vision/status", "/jobs/vision"],
+  "limits": {"target_frames": [1, 10], "max_rounds": [1, 12],
+             "video_frames_full": 64, "video_frames_segment": 48,
+             "video_quality_frames": 16}
 }
 ```
 
-该接口**不会加载模型**：只读文件与进程状态。
+该接口**不会加载模型**：只读文件与进程状态。`effort_budgets` 是按
+`target_frames=3` 算的示例，`candidates` 随 target 线性变化。
 
-### 15.8 模型、显存与降级
+### 15.8 `POST /vision/video`（段级细看，只回文字）
+
+```json
+{"video_path": "E:/.../a.mp4", "start": 200, "end": 260, "fps": 1.0, "question": null}
+```
+
+- `start` / `end` **都不给** = 看全片；给一个就补另一个（0 / 视频结尾）；非法窗口 400；
+- 给了窗口：先 `clip` 只切这一段（h264 mp4，时间点精确），再从 clip 里抽帧；
+- **帧数上限**：全片 64、单段 48（接口硬上限）；实测小模型超过 16 帧会明显
+  忽略后半段，所以画质优先再压到 **16 帧**，并在响应 `note` 里说明降了 fps；
+- 每帧前面带 `第 N 帧 time=...s` 标签，一次性交给 VLM（`vlm_video_watch.md`），
+  模型能横向比较整段变化；
+- 响应**只有文字**，不返回图片 / base64；帧文件在请求结束即删除。
+
+```json
+{
+  "ok": true,
+  "duration": 431.267,
+  "window": {"start": 200.0, "end": 260.0, "seconds": 60.0},
+  "fps": 0.267, "fps_requested": 1.0,
+  "frames_used": 16,
+  "summary": "这一段视频展示了一个排行榜，列出了不同模型的名次。随后，视频切换到一个条件商用的列表，逐项对比了不同模型的参数。",
+  "key_moments": [
+    {"time": 201.875, "what": "横向条形图出现，列出各模型的名次"},
+    {"time": 220.625, "what": "展示 Qwen3-TTS 1.7B 的参数"}
+  ],
+  "confidence": "normal",
+  "elapsed_ms": 10670,
+  "note": "帧数上限 16（接口硬上限 48，为保证小模型看清画面取 16），fps 已从 1 降到 0.267（窗口 60.0s）",
+  "model": "Qwen2.5-VL-3B-Instruct-Q4_K_M"
+}
+```
+
+- `key_moments.time` 只会保留落在窗口内的、且能在抽帧时间点附近对上的；
+- `confidence="low"` 的含义同 `/vision/frames`（summary 太短/带模糊词）；
+- 自定义问题用 `question`，会要求 `summary` 先回答它。
+
+### 15.9 `GET /vision/frame`（按需取帧图片）
+
+```powershell
+curl.exe -s "http://127.0.0.1:7880/vision/frame?path=E:/LocalAIService/outputs/frames/vision_xxx/frame_0001_5.085s.jpg" -o frame.jpg
+```
+
+- 返回图片二进制（jpg → `image/jpeg`，png → `image/png`）；
+- **路径必须在 `LOCALAI_HOME/outputs/` 或 `LOCALAI_HOME/data/downloads/` 下**：
+  `../../`、绝对路径外泄、符号链接跳出去都返回 400；文件不存在返回 404；
+- 这样「结果只回文字」也不会丢按需看图的能力。
+
+### 15.10 模型、显存与降级
 
 | 项目 | 值 |
 | --- | --- |
@@ -1714,6 +1807,26 @@ curl.exe -s -X POST http://127.0.0.1:7880/jobs/vision -H "Content-Type: applicat
 - **降级**：模型缺失/进程崩溃/请求超时/VLM 全部失败时，``/vision/frames`` 返回
   ``degraded=true`` + 方差筛选结果；``/vision/describe`` 返回 503（``vision_error``）。
   进程不会因为视觉失败而崩；下一次请求会自动重拉 llama-server。
+
+### 15.11 实测数据（431 秒 B站视频，`target_frames=3`）
+
+视频：`data/downloads/2026-11-08/TTS模型从夯到拉排行！9款热门语音模型，谁是真神？[BV1UY4G6pEJg].mp4`
+（时长 431.267s，209 条站点字幕；最大无人声空档 406.5~412.33s）。
+
+| effort | 耗时 | VLM 调用 | 规划候选 | 预筛帧数 | clip | 最终 3 帧（秒） | 段分布 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| low | 13.3s | 6 | 6 | 6 | 0 | 35.939 / 179.695 / 409.415 | 0 / 2 / 5 |
+| medium | 17.6s | 10 | 12 | 12 | 0 | 5.085 / 163.725 / 409.415 | 0 / 2 / 5 |
+| high | 20.7s | 12 | 18 | 78（含 clip 60） | 1 | 5.085 / 224.265 / 379.400 | 0 / 3 / 5 |
+
+- 三档的 3 帧都覆盖全片（不挤在前 1/3），且都不在同一段；
+- 无人声空档中点 **409.415s** 在 low/medium 里被选中，VLM 评分
+  `score=4, kind=chart`，`ocr_text="开源语音模型 · 从穷到拉锐评"`，
+  `summary="开源语音模型的排行榜图表"`，`why="图表信息量高，适合关键帧"`；
+- high 的 clip 用在第 5 段（字幕最密、尚未选到帧），抽了约 60 帧，
+  预筛后 65 张重复被跳过，说明该段画面变化很小；
+- `/vision/video`（`start=200,end=260,fps=1`）：16 帧、`fps=0.267`、
+  10.7 秒，返回的 summary/key_moments 见 15.8 示例。
 
 **相关环境变量**
 

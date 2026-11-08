@@ -129,6 +129,9 @@ class MediaAnalyzeRequest(BaseModel):
     target_frames: int = Field(
         3, ge=1, le=10, description="filter=vision 时挑几张关键帧"
     )
+    effort: str = Field(
+        "medium", description="关键帧分析力度：low / medium / high（filter=vision 时生效）"
+    )
 
 
 class JobAnalyzeRequest(MediaAnalyzeRequest):
@@ -150,7 +153,11 @@ class VisionFramesRequest(BaseModel):
     planner: str = Field(
         "hybrid", description="hybrid=逐帧评分补抽（默认）/ agent=多轮代理协议"
     )
-    max_rounds: int = Field(6, ge=1, le=12, description="最多补抽轮数")
+    effort: str = Field(
+        "medium",
+        description="分析力度 low/medium/high：决定候选数、轮数、VLM 与 clip 预算",
+    )
+    max_rounds: int = Field(6, ge=1, le=12, description="最多补抽轮数（会被 effort 上限收紧）")
     subtitles: Optional[list[dict[str, Any]]] = Field(
         None, description="可选：[{start,end,text}]；不给就找同目录字幕或跑 ASR"
     )
@@ -163,3 +170,19 @@ class JobVisionRequest(VisionFramesRequest):
     """POST /jobs/vision：异步关键帧挑选。"""
 
     priority: int = 0
+
+
+class VisionVideoRequest(BaseModel):
+    """POST /vision/video：段级细看，只返回文字。
+
+    ``start`` / ``end`` 都不给 = 看全片（自动降 fps，总帧数 ≤ 64）；
+    给了就只切这一段（≤ 48 帧），用 ``clip`` 裁出来再一次性交给 VLM。
+    """
+
+    video_path: str = Field(..., description="服务端本地的视频路径")
+    start: Optional[float] = Field(None, description="窗口起点（秒）；不给=全片开头")
+    end: Optional[float] = Field(None, description="窗口终点（秒）；不给=全片结尾")
+    fps: float = Field(1.0, gt=0.0, le=5.0, description="抽帧 fps（0.5~3；超上限会自动降）")
+    question: Optional[str] = Field(
+        None, description="可选：自定义问题，会附加在默认的「这段讲了什么」之后"
+    )

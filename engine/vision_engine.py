@@ -43,7 +43,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional, Sequence
 
 logger = logging.getLogger("localai.vision.engine")
 
@@ -792,6 +792,62 @@ def describe_many(
             )
         )
     return results
+
+
+#: 一次请求最多塞多少张图（再多就拆成调用方自己的多轮）。
+MAX_MULTI_IMAGES = 64
+
+
+def describe_frames(
+    images: Iterable[str | Path],
+    prompt: str,
+    *,
+    system_prompt: Optional[str] = None,
+    max_tokens: int = 768,
+    max_side: int = 256,
+    temperature: float = 0.0,
+    labels: Optional[Sequence[str]] = None,
+) -> str:
+    """把一段视频抽出的多张帧**一次性**交给 VLM 看，返回一段文本。
+
+    和 :func:`describe_many` 的区别：这里所有帧都放在**同一个请求**里，
+    模型能横向比较「这一段从头到尾发生了什么」，适合 ``/vision/video``。
+
+    ``labels`` 给了就在每张图**前面**插一句时间标签（例如 ``第 3 帧 time=245.0s``）；
+    实测小模型对「图片-时间」的对应关系敏感很多，不带标签容易只描述第一帧。
+    为了不撑爆 4096 上下文，调用方必须用 ``max_side`` 把每张图压小。
+
+    ``images`` 为空或超过 :data:`MAX_MULTI_IMAGES` 时抛 :class:`VisionError`。
+    """
+    paths = [str(item) for item in images]
+    if not paths:
+        raise VisionError("describe_frames 需要至少一张图片")
+    if len(paths) > MAX_MULTI_IMAGES:
+        raise VisionError(
+            f"一次最多看 {MAX_MULTI_IMAGES} 张帧，收到 {len(paths)}；请先分批"
+        )
+    max_side = max(112, min(1024, int(max_side)))
+    ensure_loaded()
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    for index, path in enumerate(paths):
+        if labels is not None and index < len(labels):
+            content.append({"type": "text", "text": f"\n{labels[index]}："})
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": _image_data_url(path, max_side=max_side)},
+            }
+        )
+    messages: list[dict[str, Any]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": content})
+    return _chat(
+        messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        timeout=_timeout() * 2,  # 多图预填充更慢，给双倍超时
+    )
 
 
 # ---------------------------------------------------------------------------
