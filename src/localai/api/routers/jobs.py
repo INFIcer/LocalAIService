@@ -105,6 +105,8 @@ async def create_asr_job(
     file: UploadFile = File(..., description="音频或视频文件"),
     language: str = Form("auto", description="auto/zh/en/ja/ko/yue..."),
     speaker: str = Form("1", description="1=识别声纹，0=跳过"),
+    engine: str = Form("", description="sensevoice / whisper / auto；空=按配置默认"),
+    timestamps: str = Form("0", description="1=需要时间戳（engine=auto 时选 whisper）"),
     priority: int = Form(0, description="优先级，越大越先"),
 ) -> dict[str, Any]:
     cfg = get_cfg(request)
@@ -141,6 +143,8 @@ async def create_asr_job(
                 "file": str(tmp_path),
                 "language": lang,
                 "speaker": speaker,
+                "engine": engine,
+                "timestamps": timestamps,
                 "original_name": raw_name,
             },
             cfg,

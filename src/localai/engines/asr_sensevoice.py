@@ -116,6 +116,7 @@ class AsrAdapter(BaseAdapter):
             "load_error": status.get("load_error"),
             "model_dir": status.get("model_dir", str(self.cfg.asr_model_dir)),
             "device": status.get("device"),
+            "vad": status.get("vad"),
             "parallel": status.get("parallel")
             or {
                 "capacity": self.parallel_capacity,
@@ -149,4 +150,38 @@ class AsrAdapter(BaseAdapter):
                 f"SenseVoice 识别失败：{type(exc).__name__}: {exc}",
                 detail=str(exc),
             ) from exc
+        result["engine"] = "sensevoice"
+        return result
+
+    async def infer_segments(self, audio_path: str, language: str = "auto") -> dict[str, Any]:
+        """带时间戳的分段识别：fsmn-vad 切句 + 逐段 SenseVoice。
+
+        SenseVoice 没有原生时间戳，``timestamp_source`` 固定是 ``vad``；
+        VAD 模型在第一次分段请求时懒加载，并跟着 ``unload()`` 一起释放。
+        """
+        module = self.get_module()
+        vram = get_vram()
+        self.mark_activity()
+        try:
+            async with self.infer_lock:
+                vram.begin_use(self.name)
+                try:
+                    await ensure_model_loaded(self)
+                    self.mark_activity()
+                    result = await asyncio.to_thread(
+                        module.transcribe_segments, str(audio_path), language
+                    )
+                    vram.touch(self.name)
+                    self.mark_activity()
+                finally:
+                    vram.end_use(self.name)
+        except (InsufficientVramError, AsrBackendError):
+            raise
+        except Exception as exc:  # noqa: BLE001 - 统一成 503 JSON
+            raise AsrBackendError(
+                f"SenseVoice 分段识别失败：{type(exc).__name__}: {exc}",
+                detail=str(exc),
+            ) from exc
+        result["engine"] = "sensevoice"
+        result.setdefault("timestamp_source", "vad")
         return result

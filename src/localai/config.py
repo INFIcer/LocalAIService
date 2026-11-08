@@ -32,6 +32,12 @@
     LOCALAI_SEPARATE_IDLE_UNLOAD
     LOCALAI_ASR_PARALLEL      识别引擎并发容量（默认 2，范围 1~4；设 1 = 完全串行）
     LOCALAI_ASR_UNLOAD_TIMEOUT 识别引擎卸载等待推理退出的超时秒数（默认 30）
+    LOCALAI_ASR_ENGINE        识别引擎默认值：sensevoice（默认）/ whisper
+    LOCALAI_WHISPER_DIR       faster-whisper 权重根目录（默认 <HOME>/models/whisper）
+    LOCALAI_WHISPER_MODEL     faster-whisper 档位（tiny/base/small/medium/large-v3，默认 small）
+    LOCALAI_WHISPER_DEVICE    faster-whisper 设备（默认 cuda，可设 cpu）
+    LOCALAI_WHISPER_COMPUTE   faster-whisper 计算类型（默认 int8_float16；CPU 回退 int8）
+    LOCALAI_WHISPER_IDLE_UNLOAD faster-whisper 空闲卸载秒数（默认 900，0=关闭）
     LOCALAI_TOKEN             可选的 Bearer 鉴权令牌（默认空=不鉴权）
 
 任务队列（详见 ``localai.jobs``）::
@@ -54,6 +60,8 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
+
+from .constants import ASR_ENGINES, WHISPER_SIZES
 
 # 本机现有的 ffmpeg 常见位置；换机器探测不到就走 PATH。
 DEFAULT_FFMPEG = r"C:\Users\Administrator\Documents\videoTrans\ffmpeg\bin\ffmpeg.exe"
@@ -174,6 +182,16 @@ class Config:
     tts_backend: str = "engine"
     model_dir: Path = field(default_factory=Path)
     asr_model_dir: Path = field(default_factory=Path)
+    #: 分段转写用的 fsmn-vad 权重目录（SenseVoice 没有原生时间戳）。
+    asr_vad_dir: Path = field(default_factory=Path)
+    #: 识别引擎默认值（sensevoice / whisper）；任务级可用 engine= 覆盖。
+    asr_engine: str = "sensevoice"
+    #: faster-whisper 权重根目录；每档权重在 ``<whisper_dir>/<size>/``。
+    whisper_dir: Path = field(default_factory=Path)
+    whisper_model: str = "small"
+    whisper_device: str = "cuda"
+    whisper_compute: str = "int8_float16"
+    whisper_idle_unload: int = 900
     speaker_model_dir: Path = field(default_factory=Path)
     comfy_model_dir: Path = field(default_factory=Path)
     comfy_base: str = "http://127.0.0.1:8188"
@@ -250,6 +268,11 @@ class Config:
         return self.output_dir / "frames"
 
     @property
+    def scenes_dir(self) -> Path:
+        """场景边界检测结果落盘目录：``<OUTPUT>/scenes/``。"""
+        return self.output_dir / "scenes"
+
+    @property
     def speaker_tmp_dir(self) -> Path:
         return self.output_dir / "speaker_tmp"
 
@@ -307,6 +330,21 @@ class Config:
             ),
         )
 
+        # 识别引擎默认值：只认 sensevoice / whisper；写错时回落到 sensevoice，
+        # 保证旧行为不变（非法值不会让服务变成不可用）。
+        asr_engine = (
+            _pick("LOCALAI_ASR_ENGINE", default="sensevoice") or "sensevoice"
+        ).strip().lower()
+        if asr_engine not in ASR_ENGINES:
+            asr_engine = "sensevoice"
+
+        # whisper 档位：非法值回落到 small（默认档）。
+        whisper_model = (
+            _pick("LOCALAI_WHISPER_MODEL", default="small") or "small"
+        ).strip().lower()
+        if whisper_model not in WHISPER_SIZES:
+            whisper_model = "small"
+
         return cls(
             home=root,
             host=_pick("LOCALAI_HOST", "INDEX_TTS_HOST", default="127.0.0.1") or "127.0.0.1",
@@ -327,6 +365,27 @@ class Config:
                     default=str(root / "models" / "SenseVoiceSmall"),
                 )
             ).expanduser(),
+            asr_engine=asr_engine,
+            asr_vad_dir=Path(
+                _pick(
+                    "LOCALAI_ASR_VAD_DIR",
+                    default=str(root / "models" / "vad" / "fsmn-vad"),
+                )
+            ).expanduser(),
+            whisper_dir=Path(
+                _pick(
+                    "LOCALAI_WHISPER_DIR",
+                    default=str(root / "models" / "whisper"),
+                )
+            ).expanduser(),
+            whisper_model=whisper_model,
+            whisper_device=(
+                _pick("LOCALAI_WHISPER_DEVICE", default="cuda") or "cuda"
+            ).strip(),
+            whisper_compute=(
+                _pick("LOCALAI_WHISPER_COMPUTE", default="int8_float16") or "int8_float16"
+            ).strip(),
+            whisper_idle_unload=_pick_int(900, "LOCALAI_WHISPER_IDLE_UNLOAD"),
             speaker_model_dir=Path(
                 _pick(
                     "LOCALAI_CAMPPUS_DIR",
@@ -430,6 +489,13 @@ class Config:
             "INDEX_TTS_HOME": str(self.home),
             "INDEX_TTS_MODEL_DIR": str(self.model_dir),
             "INDEX_TTS_ASR_MODEL_DIR": str(self.asr_model_dir),
+            "LOCALAI_ASR_VAD_DIR": str(self.asr_vad_dir),
+            "LOCALAI_ASR_ENGINE": self.asr_engine,
+            "LOCALAI_WHISPER_DIR": str(self.whisper_dir),
+            "LOCALAI_WHISPER_MODEL": self.whisper_model,
+            "LOCALAI_WHISPER_DEVICE": self.whisper_device,
+            "LOCALAI_WHISPER_COMPUTE": self.whisper_compute,
+            "LOCALAI_WHISPER_IDLE_UNLOAD": str(self.whisper_idle_unload),
             "INDEX_TTS_CAMPPUS_DIR": str(self.speaker_model_dir),
             "INDEX_TTS_SPEAKERS_DIR": str(self.speakers_dir),
             "INDEX_TTS_TORCH_HOME": str(self.torch_home),
@@ -464,6 +530,15 @@ class Config:
             "tts_backend": self.tts_backend,
             "model_dir": str(self.model_dir),
             "asr_model_dir": str(self.asr_model_dir),
+            "asr_engine": self.asr_engine,
+            "asr_vad_dir": str(self.asr_vad_dir),
+            "whisper": {
+                "dir": str(self.whisper_dir),
+                "model": self.whisper_model,
+                "device": self.whisper_device,
+                "compute_type": self.whisper_compute,
+                "idle_unload": self.whisper_idle_unload,
+            },
             "speaker_model_dir": str(self.speaker_model_dir),
             "voices_dir": str(self.voices_dir),
             "output_dir": str(self.output_dir),
@@ -480,6 +555,7 @@ class Config:
             "idle_unload": {
                 "tts": self.idle_unload,
                 "asr": self.asr_idle_unload,
+                "whisper": self.whisper_idle_unload,
                 "speaker": self.speaker_idle_unload,
                 "separate": self.separate_idle_unload,
             },
@@ -559,6 +635,9 @@ def ensure_directories(cfg: Optional[Config] = None) -> list[Path]:
         cfg.asr_tmp_dir,
         cfg.media_tmp_dir,
         cfg.frames_dir,
+        cfg.scenes_dir,
+        cfg.whisper_dir,
+        cfg.asr_vad_dir,
         cfg.speaker_tmp_dir,
         cfg.separate_tmp_dir,
         cfg.separate_dir,

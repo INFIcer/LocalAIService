@@ -309,6 +309,9 @@ class JobScheduler:
             "max_parallel": self.cfg.jobs_max_parallel,
             "per_kind_parallel": self.parallel_map(),
             "asr_parallel": self._parallel_limit("asr"),
+            # 识别引擎：默认值 + 两套引擎各自的加载状态（whisper 是第二引擎）。
+            "asr_engine": self.cfg.asr_engine,
+            "asr_engines": self._asr_engines_snapshot(),
             "parallel_extra_mb": self.cfg.jobs_parallel_extra_mb,
             "parallel_degraded": dict(self._degraded),
             "concurrency": self._concurrency_snapshot(),
@@ -327,6 +330,29 @@ class JobScheduler:
             if hasattr(gate, "snapshot"):
                 snapshot[name] = gate.snapshot()
         return snapshot
+
+    def _asr_engines_snapshot(self) -> dict[str, Any]:
+        """两个识别引擎的加载状态（/jobs/stats 用；只读内存标志）。"""
+        result: dict[str, Any] = {
+            "default": self.cfg.asr_engine,
+            "sensevoice": {"adapter": "asr", "loaded": False},
+            "whisper": {
+                "adapter": "whisper",
+                "loaded": False,
+                "model": f"faster-whisper-{self.cfg.whisper_model}",
+                "device": self.cfg.whisper_device,
+                "compute_type": self.cfg.whisper_compute,
+            },
+        }
+        for engine, name in (("sensevoice", "asr"), ("whisper", "whisper")):
+            adapter = self.registry.find(name)
+            if adapter is None:
+                continue
+            try:
+                result[engine]["loaded"] = bool(adapter.loaded())
+            except Exception:  # noqa: BLE001 - 统计失败不影响接口
+                result[engine]["loaded"] = False
+        return result
 
     def _loaded_model(self) -> Optional[str]:
         names: list[str] = []

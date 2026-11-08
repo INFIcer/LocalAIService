@@ -99,6 +99,32 @@ USE_ITN = os.environ.get("INDEX_TTS_ASR_USE_ITN", "1").strip().lower() not in (
     "off",
 )
 
+# ---------------------------------------------------------------------------
+# 分段转写用的 VAD（fsmn-vad）
+# ---------------------------------------------------------------------------
+#: VAD 权重目录（放在 LOCALAI_HOME/models 下，不散到用户目录）。
+VAD_MODEL_DIR = Path(
+    os.environ.get(
+        "LOCALAI_ASR_VAD_DIR",
+        str(SERVICE_ROOT / "models" / "vad" / "fsmn-vad"),
+    )
+)
+#: ModelScope 仓库 id（本机 funasr 能直接 AutoModel(model="fsmn-vad")，这里
+#: 先把权重落到固定目录，再按本地目录加载，避免运行期散落到用户缓存）。
+VAD_MODEL_ID = os.environ.get(
+    "LOCALAI_ASR_VAD_MODEL", "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
+)
+#: 单个 VAD 段最长毫秒数；超过会被切分（默认 30 秒）。
+VAD_MAX_SEGMENT_MS = int(os.environ.get("LOCALAI_ASR_VAD_MAX_SEGMENT_MS", "30000"))
+#: 句尾静音容忍（毫秒）：超过这么久没声音就断句。默认 500ms。
+#: 注意：不显式传这个参数时 funasr 会走「动态静音」策略，容易把几十秒的
+#: 连续语音并成一段；显式传 500ms 后实测 46 秒里 12 句能切成 12 段。
+VAD_MAX_END_SILENCE_MS = int(
+    os.environ.get("LOCALAI_ASR_VAD_MAX_END_SILENCE_MS", "500")
+)
+#: VAD 权重完整性检查：这两个文件在就绪（其余文件由 funasr 读取）。
+VAD_REQUIRED_FILES = ("model.pt", "config.yaml")
+
 
 logger = logging.getLogger("sensevoice-asr")
 
@@ -270,6 +296,10 @@ _load_seconds: Optional[float] = None
 _load_error: Optional[str] = None
 _loaded_device: Optional[str] = None
 
+#: 分段转写用的 VAD 模型（懒加载；与 SenseVoice 一起在 unload() 里释放）。
+_vad_model: Any = None
+_vad_load_error: Optional[str] = None
+
 
 class AsrError(RuntimeError):
     """ASR 侧可预期错误（缺文件、加载失败、识别失败）。"""
@@ -435,6 +465,30 @@ def model_status() -> dict[str, Any]:
         "load_error": _load_error,
         "device": _loaded_device or DEVICE,
         "parallel": parallel_status(),
+        "vad": vad_model_status(),
+    }
+
+
+def vad_model_status() -> dict[str, Any]:
+    """VAD 模型状态（只查文件与内存标志，不触发下载/加载）。"""
+    missing: list[str] = []
+    for name in VAD_REQUIRED_FILES:
+        path = VAD_MODEL_DIR / name
+        try:
+            if not path.is_file() or path.stat().st_size <= 0:
+                missing.append(name)
+        except OSError:
+            missing.append(name)
+    return {
+        "ready": not missing,
+        "model": "fsmn-vad",
+        "model_id": VAD_MODEL_ID,
+        "model_dir": str(VAD_MODEL_DIR),
+        "missing": missing,
+        "loaded": _vad_model is not None,
+        "load_error": _vad_load_error,
+        "max_segment_ms": VAD_MAX_SEGMENT_MS,
+        "max_end_silence_ms": VAD_MAX_END_SILENCE_MS,
     }
 
 
@@ -590,11 +644,12 @@ def unload() -> None:
     也不会把信号量计数搞乱（下一次空闲回收还可以再试）。
     """
     global _model, _load_seconds, _load_error, _loaded_device
+    global _vad_model, _vad_load_error
 
     try:
         with _INFER_GATE.exclusive(timeout=ASR_UNLOAD_TIMEOUT):
             with _LOAD_LOCK:
-                if _model is None:
+                if _model is None and _vad_model is None:
                     return
                 # 先断引用，再 gc；AutoModel 内部还持有 model / tokenizer / frontend。
                 try:
@@ -610,6 +665,9 @@ def unload() -> None:
                 _load_seconds = None
                 _load_error = None
                 _loaded_device = None
+                # VAD 只是分段转写的辅助模型，跟着一起释放。
+                _vad_model = None
+                _vad_load_error = None
 
             # 在独占窗口内清缓存：避免新推理在 gc / empty_cache 期间进来。
             _free_cuda()
@@ -621,6 +679,245 @@ def unload() -> None:
         return
 
     logger.info("SenseVoice 已卸载，显存已释放")
+
+
+# ---------------------------------------------------------------------------
+# 分段转写（SenseVoice 没有原生时间戳 -> 用 fsmn-vad 切句后逐段识别）
+# ---------------------------------------------------------------------------
+
+
+def _vad_missing_files() -> list[str]:
+    missing: list[str] = []
+    for name in VAD_REQUIRED_FILES:
+        path = VAD_MODEL_DIR / name
+        try:
+            if not path.is_file() or path.stat().st_size <= 0:
+                missing.append(name)
+        except OSError:
+            missing.append(name)
+    return missing
+
+
+def _ensure_vad_weights() -> None:
+    """准备 fsmn-vad 权重；优先 ModelScope，落到 ``models/vad/fsmn-vad``。"""
+    if not _vad_missing_files():
+        return
+    logger.info("准备 fsmn-vad 权重：%s -> %s", VAD_MODEL_ID, VAD_MODEL_DIR)
+    VAD_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        from modelscope import snapshot_download  # noqa: PLC0415 - 故意延迟
+
+        snapshot_download(VAD_MODEL_ID, local_dir=str(VAD_MODEL_DIR))
+    except Exception as exc:  # noqa: BLE001
+        raise AsrError(
+            f"fsmn-vad 权重准备失败（目录 {VAD_MODEL_DIR}）：{type(exc).__name__}: {exc}"
+        ) from exc
+    missing = _vad_missing_files()
+    if missing:
+        raise AsrError(f"fsmn-vad 权重不完整，仍缺：{', '.join(missing)}")
+
+
+def ensure_vad_loaded():
+    """懒加载 fsmn-vad；失败抛 AsrError。"""
+    global _vad_model, _vad_load_error
+
+    if _vad_model is not None:
+        return _vad_model
+
+    with _LOAD_LOCK:
+        if _vad_model is not None:
+            return _vad_model
+        _ensure_vad_weights()
+        try:
+            from funasr import AutoModel  # noqa: PLC0415 - 故意延迟
+
+            device = _resolve_device(DEVICE)
+            logger.info("开始加载 fsmn-vad：dir=%s device=%s", VAD_MODEL_DIR, device)
+            _vad_model = AutoModel(
+                model=str(VAD_MODEL_DIR),
+                trust_remote_code=True,
+                disable_update=True,
+                device=device,
+                disable_pbar=True,
+                disable_log=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _vad_load_error = f"{type(exc).__name__}: {exc}"
+            logger.exception("fsmn-vad 加载失败")
+            raise AsrError(f"fsmn-vad 加载失败：{_vad_load_error}") from exc
+        _vad_load_error = None
+        logger.info("fsmn-vad 加载完成")
+    return _vad_model
+
+
+def _parse_vad_value(values: Any, duration: Optional[float]) -> list[tuple[float, float]]:
+    """把 funasr VAD 输出归一成 ``[(start_sec, end_sec), ...]``（升序、无重叠）。
+
+    fsmn-vad 的 ``value`` 形如 ``[[0, 2320], [2830, 5250]]``（毫秒）；流式模式
+    下可能出现 ``-1`` 表示「还没结束 / 从 0 开始」，这里统一兜底成 0 或音频末尾。
+    """
+    pairs: list[tuple[float, float]] = []
+    for item in values or []:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        try:
+            start_ms = float(item[0])
+            end_ms = float(item[1])
+        except (TypeError, ValueError):
+            continue
+        start = 0.0 if start_ms < 0 else start_ms / 1000.0
+        end = (duration if duration is not None else start) if end_ms < 0 else end_ms / 1000.0
+        if end <= start:
+            continue
+        if duration is not None:
+            end = min(end, duration)
+            if end <= start:
+                continue
+        if pairs and start < pairs[-1][1]:
+            start = pairs[-1][1]
+        if end <= start:
+            continue
+        pairs.append((round(start, 3), round(end, 3)))
+    return pairs
+
+
+def vad_boundaries(audio_path: str | Path) -> list[tuple[float, float]]:
+    """用 fsmn-vad 取语音段落边界（秒）。"""
+    path = Path(audio_path)
+    if not path.is_file():
+        raise AsrError(f"音频文件不存在：{path}")
+    vad = ensure_vad_loaded()
+    duration = _audio_duration(path)
+    try:
+        results = vad.generate(
+            input=str(path),
+            cache={},
+            max_single_segment_time=VAD_MAX_SEGMENT_MS,
+            max_end_silence_time=VAD_MAX_END_SILENCE_MS,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise AsrError(f"fsmn-vad 切分失败：{type(exc).__name__}: {exc}") from exc
+    values: Any = []
+    if results:
+        first = results[0]
+        if isinstance(first, dict):
+            values = first.get("value") or []
+        elif isinstance(first, (list, tuple)):
+            values = first
+    return _parse_vad_value(values, duration)
+
+
+def _ensure_16k_wav(path: Path) -> tuple[Path, Optional[Path]]:
+    """确保是 16k 单声道 wav；返回 ``(可用路径, 需要清理的临时路径)``。"""
+    try:
+        import soundfile as sf  # noqa: PLC0415
+
+        info = sf.info(str(path))
+        if int(info.samplerate) == 16000:
+            return path, None
+    except Exception:  # noqa: BLE001 - 读不出信息就交给 ffmpeg 兜底
+        pass
+    try:
+        import ffmpeg_tool  # noqa: PLC0415 - engine 目录下的薄封装
+
+        converted = ffmpeg_tool.to_wav16k(str(path))
+        return Path(converted["path"]), Path(converted["path"])
+    except Exception as exc:  # noqa: BLE001
+        raise AsrError(
+            f"分段转写需要 16k wav，但转换失败：{type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def transcribe_segments(audio_path: str, language: str = "auto") -> dict[str, Any]:
+    """SenseVoice 的分段转写：VAD 切句 + 逐段识别。
+
+    SenseVoice 本身没有时间戳，直接用 VAD 的语音段边界当 ``start/end``：
+    段与段之间的静音**不会被并入任何一段**（间隙如实保留），因此
+    ``timestamp_source`` 标记为 ``"vad"``。whisper 引擎走原生时间戳，
+    标记为 ``"native"``。
+
+    返回::
+
+        {"text": 全文, "language": "zh", "duration": 12.3,
+         "segments": [{"start": 0.0, "end": 2.4, "text": "..."}],
+         "timestamp_source": "vad", "elapsed": 1.2, "device": "cuda:0"}
+
+    只要有一句识别失败就整体抛 :class:`AsrError`（不返回半截结果）。
+    """
+    path = Path(audio_path)
+    if not path.is_file():
+        raise AsrError(f"音频文件不存在：{path}")
+
+    import shutil  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+
+    started = time.perf_counter()
+    work_path, cleanup_path = _ensure_16k_wav(path)
+    duration = _audio_duration(work_path)
+
+    boundaries = vad_boundaries(work_path)
+    if not boundaries and duration:
+        # VAD 一段都没检测到：视为整段静音，返回空分段而不是报错。
+        logger.info("VAD 没有检测到语音段：%s（时长 %.2f 秒）", path.name, duration)
+
+    segments: list[dict[str, Any]] = []
+    texts: list[str] = []
+    detected_language: Optional[str] = None
+    temp_dir: Optional[Path] = None
+
+    try:
+        if boundaries:
+            import soundfile as sf  # noqa: PLC0415
+
+            data, sample_rate = sf.read(str(work_path), dtype="float32", always_2d=True)
+            temp_dir = Path(tempfile.mkdtemp(prefix="localai_asr_seg_", dir=None))
+            for index, (start, end) in enumerate(boundaries):
+                start_index = max(0, int(round(start * sample_rate)))
+                end_index = min(len(data), int(round(end * sample_rate)))
+                if end_index <= start_index:
+                    continue
+                clip_path = temp_dir / f"seg_{index:04d}.wav"
+                sf.write(str(clip_path), data[start_index:end_index], sample_rate, subtype="PCM_16")
+                try:
+                    result = transcribe(str(clip_path), language=language)
+                except Exception as exc:  # noqa: BLE001 - 统一成整段失败
+                    raise AsrError(
+                        f"第 {index + 1} 段（{start:.2f}~{end:.2f}s）识别失败："
+                        f"{type(exc).__name__}: {exc}"
+                    ) from exc
+                text = str(result.get("text") or "").strip()
+                if detected_language is None and result.get("language") not in (None, "nospeech"):
+                    detected_language = result.get("language")
+                segments.append({"start": start, "end": end, "text": text})
+                if text:
+                    texts.append(text)
+    finally:
+        if temp_dir is not None:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        if cleanup_path is not None:
+            try:
+                cleanup_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    # 中日韩直接拼，其它语言用空格分隔。
+    lang = detected_language or (language if language != "auto" else "zh")
+    separator = "" if str(lang).split("-")[0] in ("zh", "yue", "ja", "ko") else " "
+    elapsed = time.perf_counter() - started
+    return {
+        "text": separator.join(texts),
+        "language": lang,
+        "duration": round(duration, 3) if duration is not None else None,
+        "segments": segments,
+        "timestamp_source": "vad",
+        "elapsed": round(elapsed, 3),
+        "device": _loaded_device,
+        "vad": {
+            "model": "fsmn-vad",
+            "model_dir": str(VAD_MODEL_DIR),
+            "segments": len(segments),
+        },
+    }
 
 
 # ---------------------------------------------------------------------------

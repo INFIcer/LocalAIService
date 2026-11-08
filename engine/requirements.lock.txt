@@ -169,3 +169,16 @@ websockets==17.4
 Werkzeug==3.1.9
 wetext==0.2.1
 ﻿absl-py==2.5.1
+
+# --- faster-whisper（第二识别引擎，2026-11 新增）---
+faster-whisper==1.2.1
+ctranslate2==4.8.5
+# av 19.x 与 faster-whisper 1.2.1 不兼容（open() 不认 metadata_errors），锁 17.0.1
+av==17.0.1
+onnxruntime==1.31.1
+flatbuffers==25.12.19
+# CTranslate2 的 CUDA 12 运行库（本机 torch 是 cu130，两者互不覆盖）
+nvidia-cublas-cu12==12.9.2.10 ; sys_platform == "win32"
+nvidia-cudnn-cu12==9.28.1.4 ; sys_platform == "win32"
+nvidia-cuda-runtime-cu12==12.9.79 ; sys_platform == "win32"
+nvidia-cuda-nvrtc-cu12==12.9.86 ; sys_platform == "win32"

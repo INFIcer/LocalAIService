@@ -69,6 +69,23 @@ AUDIO_MAX_BYTES = 50 * 1024 * 1024
 
 ASR_LANGUAGES = ("auto", "zh", "en", "ja", "ko", "yue", "nospeech")
 
+#: 识别引擎：SenseVoice（默认，带声纹）与 faster-whisper（原生时间戳）。
+ASR_ENGINES = ("sensevoice", "whisper")
+#: 请求里可用的 engine 取值；``auto`` 表示按「是否要时间戳 / 配置默认」决定。
+ASR_ENGINE_CHOICES = ("sensevoice", "whisper", "auto")
+
+#: faster-whisper 支持的档位（与 engine/whisper_engine.py 保持一致）。
+WHISPER_SIZES = ("tiny", "base", "small", "medium", "large-v3")
+
+#: 各档权重的显存初始估算（MB）；之后由显存管家按实测增量校准。
+WHISPER_ESTIMATE_MB = {
+    "tiny": 150,
+    "base": 250,
+    "small": 600,
+    "medium": 1600,
+    "large-v3": 3500,
+}
+
 # ---------------------------------------------------------------------------
 # 人声分离
 # ---------------------------------------------------------------------------

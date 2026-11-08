@@ -29,12 +29,14 @@ from fastapi import HTTPException
 
 from ..config import Config
 from ..constants import (
+    ASR_ENGINE_CHOICES,
     ASR_LANGUAGES,
     MEDIA_EXTENSIONS,
     SEPARATE_MODELS,
     SEPARATE_STEMS,
     TTS_MAX_TEXT,
 )
+from ..core.asr_engines import adapter_for, normalize_engine
 from ..core.errors import AsrBackendError, InsufficientVramError, SeparateBackendError
 
 logger = logging.getLogger("localai.jobs.executors")
@@ -69,6 +71,18 @@ def speaker_enabled(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     return str(value if value is not None else "").strip().lower() not in _SPEAKER_OFF_VALUES
+
+
+_TRUE_VALUES = {"1", "true", "yes", "on", "y"}
+
+
+def _flag(value: Any) -> bool:
+    """把 ``timestamps`` 这类开关值转成 bool（默认关闭）。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value or "").strip().lower() in _TRUE_VALUES
 
 
 @dataclass
@@ -161,10 +175,22 @@ def prepare_payload(
             raise ValueError(
                 f"不支持的 language={language!r}，可选：{', '.join(ASR_LANGUAGES)}"
             )
+        raw_engine = (_text(data.get("engine")) or "").lower()
+        if raw_engine in ("", "default"):
+            engine = ""
+        elif raw_engine in ASR_ENGINE_CHOICES:
+            engine = raw_engine
+        else:
+            raise ValueError(
+                f"不支持的 engine={raw_engine!r}，可选：{', '.join(ASR_ENGINE_CHOICES)}"
+            )
         return act, {
             "file": str(file_path),
             "language": language,
             "speaker": speaker_enabled(data.get("speaker", True)),
+            # 空字符串 = 用配置默认（LOCALAI_ASR_ENGINE）；auto 由执行器按需解析。
+            "engine": engine,
+            "timestamps": _flag(data.get("timestamps", False)),
             "source_format": file_path.suffix.lower(),
             "original_name": _text(data.get("original_name")) or file_path.name,
         }
@@ -283,20 +309,29 @@ async def _run_tts(payload: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
 
 
 async def _run_asr(payload: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
-    """与旧 ``/asr`` 完全相同的处理链路：转 16k -> 识别 ->（可选）声纹。"""
+    """与旧 ``/asr`` 相同的处理链路：转 16k -> 识别 ->（可选）声纹。
+
+    ``payload.engine`` 为空 = 用配置默认（``LOCALAI_ASR_ENGINE``）；``auto`` 时
+    需要时间戳就选 whisper，否则用配置默认。响应固定带 ``engine`` 字段。
+    """
     cfg = ctx.cfg
     registry = ctx.registry
     tmp_path = Path(payload["file"])
     suffix = payload["source_format"]
     lang = payload["language"]
     use_speaker = bool(payload["speaker"])
+    engine = normalize_engine(
+        payload.get("engine"),
+        cfg,
+        need_timestamps=bool(payload.get("timestamps")),
+    )
     wav_path: Optional[Path] = None
     converted = False
     started = time.perf_counter()
     speaker_info: Optional[dict[str, Any]] = None
     speaker_error: Optional[str] = None
     media = registry.get("media")
-    asr = registry.get("asr")
+    asr = adapter_for(registry, engine)
     try:
         # 非 wav 一律先归一成 16k 单声道 wav；音频失败回退原文件，视频不回退。
         if suffix != ".wav":
@@ -325,7 +360,7 @@ async def _run_asr(payload: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         raise
     except Exception as exc:  # noqa: BLE001 - 统一成 503
         raise AsrBackendError(
-            f"SenseVoice 识别失败：{type(exc).__name__}: {exc}",
+            f"{engine} 识别失败：{type(exc).__name__}: {exc}",
             detail=str(exc),
         ) from exc
     finally:
@@ -338,6 +373,7 @@ async def _run_asr(payload: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     elapsed_ms = round((time.perf_counter() - started) * 1000)
     data: dict[str, Any] = {
         "ok": True,
+        "engine": engine,
         "text": result.get("text") or "",
         "language": result.get("language") or lang,
         "emotion": result.get("emotion"),

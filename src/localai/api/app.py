@@ -93,6 +93,16 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
         logger.info("ASR 模型状态：%s", asr_adapter.status()["detail"])
         logger.info("ASR 模型目录：%s（首次 /asr 请求时加载）", cfg.asr_model_dir)
 
+        whisper_adapter = registry.get("whisper")
+        whisper_status = whisper_adapter.status()
+        logger.info(
+            "whisper 引擎：默认档=%s device=%s compute=%s；%s",
+            cfg.whisper_model,
+            cfg.whisper_device,
+            cfg.whisper_compute,
+            whisper_status["detail"],
+        )
+
         media_adapter = registry.get("media")
         media_health = media_adapter.health()
         if media_health.get("ffmpeg") == "ok":
@@ -150,8 +160,9 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
     app = FastAPI(
         title="本地 AI 服务管理器（TTS + ASR + 声纹 + 媒体 + 人声分离）",
         description=(
-            "一个端口提供 TTS（IndexTTS-2.5）、ASR（SenseVoiceSmall）、声纹（campplus）、"
-            "ffmpeg 媒体工具与 Demucs 人声分离；模型懒加载 + 空闲卸载。\n\n"
+            "一个端口提供 TTS（IndexTTS-2.5）、ASR（SenseVoiceSmall / faster-whisper）、"
+            "声纹（campplus）、ffmpeg 媒体工具（含场景检测）与 Demucs 人声分离；"
+            "模型懒加载 + 空闲卸载。\n\n"
             "能力发现：`GET /capabilities`；调用方文档：`docs/SERVICE_API.md`。"
         ),
         version=__version__,

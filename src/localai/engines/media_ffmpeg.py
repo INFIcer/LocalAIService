@@ -25,7 +25,13 @@ class MediaAdapter(BaseAdapter):
     model_name = "ffmpeg"
     requires_gpu = False
     DEFAULT_ESTIMATE_MB = 0
-    ENDPOINTS = ("/media/probe", "/media/to_wav", "/media/frames", "/media/audio")
+    ENDPOINTS = (
+        "/media/probe",
+        "/media/to_wav",
+        "/media/frames",
+        "/media/audio",
+        "/media/scenes",
+    )
 
     def get_module(self) -> Any:
         if self._module is not None:

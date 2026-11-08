@@ -33,7 +33,16 @@ async def health(request: Request) -> dict[str, Any]:
     asr_health = {
         "ready": bool(asr["ready"]),
         "loaded": bool(asr["loaded"]),
+        "engine": cfg.asr_engine,
         "idle_unload_seconds": cfg.asr_idle_unload,
+        "vad": asr.get("vad"),
+    }
+    whisper = registry.get("whisper").status()
+    whisper_health = {
+        "ready": bool(whisper.get("ready")),
+        "loaded": bool(whisper.get("loaded")),
+        "model": whisper.get("model") or f"faster-whisper-{cfg.whisper_model}",
+        "idle_unload_seconds": cfg.whisper_idle_unload,
     }
     spk = registry.get("speaker").status()
     speaker_health = {
@@ -74,6 +83,7 @@ async def health(request: Request) -> dict[str, Any]:
             "idle_unload_seconds": cfg.idle_unload,
             "idle_seconds": None if idle is None else round(idle, 1),
             "asr": asr_health,
+            "whisper": whisper_health,
             "speaker": speaker_health,
             "separate": separate_health,
             "vram": vram_health,
@@ -98,6 +108,7 @@ async def health(request: Request) -> dict[str, Any]:
         "model_detail": status["detail"],
         "comfy_url": cfg.comfy_base,
         "asr": asr_health,
+        "whisper": whisper_health,
         "speaker": speaker_health,
         "separate": separate_health,
         "vram": vram_health,
@@ -144,6 +155,17 @@ async def capabilities(request: Request) -> dict[str, Any]:
             "base_url": cfg.base_url,
         },
         "backend": cfg.tts_backend,
+        "asr": {
+            "engine": cfg.asr_engine,
+            "engines": ["sensevoice", "whisper"],
+            "whisper": {
+                "model": cfg.whisper_model,
+                "device": cfg.whisper_device,
+                "compute_type": cfg.whisper_compute,
+                "weights_dir": str(cfg.whisper_dir / cfg.whisper_model),
+                "idle_unload_seconds": cfg.whisper_idle_unload,
+            },
+        },
         "auth": {"required": bool(cfg.token), "scheme": "bearer"},
         "gpu": {
             "available": bool(total_mb),
@@ -179,6 +201,7 @@ async def capabilities(request: Request) -> dict[str, Any]:
             "idle_unload_seconds": {
                 "tts": cfg.idle_unload,
                 "asr": cfg.asr_idle_unload,
+                "whisper": cfg.whisper_idle_unload,
                 "speaker": cfg.speaker_idle_unload,
                 "separate": cfg.separate_idle_unload,
             },

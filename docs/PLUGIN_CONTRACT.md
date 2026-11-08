@@ -193,6 +193,51 @@ language=auto
 - 507 → 提示显存不足，建议关闭其它 GPU 程序；
 - 超时（建议 300 秒）→ 提示可重试，不要自动无限重试。
 
+### 3.6 选引擎与要时间戳（新增）
+
+服务现在有两个识别引擎，**普通语音条转文字不需要改任何代码**（默认仍是 sensevoice，
+中文最快、带声纹）。只有下面几种情况才需要显式选择：
+
+| 需求 | 用哪个接口 / 参数 |
+| --- | --- |
+| 普通语音条转文字 | `POST /asr`（不传 `engine`，默认 sensevoice） |
+| 需要每句的 `start/end`（字幕、定位、按句切片） | `POST /asr/segments` |
+| 想用 whisper 做整段转写 | `POST /asr`，`engine=whisper` |
+| 不确定但反正要时间戳 | `/asr/segments` 不传或 `engine=auto`（固定选 whisper） |
+| 异步任务 | `POST /jobs/asr` 同样支持 `engine` / `timestamps` |
+
+`/asr` 的响应新增 `engine` 字段（`sensevoice` / `whisper`），插件可以不展示，但建议
+写进日志方便排错。
+
+`/asr/segments` 契约：
+
+```json
+{
+  "ok": true,
+  "engine": "whisper",
+  "language": "zh",
+  "duration": 12.3,
+  "segments": [{"start": 0.0, "end": 2.4, "text": "..."}],
+  "text": "全文",
+  "timestamp_source": "native"
+}
+```
+
+插件要注意：
+
+- 分段保证**升序、无重叠、`end > start`**，可以直接拿来切音频/做字幕；
+- `timestamp_source=native` 是 whisper 原生时间戳；`vad` 是 sensevoice 用
+  fsmn-vad 切句得到的边界（段间静音保留为间隙，不保证逐字对齐）；
+- 静音/纯噪声可能返回 `segments: []`，这是合法结果，展示「（未识别到语音）」；
+- **不要默认给所有请求加 `engine=whisper`**：whisper 首次使用要下载
+  `models/whisper/<size>/`（几十秒到几分钟），而 sensevoice 默认已就绪；
+- 需要 whisper 时把超时放宽到 **≥600 秒**（首次下载 + 加载），之后单条 3 秒音频
+  约 0.3 秒；显存不足仍是 507，按 3.5 的降级处理。
+
+实测参考（RTX 3070 8G，中文 CER）：sensevoice 1.73%，whisper small 0.89%、
+medium 0.89%、base 9.16%、tiny 17.03%。默认组合是「sensevoice 转文字 + whisper small
+出时间戳」。
+
 ---
 
 ## 4. 场景三：声音选择与音色管理

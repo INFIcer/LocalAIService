@@ -14,6 +14,7 @@ from typing import Optional
 
 from ..config import Config, get_config
 from ..core.registry import EngineRegistry
+from .asr_fasterwhisper import WhisperAdapter
 from .asr_sensevoice import AsrAdapter
 from .base import BaseAdapter
 from .media_ffmpeg import MediaAdapter
@@ -25,6 +26,7 @@ __all__ = [
     "BaseAdapter",
     "TtsAdapter",
     "AsrAdapter",
+    "WhisperAdapter",
     "SpeakerAdapter",
     "SeparateAdapter",
     "MediaAdapter",
@@ -39,6 +41,7 @@ def build_registry(cfg: Optional[Config] = None) -> EngineRegistry:
     # 注册顺序决定 /vram 里模型的展示顺序。
     registry.register(TtsAdapter(cfg))
     registry.register(AsrAdapter(cfg))
+    registry.register(WhisperAdapter(cfg))
     registry.register(SpeakerAdapter(cfg))
     registry.register(SeparateAdapter(cfg))
     registry.register(MediaAdapter(cfg))

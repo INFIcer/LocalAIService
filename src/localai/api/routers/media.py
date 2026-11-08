@@ -1,4 +1,4 @@
-"""媒体路由：ffmpeg 探测 / 转 16k wav / 抽帧 / 抽音轨。
+"""媒体路由：ffmpeg 探测 / 转 16k wav / 抽帧 / 抽音轨 / 场景检测。
 
 契约（全部 multipart，文件字段名统一叫 ``file``）：
 
@@ -6,8 +6,10 @@
 - ``POST /media/to_wav`` -> audio/wav 二进制（16k 单声道 PCM16）
 - ``POST /media/frames`` -> ``{ok, count, dir, frames[], preview_b64}``
 - ``POST /media/audio``  -> audio/wav 或 audio/mpeg 二进制
+- ``POST /media/scenes`` -> ``{ok, count, scenes[{time,score}], json_path}``
 
-临时文件处理完立即删除；抽帧结果留在 ``<OUTPUT>/frames/<时间戳>/``。
+临时文件处理完立即删除；抽帧结果留在 ``<OUTPUT>/frames/<时间戳>/``；
+场景检测结果（可选）落在 ``<OUTPUT>/scenes/<时间戳>.json``。
 """
 
 from __future__ import annotations
@@ -214,3 +216,53 @@ async def media_audio_endpoint(
         result.get("channels"),
     )
     return Response(content=audio_bytes, media_type=media_type, headers=headers)
+
+
+@router.post("/media/scenes", summary="场景/镜头边界检测（ffmpeg scene 分数）")
+async def media_scenes_endpoint(
+    request: Request,
+    file: UploadFile = File(..., description="要检测的视频文件"),
+    threshold: float = Form(0.3, description="场景分数阈值 0~1，越大越严格"),
+    max_scenes: int = Form(200, description="最多返回多少个边界"),
+    min_gap: float = Form(1.0, description="最小间隔秒数（去抖）"),
+) -> dict[str, Any]:
+    """返回 ``{ok, count, scenes:[{time,score}], duration, json_path}``。
+
+    结果同时落盘到 ``<OUTPUT>/scenes/<时间戳>.json``，方便二次处理。
+    """
+    cfg = get_cfg(request)
+    media = get_registry(request).get("media")
+    started = time.perf_counter()
+    tmp_path = await save_media_upload(cfg, file, "scenes")
+    try:
+        result = await media.call(
+            "detect_scenes",
+            str(tmp_path),
+            threshold=threshold,
+            max_scenes=max_scenes,
+            min_gap=min_gap,
+            save_dir=str(cfg.scenes_dir),
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    elapsed_ms = round((time.perf_counter() - started) * 1000)
+    logger.info(
+        "场景检测：%s -> %d 个边界（阈值 %.2f，最小间隔 %.2fs，耗时 %dms）",
+        Path(file.filename or "").name,
+        result.get("count", 0),
+        threshold,
+        min_gap,
+        elapsed_ms,
+    )
+    return {
+        "ok": True,
+        "count": result.get("count", 0),
+        "scenes": result.get("scenes") or [],
+        "duration": result.get("duration"),
+        "threshold": result.get("threshold"),
+        "max_scenes": result.get("max_scenes"),
+        "min_gap": result.get("min_gap"),
+        "json_path": result.get("json_path"),
+        "elapsed_ms": elapsed_ms,
+    }

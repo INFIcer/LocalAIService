@@ -184,7 +184,15 @@ def cmd_serve(args: argparse.Namespace) -> int:
 def _doctor_dependencies() -> list[tuple[str, str, bool]]:
     """返回 (名称, 版本或状态, 是否必需/存在)。"""
     required = ["fastapi", "uvicorn", "httpx", "soundfile", "numpy", "pydantic"]
-    optional = ["torch", "funasr", "demucs", "transformers", "modelscope"]
+    optional = [
+        "torch",
+        "funasr",
+        "demucs",
+        "transformers",
+        "modelscope",
+        "faster_whisper",
+        "ctranslate2",
+    ]
     rows: list[tuple[str, str, bool]] = []
     for name in required:
         version = _module_version(name)
@@ -231,6 +239,35 @@ def _doctor_models(cfg: Config) -> list[tuple[str, str, bool, str]]:
             str(cfg.speaker_model_dir),
             not spk_missing,
             "文件齐全" if not spk_missing else f"缺 {', '.join(spk_missing)}",
+        )
+    )
+
+    # faster-whisper（可选第二识别引擎）：权重缺失不影响启动，首次请求会自动下载。
+    whisper_dir = cfg.whisper_dir / cfg.whisper_model
+    whisper_missing = _check_files(
+        whisper_dir, ("model.bin", "config.json", "tokenizer.json", "vocabulary.txt")
+    )[1]
+    rows.append(
+        (
+            f"faster-whisper-{cfg.whisper_model}",
+            str(whisper_dir),
+            not whisper_missing,
+            (
+                "权重齐全"
+                if not whisper_missing
+                else "可选：未下载（首次 /asr engine=whisper 时自动从 ModelScope 下载）"
+            ),
+        )
+    )
+
+    # fsmn-vad：SenseVoice 分段转写用，缺了只影响 /asr/segments 的 sensevoice 分支。
+    vad_missing = _check_files(cfg.asr_vad_dir, ("model.pt", "config.yaml"))[1]
+    rows.append(
+        (
+            "fsmn-vad",
+            str(cfg.asr_vad_dir),
+            not vad_missing,
+            "权重齐全" if not vad_missing else "可选：未下载（首次分段请求时自动下载）",
         )
     )
 
@@ -340,7 +377,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     for name, directory, ok, detail in _doctor_models(cfg):
         if ok:
             mark = OK
-        elif "htdemucs_ft" in name:
+        elif "htdemucs_ft" in name or "faster-whisper" in name or "fsmn-vad" in name:
+            # 可选组件：缺失只提示，不算问题、不增加警告（doctor 要能 0 警告）。
             mark = INFO
         else:
             mark = FAIL
@@ -386,8 +424,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print(
         "       idle_unload: "
         f"tts={cfg.idle_unload}s asr={cfg.asr_idle_unload}s "
+        f"whisper={cfg.whisper_idle_unload}s "
         f"speaker={cfg.speaker_idle_unload}s separate={cfg.separate_idle_unload}s"
     )
+    print(f"       默认识别引擎：{cfg.asr_engine}；whisper 档位：{cfg.whisper_model}"
+          f"（{cfg.whisper_device}/{cfg.whisper_compute}）")
     print(f"       鉴权：{'已启用（LOCALAI_TOKEN）' if cfg.token else '未启用（默认）'}")
 
     print("\n" + "-" * 72)

@@ -684,7 +684,7 @@ def register_adapters(registry: Any) -> VramManager:
         vram.register(
             adapter.name,
             adapter.unload,
-            adapter.DEFAULT_ESTIMATE_MB,
+            adapter.estimate_mb(),
             adapter.loader_hint,
             is_loaded_fn=adapter.loaded,
             infer_lock=adapter.infer_lock,

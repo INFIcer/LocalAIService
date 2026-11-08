@@ -18,6 +18,7 @@ ffmpeg 媒体工具（本地 AI 服务共用）
     to_wav16k(src, dst=None)             任意音视频 -> 16kHz 单声道 PCM16 wav（ASR 用）
     extract_frames(src, out_dir, ...)    抽帧（按数量 / 时间点 / fps），返回文件与尺寸
     extract_audio(src, out_dir, fmt=...) 只抽音轨（保留原采样率）
+    detect_scenes(src, ...)              场景/镜头边界检测（ffmpeg scene 分数）
 
 命令行自检：
     python ffmpeg_tool.py status
@@ -32,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -717,6 +719,168 @@ def extract_audio(
 
 
 # ---------------------------------------------------------------------------
+# 场景 / 镜头边界检测
+# ---------------------------------------------------------------------------
+
+#: 场景分数阈值：越大越只挑「明显切换」。
+SCENE_DEFAULT_THRESHOLD = 0.3
+#: 单次最多返回的边界数（防止长视频返回几万个点）。
+SCENE_MAX_SCENES = 200
+#: 最小间隔（秒）：两次切换太近时只保留前一个，去掉抖动。
+SCENE_MIN_GAP = 1.0
+
+#: 从 ffmpeg 日志里抠时间点 / 场景分数。
+_PTS_TIME_RE = re.compile(r"pts_time:\s*([0-9]+(?:\.[0-9]+)?)")
+_SCENE_SCORE_RE = re.compile(r"lavfi\.scene_score=\s*([0-9]+(?:\.[0-9]+)?)")
+
+
+def _debounce_scenes(
+    points: list[tuple[float, float]],
+    *,
+    min_gap: float,
+) -> list[tuple[float, float]]:
+    """最小间隔去抖：时间升序，间隔小于 ``min_gap`` 的只保留第一个。
+
+    ffmpeg 的 scene 分数在快速运镜 / 闪白时可能连续多帧超阈值，
+    去抖后每个镜头只留一个边界。
+    """
+    kept: list[tuple[float, float]] = []
+    for seconds, score in sorted(points, key=lambda item: item[0]):
+        if seconds < 0:
+            continue
+        if kept and seconds - kept[-1][0] < float(min_gap):
+            continue
+        kept.append((round(seconds, 3), round(score, 4)))
+    return kept
+
+
+def detect_scenes(
+    src: str | Path,
+    *,
+    threshold: float = SCENE_DEFAULT_THRESHOLD,
+    max_scenes: int = SCENE_MAX_SCENES,
+    min_gap: float = SCENE_MIN_GAP,
+    save_dir: str | Path | None = None,
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    """检测视频的镜头切换点（ffmpeg ``scene`` 分数）。
+
+    实现：``-vf "select='gt(scene,TH)',metadata=mode=print:file=-,showinfo"
+    -f null -``
+
+    - ``showinfo`` 把每个被选中帧的 ``pts_time`` 打到 stderr；
+    - ``metadata=mode=print`` 把 ``lavfi.scene_score`` 打到 stdout；
+    - 两边按顺序对齐；万一 stdout 没解析到，就退回只用 stderr 的时间点、
+      分数记 0。
+
+    参数
+    ----
+    threshold:  场景分数阈值，默认 0.3（越大越严格）。
+    max_scenes: 最多返回多少个边界，默认 200。
+    min_gap:    最小间隔（秒），默认 1.0；更近的只保留前一个。
+    save_dir:   给了就把结果写一份 ``<save_dir>/<时间戳>.json``。
+
+    返回::
+
+        {"count": 2, "scenes": [{"time": 1.52, "score": 1.0}, ...],
+         "duration": 4.56, "threshold": 0.3, "max_scenes": 200,
+         "min_gap": 1.0, "json_path": "...json"（可选）}
+
+    错误抛 :class:`MediaError`（文件不存在 / 没有视频流 / ffmpeg 失败）。
+    """
+    source = _require_file(src)
+    try:
+        threshold = float(threshold)
+    except (TypeError, ValueError) as exc:
+        raise MediaError(f"threshold 必须是数字，收到 {threshold!r}") from exc
+    if not 0.0 <= threshold <= 1.0:
+        raise MediaError(f"threshold 必须在 0~1 之间，收到 {threshold}")
+    max_scenes = int(max_scenes)
+    if max_scenes <= 0:
+        raise MediaError(f"max_scenes 必须是正整数，收到 {max_scenes}")
+    try:
+        min_gap = float(min_gap)
+    except (TypeError, ValueError) as exc:
+        raise MediaError(f"min_gap 必须是数字，收到 {min_gap!r}") from exc
+    if min_gap < 0:
+        raise MediaError(f"min_gap 不能是负数，收到 {min_gap}")
+
+    info = probe(source)
+    if not info.get("video"):
+        raise MediaError(f"这个文件没有视频流，做不了场景检测：{source}")
+
+    # 9 位小数足够把 ffmpeg 的 pts_time 原样带过来。
+    scene_filter = (
+        f"select='gt(scene,{threshold:.6f})',"
+        "metadata=mode=print:file=-,showinfo"
+    )
+    proc = _run(
+        ["-v", "info", "-i", str(source), "-vf", scene_filter, "-f", "null", "-"],
+        timeout=timeout,
+    )
+
+    # stdout：成对的 pts_time / lavfi.scene_score（按帧顺序）。
+    pairs: list[tuple[float, float]] = []
+    pending_time: Optional[float] = None
+    for line in (proc.stdout or "").splitlines():
+        time_match = _PTS_TIME_RE.search(line)
+        if time_match:
+            pending_time = float(time_match.group(1))
+            continue
+        score_match = _SCENE_SCORE_RE.search(line)
+        if score_match:
+            score = float(score_match.group(1))
+            if pending_time is not None:
+                pairs.append((pending_time, score))
+                pending_time = None
+
+    # stderr：showinfo 的 pts_time（stdout 没解析到时的兜底）。
+    if not pairs:
+        for line in (proc.stderr or "").splitlines():
+            if "Parsed_showinfo" not in line:
+                continue
+            match = _PTS_TIME_RE.search(line)
+            if match:
+                pairs.append((float(match.group(1)), 0.0))
+
+    scenes = _debounce_scenes(pairs, min_gap=min_gap)[:max_scenes]
+    result: dict[str, Any] = {
+        "count": len(scenes),
+        "scenes": [{"time": seconds, "score": score} for seconds, score in scenes],
+        "duration": info.get("duration"),
+        "threshold": threshold,
+        "max_scenes": max_scenes,
+        "min_gap": min_gap,
+        "source": str(source),
+    }
+
+    if save_dir is not None:
+        # 落盘文件名用「时间戳 + 毫秒 + 短随机」，既不撞名又一眼能看出时间。
+        target_dir = Path(save_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        millis = int(time.time() * 1000) % 1000
+        json_path = target_dir / f"{stamp}_{millis:03d}.json"
+        payload = {
+            "source": str(source),
+            "duration": info.get("duration"),
+            "threshold": threshold,
+            "max_scenes": max_scenes,
+            "min_gap": min_gap,
+            "count": len(scenes),
+            "scenes": result["scenes"],
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+        json_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        result["json_path"] = str(json_path)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # 命令行自检
 # ---------------------------------------------------------------------------
 
@@ -748,6 +912,13 @@ def _main() -> int:
     audio_parser.add_argument("--out", required=True)
     audio_parser.add_argument("--format", default="wav", choices=("wav", "mp3"))
 
+    scenes_parser = sub.add_parser("scenes", help="场景/镜头边界检测")
+    scenes_parser.add_argument("path")
+    scenes_parser.add_argument("--threshold", type=float, default=SCENE_DEFAULT_THRESHOLD)
+    scenes_parser.add_argument("--max-scenes", type=int, default=SCENE_MAX_SCENES)
+    scenes_parser.add_argument("--min-gap", type=float, default=SCENE_MIN_GAP)
+    scenes_parser.add_argument("--out", default=None, help="结果 json 落盘目录（可选）")
+
     args = parser.parse_args()
     if args.command == "status":
         print(json.dumps(status(), ensure_ascii=False, indent=2))
@@ -755,6 +926,17 @@ def _main() -> int:
 
     if args.command == "probe":
         print(json.dumps(probe(args.path), ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "scenes":
+        result = detect_scenes(
+            args.path,
+            threshold=args.threshold,
+            max_scenes=args.max_scenes,
+            min_gap=args.min_gap,
+            save_dir=args.out,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
 
     if args.command == "wav16k":

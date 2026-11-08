@@ -59,6 +59,17 @@ curl -X POST "http://127.0.0.1:7880/asr?speaker=0" \
   },
   "listen": {"host": "127.0.0.1", "port": 7880, "base_url": "http://127.0.0.1:7880"},
   "backend": "engine",
+  "asr": {
+    "engine": "sensevoice",
+    "engines": ["sensevoice", "whisper"],
+    "whisper": {
+      "model": "small",
+      "device": "cuda",
+      "compute_type": "int8_float16",
+      "weights_dir": "E:\\LocalAIService\\models\\whisper\\small",
+      "idle_unload_seconds": 900
+    }
+  },
   "auth": {"required": false, "scheme": "bearer"},
   "gpu": {"available": true, "free_mb": 7369, "total_mb": 8192, "margin_mb": 512},
   "capabilities": {
@@ -103,6 +114,8 @@ curl -X POST "http://127.0.0.1:7880/asr?speaker=0" \
 | `model_ready` / `engine_loaded` | 文件齐全 / 当前是否已加载 |
 | `voices` | 音色数量 |
 | `asr` / `speaker` / `separate` | 各能力的 `ready`、`loaded`、空闲秒数 |
+| `asr.engine` / `asr.vad` | 默认识别引擎；SenseVoice 分段用的 fsmn-vad 状态 |
+| `whisper` | faster-whisper 的 `ready` / `loaded` / `model` / 空闲秒数（不加载模型） |
 | `vram` | `free_mb` / `total_mb`（nvidia-smi，1 秒缓存） |
 | `media` | ffmpeg/ffprobe 探测结果 |
 | `comfy` | engine 后端固定为 `disabled` |
@@ -146,7 +159,7 @@ curl -X POST http://127.0.0.1:7880/vram/unload \
 ```
 
 返回：`{"ok":true,"released":["tts"],"free_mb":7360,"total_mb":8192}`。
-可选名字：`tts` / `asr` / `speaker` / `separate`；未知名字返回 400。
+可选名字：`tts` / `asr` / `whisper` / `speaker` / `separate`；未知名字返回 400。
 
 ---
 
@@ -213,6 +226,13 @@ curl -X POST http://127.0.0.1:7880/tts \
 
 ## 4. ASR（语音识别）
 
+服务内置两个识别引擎，注册成两个并列能力，各自懒加载、各自占显存、按 LRU 互相腾退：
+
+| 引擎 | 注册能力 | 模型 | 时间戳 | 说明 |
+| --- | --- | --- | --- | --- |
+| `sensevoice`（默认） | `asr` | SenseVoiceSmall | 无原生时间戳；`/asr/segments` 用 fsmn-vad 切句（`timestamp_source=vad`） | 中文短音频最快，带情感/事件标签与声纹 |
+| `whisper` | `whisper` | faster-whisper（`tiny/base/small/medium/large-v3`） | 原生 segment 时间戳（`timestamp_source=native`） | 需要精确时间戳、多语种；默认档 `small` |
+
 ### `POST /asr`，别名 `POST /api/v1/asr`
 
 multipart：
@@ -221,7 +241,12 @@ multipart：
 | --- | --- |
 | `file` | 音频或视频（wav/mp3/m4a/ogg/flac/mp4/mkv/webm…，≤200MB） |
 | `language` | `auto`/`zh`/`en`/`ja`/`ko`/`yue`/`nospeech` |
-| `?speaker=0` | 关闭声纹（默认开启；关闭后连 campplus 都不加载） |
+| `speaker` | `1`（默认，识别声纹）/ `0`（跳过，连 campplus 都不加载） |
+| `engine` | `sensevoice` / `whisper` / `auto`；**空 = 按配置默认**（`LOCALAI_ASR_ENGINE`） |
+| `timestamps` | `0`（默认）/ `1`；只影响 `engine=auto` 的选择：要时间戳时选 whisper |
+
+`engine=auto` 规则：`timestamps=1` 走 whisper，否则走配置默认。
+旧的默认行为完全不变（不带 `engine` → sensevoice + 声纹）。
 
 非 WAV 会先用 ffmpeg 归一成 **16kHz 单声道 WAV** 再识别；采样率不用自己处理。
 音频容器转码失败会回退直接识别；视频转码失败直接报错。
@@ -231,6 +256,7 @@ multipart：
 ```json
 {
   "ok": true,
+  "engine": "sensevoice",
   "text": "识别出的文字",
   "language": "zh",
   "emotion": "NEUTRAL",
@@ -244,16 +270,149 @@ multipart：
 }
 ```
 
-声纹失败不会影响转写，会多一个 `speaker_error` 字段。
+`engine` 是本次真正用到的引擎（`sensevoice` / `whisper`）。声纹失败不会影响转写，
+会多一个 `speaker_error` 字段。
 
 ```bash
 curl -X POST "http://127.0.0.1:7880/asr?speaker=0" \
   -F "file=@meeting.mp4" -F "language=auto"
+
+# 指定 whisper（原生时间戳，但 /asr 只返回文本；要分段用 /asr/segments）
+curl -X POST "http://127.0.0.1:7880/asr" \
+  -F "file=@meeting.wav" -F "engine=whisper" -F "language=zh"
 ```
 
 ### `GET /asr/status`
 
-`{ready, loaded, idle_seconds, idle_unload_seconds, detail}`。
+```json
+{
+  "ready": true,
+  "loaded": false,
+  "engine": "sensevoice",
+  "engines": {
+    "sensevoice": {"model": "SenseVoiceSmall", "ready": true, "loaded": false,
+                    "model_dir": "...", "idle_unload_seconds": 900, "vad": {"ready": true, "loaded": false}},
+    "whisper": {"model": "faster-whisper-small", "ready": true, "loaded": false,
+                "model_dir": "E:\\LocalAIService\\models\\whisper\\small",
+                "device": "cuda", "compute_type": "int8_float16",
+                "size": "small", "size_mb": 463.7, "idle_unload_seconds": 900}
+  },
+  "whisper": {"...": "同上，另带 idle_seconds"},
+  "idle_seconds": null,
+  "parallel": {"capacity": 2, "in_use": 0, "peak": 0, "env": "LOCALAI_ASR_PARALLEL"}
+}
+```
+
+### `POST /asr/segments`（带时间戳的分段转写）
+
+multipart：`file`（音频/视频）、`language`、`engine=sensevoice|whisper|auto`。
+`engine=auto` 在**本接口固定选 whisper**（本接口就是要时间戳）。
+
+```bash
+curl -X POST http://127.0.0.1:7880/asr/segments \
+  -F "file=@speech.wav" -F "language=zh" -F "engine=whisper"
+```
+
+响应：
+
+```json
+{
+  "ok": true,
+  "engine": "whisper",
+  "language": "zh",
+  "duration": 12.3,
+  "segments": [
+    {"start": 0.0, "end": 2.4, "text": "第一句"},
+    {"start": 2.6, "end": 5.1, "text": "第二句"}
+  ],
+  "text": "第一句第二句",
+  "timestamp_source": "native",
+  "elapsed": 0.8,
+  "device": "cuda",
+  "converted": false,
+  "source_format": ".wav"
+}
+```
+
+保证：
+
+- 分段**按时间升序、互不重叠、`end > start`**（服务端统一整理）；
+- `timestamp_source` 区分来源：whisper 是 `native`，sensevoice 是 `vad`；
+- sensevoice 的 `start/end` 取 fsmn-vad 的语音段边界（段间静音如实保留为间隙）；
+- 分段之间的静音不会被硬塞进某一段，`duration` 是整段音频时长。
+
+### Whisper 引擎（faster-whisper）
+
+| 项目 | 值 |
+| --- | --- |
+| Python 包 | `faster-whisper==1.2.1` + `ctranslate2==4.8.5` + `av==17.0.1` + `onnxruntime==1.31.1` |
+| 显存运行库 | `nvidia-cublas-cu12` / `nvidia-cudnn-cu12` / `nvidia-cuda-runtime-cu12`（本机 torch 是 cu130，两者互不覆盖） |
+| 权重目录 | `LOCALAI_HOME/models/whisper/<size>/`（默认 `E:\LocalAIService\models\whisper\small`） |
+| 支持档位 | `tiny` / `base` / `small`（默认）/ `medium` / `large-v3` |
+| 下载顺序 | 本地已有 → 本机 HF 缓存 → ModelScope（`Systran/faster-whisper-<size>`）→ HF 镜像 `hf-mirror.com` |
+| 设备 / 精度 | `cuda` + `int8_float16`（默认）；CPU 回退 `int8` |
+| 加载策略 | 服务启动 0 模型；第一次请求才下载/加载；`unload()` 释放模型 + gc + empty_cache |
+| 空闲卸载 | `LOCALAI_WHISPER_IDLE_UNLOAD`（默认 900 秒） |
+
+环境变量：
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `LOCALAI_ASR_ENGINE` | `sensevoice` | 识别默认引擎（`sensevoice` / `whisper`）；任务级 `engine=` 可覆盖 |
+| `LOCALAI_WHISPER_MODEL` | `small` | 档位 |
+| `LOCALAI_WHISPER_DEVICE` | `cuda` | 设备；设 `cpu` 走 CPU |
+| `LOCALAI_WHISPER_COMPUTE` | `int8_float16` | 计算类型 |
+| `LOCALAI_WHISPER_DIR` | `<HOME>/models/whisper` | 权重根目录 |
+| `LOCALAI_WHISPER_IDLE_UNLOAD` | `900` | 空闲卸载秒数（0=关闭） |
+| `LOCALAI_WHISPER_PROMPT` | `以下是普通话的句子。` | 中文提示词；实测把 small 的 CER 从 16.6% 降到 0.9%，设空可关 |
+| `LOCALAI_WHISPER_ALLOW_CPU_FALLBACK` | `1` | CUDA 失败时是否回退 CPU |
+
+> 权重不会散到用户目录：`WhisperModel` 直接用 `models/whisper/<size>/` 本地目录，
+> 下载由服务层先落盘再加载。`models/` 已在 `.gitignore` 中。
+
+### 识别实测（RTX 3070 8G，2026-11）
+
+评测集：8 条 TTS 合成的**已知文本**中文短音频（合计 25.6 秒，单条 2.7~3.6 秒），
+语言固定 `zh`，whisper `beam_size=5`、`vad_filter=True`、`initial_prompt=以下是普通话的句子。`。
+CER = 字符错误率（去标点/空白后的编辑距离 / 参考字符数）。
+
+| 引擎 | 模型 | CER | 单条延迟（均值） | RTF（音频时长/耗时） | 冷加载 |
+| --- | --- | --- | --- | --- | --- |
+| sensevoice | SenseVoiceSmall | **1.73%** | 0.165 s | 19.45 | 10.84 s |
+| whisper | tiny | 17.03% | 0.232 s | 13.81 | 0.41 s |
+| whisper | base | 9.16% | 0.273 s | 11.74 | 0.44 s |
+| whisper | **small** | **0.89%** | 0.328 s | 9.75 | 1.18 s |
+| whisper | medium | **0.89%** | 0.646 s | 4.95 | 3.28 s |
+| whisper | small（CPU/int8） | — | 2.19 s | 1.46 | 1.82 s |
+
+> RTF 按任务书定义 = 音频时长 / 处理耗时，越大越快。CPU small 仍快于实时（1.46×）。
+
+显存（整卡 `nvidia-smi` used，加载期间每 100ms 采样；基线约 1.4~1.6GB 含桌面与
+CUDA context）：
+
+| 模型 | 加载后整卡 used | 加载增量 | 卸载后 |
+| --- | --- | --- | --- |
+| whisper tiny | 1615 MB | +220 MB | 1619 MB |
+| whisper base | 1698 MB | +96 MB | 1596 MB |
+| whisper small | 1854 MB | +288 MB | 1576 MB |
+| whisper medium | 2534 MB | +960 MB | 1597 MB |
+| sensevoice | 2470 MB | +893 MB | 1528 MB |
+
+> whisper `small` 常驻只占约 0.3GB（int8_float16），完全能和 TTS 共存；
+> `medium` 约 1GB，仍可与 TTS 同时驻留（8G 卡余量足够），紧张时显存管家会按 LRU 先卸 TTS。
+
+长音频（46.35 秒、12 句、句间 0.6 秒静音）：
+
+| 项目 | 结果 |
+| --- | --- |
+| 引擎 / 档位 | whisper `small`（cuda / int8_float16） |
+| 处理耗时 | 2.95 秒（RTF 15.72） |
+| segments | 12 段（与 12 句一一对应） |
+| 抽查 3 段裁剪再识别 | 段 0（0~4.0s）、段 6（23.0~27.0s）、段 11（42.0~46.0s），whisper 与 sensevoice 复识 CER 均 **0.00%** |
+| 与真实句子起点误差 | 最大 0.64 秒（whisper 的段边界略偏早，裁剪片段内容仍完整） |
+
+> 结论：需要时间戳用 whisper `small`；`medium` 的 CER 与 small 相同但慢 2 倍、多占
+> 0.7GB，默认不选。`tiny/base` 中文 CER 偏高（17%/9%），只适合快速预览。
 
 ---
 
@@ -342,6 +501,50 @@ multipart：
 ### `POST /media/audio`
 
 表单 `format=wav|mp3`；只抽音轨，保留源采样率与声道，返回音频二进制。
+
+### `POST /media/scenes`（场景 / 镜头边界检测）
+
+multipart：`file`（视频）、`threshold`（默认 `0.3`）、`max_scenes`（默认 `200`）、
+`min_gap`（默认 `1.0` 秒）。
+
+实现：`ffmpeg -vf "select='gt(scene,TH)',metadata=mode=print:file=-,showinfo" -f null -`，
+解析 stderr 的 `pts_time` 与 stdout 的 `lavfi.scene_score`，再做「最小间隔去抖」
+（间隔小于 `min_gap` 的只保留前一个）。
+
+```bash
+curl -X POST http://127.0.0.1:7880/media/scenes \
+  -F "file=@cut.mp4" -F "threshold=0.3" -F "min_gap=1.0"
+```
+
+```json
+{
+  "ok": true,
+  "count": 2,
+  "scenes": [
+    {"time": 1.52, "score": 1.0},
+    {"time": 3.04, "score": 1.0}
+  ],
+  "duration": 4.56,
+  "threshold": 0.3,
+  "max_scenes": 200,
+  "min_gap": 1.0,
+  "json_path": "E:\\LocalAIService\\outputs\\scenes\\20261108_173056_247.json",
+  "elapsed_ms": 92
+}
+```
+
+- 结果同时落盘到 `<OUTPUT>/scenes/<时间戳>.json`（含 source/threshold/scenes）；
+- `time` 单位秒，`score` 是 ffmpeg 的 scene 分数（0~1）；
+- 没有视频流的文件返回 400；`threshold` 越界 / `max_scenes<=0` / `min_gap<0` 也返回 400。
+
+实测（合成 4.56 秒黑→白→蓝切换视频，真实切换点 1.50s / 3.00s）：
+
+| 检测边界 | 真实边界 | 误差 | score | 耗时 |
+| --- | --- | --- | --- | --- |
+| 1.52 s | 1.50 s | +0.02 s | 1.0 | 0.092 s（整段） |
+| 3.04 s | 3.00 s | +0.04 s | 1.0 | — |
+
+> 误差来自帧级时间戳（25fps = 0.04s/帧），不是算法抖动。
 
 ---
 
@@ -658,9 +861,17 @@ Content-Type: application/json
 curl -X POST http://127.0.0.1:7880/jobs/asr \
   -F "file=@hello.wav" -F "language=auto" -F "speaker=1" -F "priority=0"
 
+# 任务级指定引擎 / 要时间戳（engine=auto 时选 whisper）
+curl -X POST http://127.0.0.1:7880/jobs/asr \
+  -F "file=@hello.wav" -F "engine=whisper" -F "timestamps=1"
+
 curl -X POST http://127.0.0.1:7880/jobs/separate \
   -F "file=@song.mp3" -F "model=htdemucs" -F "stems=vocals,drums,bass,other"
 ```
+
+`POST /jobs/asr` 新增可选表单 `engine=sensevoice|whisper|auto`、`timestamps=0|1`；
+任务结果的 JSON 里同样带 `"engine"` 字段。通用 `POST /jobs` 的 `payload` 里也可以放
+`engine` / `timestamps`。
 
 上传文件先落到 `<HOME>/data/uploads/<job_id>/input.<ext>`；任务结束（done /
 failed / canceled）后默认删除，`LOCALAI_JOBS_KEEP_UPLOADS=1` 可保留。
@@ -721,6 +932,14 @@ failed / canceled）后默认删除，`LOCALAI_JOBS_KEEP_UPLOADS=1` 可保留。
     "running": 1,
     "max_parallel": 1,
     "per_kind_parallel": {"tts": 1, "asr": 1, "separate": 1, "speaker": 1, "media": 1},
+    "asr_parallel": 1,
+    "asr_engine": "sensevoice",
+    "asr_engines": {
+      "default": "sensevoice",
+      "sensevoice": {"adapter": "asr", "loaded": false},
+      "whisper": {"adapter": "whisper", "loaded": true, "model": "faster-whisper-small",
+                  "device": "cuda", "compute_type": "int8_float16"}
+    },
     "parallel_extra_mb": 600,
     "parallel_degraded": {},
     "concurrency": {
