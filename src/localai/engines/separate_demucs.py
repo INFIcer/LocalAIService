@@ -24,6 +24,13 @@ class SeparateAdapter(BaseAdapter):
     # WDDM 下加载增量可能只统计到 140MB，但推理峰值约 0.9GB。
     MIN_ESTIMATE_MB = 800
     ENDPOINTS = ("/separate", "/api/v1/separate", "/separate/status")
+    # 实测并行 2 没有稳定收益（2 条 10 秒音频 0.86s -> 0.72~0.83s），
+    # 且 engine/separator_engine.py 内部有 _INFER_LOCK，强制串行。
+    CAN_INFER_IN_PARALLEL = False
+    PARALLEL_NOTE = (
+        "Demucs 引擎内部有 _INFER_LOCK；实测并行 2 无稳定收益"
+        "（0.86s→0.72~0.83s），强制串行"
+    )
 
     @property
     def loader_hint(self) -> str:

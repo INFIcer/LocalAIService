@@ -10,6 +10,8 @@ import asyncio
 import logging
 from typing import Any, Optional
 
+from .concurrency import exclusive
+
 logger = logging.getLogger("localai.idle")
 
 
@@ -47,8 +49,9 @@ class IdleWatchdog:
                     continue
                 if not self.adapter.loaded():
                     continue
-                # 拿推理锁：如果此刻正在推理，就等它跑完再卸，避免卸到一半。
-                async with self.adapter.infer_lock:
+                # 独占推理闸门：如果此刻正在推理（可能有多个并发），
+                # 就等它们全部跑完再卸，避免卸到一半。
+                async with exclusive(self.adapter.infer_lock):
                     if not self.adapter.loaded():
                         continue
                     await asyncio.to_thread(self.adapter.unload)

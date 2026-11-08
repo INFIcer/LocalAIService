@@ -23,6 +23,14 @@ class AsrAdapter(BaseAdapter):
     # 多次加载后实测增量会被 CUDA 缓存复用拉低；保留 900MB 下限。
     MIN_ESTIMATE_MB = 900
     ENDPOINTS = ("/asr", "/api/v1/asr", "/asr/status")
+    # 实测：把 engine/asr_engine.py 的 _INFER_LOCK 临时去掉后，4 条 3~10 秒音频
+    # 总耗时 0.324s -> 0.227s（约 -30%），说明模型本身能并发；但引擎内部锁
+    # 仍在，服务层无法绕过，所以默认仍为 1（详见 docs/SERVICE_API.md）。
+    CAN_INFER_IN_PARALLEL = False
+    PARALLEL_NOTE = (
+        "模型本身实测可并发（去引擎锁后 0.324s→0.227s），"
+        "但 engine/asr_engine.py 的 _INFER_LOCK 仍串行，服务层无法绕过，默认 1"
+    )
 
     @property
     def loader_hint(self) -> str:

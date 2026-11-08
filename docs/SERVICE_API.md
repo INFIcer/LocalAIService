@@ -387,9 +387,10 @@ multipart：
 
 ## 10. 并发、超时与首次加载
 
-- 所有 TTS / ASR / 人声分离任务都进同一个持久化队列，由**单 worker**
-  串行执行（同 kind 连续批处理）；声纹/媒体接口仍是直接调用。
-- 每个 GPU 能力仍保留一把推理锁；调度器已保证同一时刻只有一个任务在跑。
+- 所有 TTS / ASR / 人声分离任务都进同一个持久化队列，由**单 worker 派发**；
+  默认每类并行度为 1（真实引擎内部还有锁，见 12.2.1），所以实际仍是一条一条跑。
+  声纹/媒体接口仍是直接调用。
+- 每个 GPU 能力的推理闸门容量可调；默认 1，语义与旧锁相同。
 - 加载前统一经过显存管家：按 LRU 卸载其它空闲模型，仍不够则 507。
 - 首次调用 TTS 约 10~60 秒；ASR/声纹/分离通常几秒~几十秒。
 - 客户端建议：同步 TTS 超时 ≥ 180 秒；ASR/分离 ≥ 300 秒；连接超时 5 秒。
@@ -412,10 +413,10 @@ Authorization: Bearer <LOCALAI_TOKEN>
 
 ---
 
-## 12. 任务队列（持久化 + 批处理调度）
+## 12. 任务队列（持久化 + 三层排序 + 同类并行）
 
 从 2.2.0 起，**所有 TTS / ASR / 人声分离请求都会先变成一条任务记录**，
-再交给单 worker 调度器执行：
+再交给单 worker 调度器派发（默认每类并行 1，实际一条一条跑）：
 
 - 旧同步接口（`/tts`、`/v1/audio/speech`、`/api/v1/tts/tasks`、`/asr`、
   `/api/v1/asr`、`/separate`、`/api/v1/separate`）**响应体、状态码、二进制
@@ -445,31 +446,103 @@ Authorization: Bearer <LOCALAI_TOKEN>
 | `client_ip` | TEXT | 调用方 IP |
 | `meta` | TEXT | JSON 预留扩展；取消 running 任务时写 `cancel_requested` |
 
-### 12.2 调度规则
+### 12.2 调度规则（严格三层，无 aging）
 
-1. **单 worker、单卡**：同一时刻只跑一个任务；`LOCALAI_JOBS_MAX_PARALLEL`
-   预留给以后（当前固定 1）。
-2. **同 kind 批处理**：当前 kind 还有排队任务时继续跑同一 kind，
-   例如队列里 TTS×5、分离×2，会先跑完 5 个 TTS 再切分离，
-   避免 TTS ↔ Demucs 反复加载/卸载。
-3. **优先级 + 老化**：
-   - 基础顺序 `priority DESC, created_at ASC`；
-   - 等待每满 `LOCALAI_JOBS_AGING_SECONDS`（默认 60 秒），有效优先级 +1；
-   - 当前 kind 还有任务时，只有**其它 kind 的有效优先级严格更高**才切换，
-     因此高优先级任务不会被批处理饿死。
-4. **已经 running 的任务不能被抢占**：优先级只影响还在 `queued` 的任务。
+从高到低**只有三层**，没有老化、没有自动提权：
+
+1. **同类型优先**（避免频繁加载/卸载模型）
+   如果当前已加载的能力（调度器的 `current_kind`）在队列里还有任务，就先跑它们；
+   其它类型优先级再高也**不许**切走。
+2. **优先级**：任务提交时的可选参数 `priority`（整数，默认 0，越大越先）。
+3. **提交时间**：`created_at` 早的先；同一毫秒内按入库顺序（rowid）FIFO。
+
+实现方式：
+
+```text
+current_kind 有效、且该 kind 队列非空
+    -> 只在这个 kind 里按 (priority DESC, created_at ASC, rowid ASC) 取
+否则
+    -> 在所有 kind 里按同样的键选出「下一个任务」，用它的 kind 作为新的 current_kind
+```
+
+**同类清空是唯一的切换出口。** 明确接受「同类型持续涌入会饿死其它类型」
+这个代价（主人要求如此）：只要 tts 队列一直有任务，priority=999 的 separate
+也只能等着。已经 running 的任务不能被抢占，优先级只影响还在 `queued` 的任务。
+
+### 12.2.1 同类型并行（显存允许时）
+
+同一 `current_kind` 的多个任务可以同时跑；**不同 kind 仍然串行**（避免同一张
+卡上叠两套模型）。控制项：
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `LOCALAI_JOBS_PARALLEL_TTS` | `1` | TTS 同类并行上限 |
+| `LOCALAI_JOBS_PARALLEL_ASR` | `1` | ASR 同类并行上限 |
+| `LOCALAI_JOBS_PARALLEL_SEPARATE` | `1` | 人声分离同类并行上限 |
+| `LOCALAI_JOBS_PARALLEL_EXTRA_MB` | `600` | 每新增一个并行任务，要求额外预留的显存 |
+| `LOCALAI_JOBS_MAX_PARALLEL` | `1` | 总并发硬上限；`1` = 不额外限制，由每类上限决定 |
+
+派发规则：
+
+1. 第一个任务不检查显存（它负责按需加载模型，加载本身由显存管家把关）；
+2. 在已派发 1 个之后，每新增 1 个并行任务前检查：
+   `vram.snapshot().free_mb - margin_mb >= LOCALAI_JOBS_PARALLEL_EXTRA_MB`，
+   不够就只跑已经派发的那些，不新开（等已有任务结束再试）；
+3. 适配器的 `infer_lock` 已从单把 `asyncio.Lock` 换成**容量可调的并发闸门**：
+   容量 1 语义完全不变；容量 >1 时允许 N 个并发进入推理；
+4. 是否真的允许同模型并发由适配器的 `CAN_INFER_IN_PARALLEL` 决定。没有实测
+   确认的类型一律强制 1，并在启动日志与 `/capabilities` 里说明原因；
+5. 撞 CUDA OOM：立即把该 kind 的并行**临时降到 1**、卸载其它模型腾空间、
+   只重试这一条任务一次；仍失败则任务 `failed`，进程不崩。
+
+#### 实测数据（RTX 3070 8G，2026-11-08）
+
+方法：同一进程内直接调用真实适配器（绕开 HTTP 开销），每组用真实模型跑；
+显存峰值每 150ms 用 `nvidia-smi` 采样，记录整卡 `used`。TTS 用 4 条短句，
+ASR 用 4 条 3.07 / 4.11 / 7.63 / 9.69 秒 wav，分离用 2 条 9.69 / 10.37 秒音频。
+
+| 类型 | 并行度 | 总耗时 | 峰值显存（整卡 used） | 是否有收益 |
+| --- | --- | --- | --- | --- |
+| TTS（4 条短句） | 1 | 8.53 s | 6439 MB | — |
+| TTS（4 条短句） | 2 | 8.06 s（-5.5%） | 6459 MB | 否（<10%，噪声级） |
+| ASR（4 条 3~10s） | 1 | 0.324 s（3 次中位） | 1887 MB | — |
+| ASR（4 条 3~10s） | 2 | 0.315 s（-3%） | 1917 MB | 否（引擎锁串行） |
+| ASR（对照：临时去掉引擎 `_INFER_LOCK`） | 2 | 0.227 s（-30%） | 1917 MB | 是（但需改引擎） |
+| 分离（2 条约 10s） | 1 | 0.862 s（3 次中位） | 1633 MB | — |
+| 分离（2 条约 10s） | 2 | 0.717~0.825 s（不稳定） | 1633 MB | 否（不稳定） |
+
+结论与默认值：
+
+- **TTS = 1**：并行 2 的总耗时只降 5.5%，没有超过 10% 的吞吐收益；而且
+  `engine/engine.py` 内部有 `_INFER_LOCK`、随机种子是模块级状态，并发不安全。
+- **ASR = 1**：适配器层允许 2 个任务进入，但 `engine/asr_engine.py` 内部仍有
+  一把 `_INFER_LOCK`，真实推理依然串行（总耗时只降 3%）。对照实验说明
+  **模型本身可以并发**（去掉引擎锁后 -30%），但本次只改服务层，没有动原生
+  引擎，所以默认仍为 1。要真正启用必须先放开 `engine/asr_engine.py` 的推理锁，
+  再设 `LOCALAI_JOBS_PARALLEL_ASR=2`，并同步把适配器的
+  `CAN_INFER_IN_PARALLEL` 打开。
+- **分离 = 1**：并行 2 的收益不稳定，且引擎内部同样有锁。
+
+> 调度层的并行能力本身已经实现并用测试验证：用假执行器（不加载模型）时，
+> `LOCALAI_JOBS_PARALLEL_ASR=2` 下 4 个 ASR 任务的 `running` 峰值确实到 2，
+> 显存检查不通过时自动回落到 1（见 `tests/test_jobs.py` 的 d 组）。
+> 真实模型统一为 1 是实测结论，不是没实现。
+
+### 12.2.2 超时、崩溃恢复与其它开关
+
 5. **超时**：`LOCALAI_JOB_TIMEOUT`（默认 600 秒）到点置 `failed`，
-   并等底层 GPU 调用真正退出后才跑下一个（GPU 调用无法从线程里强杀）。
+   并等底层 GPU 调用真正退出后才释放名额（GPU 调用无法从线程里强杀）。
 6. **崩溃恢复**：启动时把上次遗留的 `running` 按
    `LOCALAI_JOBS_RECOVER=requeue|fail`（默认 `requeue`）重新排队或判失败。
-
-可用环境变量：
 
 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `LOCALAI_JOBS_RECOVER` | `requeue` | 重启时 running 的处理方式 |
-| `LOCALAI_JOBS_AGING_SECONDS` | `60` | 老化提权间隔；0=关闭 |
-| `LOCALAI_JOBS_MAX_PARALLEL` | `1` | 预留并发度 |
+| `LOCALAI_JOBS_MAX_PARALLEL` | `1` | 总并发硬上限（`1`=不额外限制） |
+| `LOCALAI_JOBS_PARALLEL_TTS` | `1` | TTS 同类并行上限 |
+| `LOCALAI_JOBS_PARALLEL_ASR` | `1` | ASR 同类并行上限 |
+| `LOCALAI_JOBS_PARALLEL_SEPARATE` | `1` | 分离同类并行上限 |
+| `LOCALAI_JOBS_PARALLEL_EXTRA_MB` | `600` | 每个新增并行任务预留显存（MB） |
 | `LOCALAI_JOB_TIMEOUT` | `600` | 单任务超时（秒） |
 | `LOCALAI_JOBS_KEEP_UPLOADS` | `0` | 任务完成后是否保留上传文件 |
 | `LOCALAI_JOBS_POLL` | `0.2` | 调度器空转轮询间隔（秒） |
@@ -563,8 +636,15 @@ failed / canceled）后默认删除，`LOCALAI_JOBS_KEEP_UPLOADS=1` 可保留。
     "batch_streak": 4,
     "loaded_model": "IndexTTS-2.5",
     "running_job_id": "…",
+    "running_job_ids": ["…"],
+    "running": 1,
     "max_parallel": 1,
-    "aging_seconds": 60,
+    "per_kind_parallel": {"tts": 1, "asr": 1, "separate": 1, "speaker": 1, "media": 1},
+    "parallel_extra_mb": 600,
+    "parallel_degraded": {},
+    "concurrency": {
+      "tts": {"name": "tts", "capacity": 1, "in_use": 1, "peak": 1, "reason": ""}
+    },
     "timeout_seconds": 600.0,
     "recover_mode": "requeue",
     "paused": false
@@ -575,13 +655,19 @@ failed / canceled）后默认删除，`LOCALAI_JOBS_KEEP_UPLOADS=1` 可保留。
 - `by_kind` 是**全部历史任务**按 kind 计数（不是只统计排队中的）；
   需要看排队/运行中的分布用 `queued_by_kind` / `running_by_kind`；
 - `avg_wait_ms` = 平均（started_at - created_at）；`avg_run_ms` = 平均
-  （finished_at - started_at）；没有样本时为 0。
+  （finished_at - started_at）；没有样本时为 0；
+- `per_kind_parallel` 是**当前生效**的每类并行度（配置 + 能力限制 + OOM 降级后的值）；
+- `parallel_degraded` 记录撞过 CUDA OOM、被临时降为 1 的 kind 及原因；
+- `concurrency` 是每个能力推理闸门的实时状态（容量 / 占用 / 峰值）；
+- **没有 `aging_seconds`**（老化逻辑已彻底删除）。
 
 ### 12.8 观测
 
 - 日志（`logs/service.*.log`）每个任务一行开始/结束：
-  `id / kind / action / model / 等待 ms / 执行 ms / 显存 free/total`；
-- 切换 kind 时记一行：`调度切换：tts→separate（批次 5/2）`；
+  `id / kind / action / model / 等待 ms / 执行 ms / 显存 free/total / 并发 n/N`；
+- 切换 kind 时记一行：
+  `调度切换：tts→separate（批次 5/2；同类队列已清空是唯一切换出口）`；
+- 并行撞 OOM 时记一行：`显存不足降级：asr 同类并行临时降为 1 …`；
 - `GET /health` 新增：
 
 ```json
@@ -591,8 +677,12 @@ failed / canceled）后默认删除，`LOCALAI_JOBS_KEEP_UPLOADS=1` 可保留。
 - `GET /capabilities` 新增：
 
 ```json
-"jobs": {"enabled": true, "sync_endpoints_use_queue": true, "max_parallel": 1,
-         "aging_seconds": 60, "timeout_seconds": 600.0, "recover": "requeue"}
+"jobs": {"enabled": true, "sync_endpoints_use_queue": true,
+         "order": "kind_first > priority > created_at（无 aging）",
+         "max_parallel": 1,
+         "per_kind_parallel": {"tts": 1, "asr": 1, "separate": 1, "speaker": 1, "media": 1},
+         "parallel_extra_mb": 600,
+         "timeout_seconds": 600.0, "recover": "requeue"}
 ```
 
 ### 12.9 注意
@@ -603,4 +693,7 @@ failed / canceled）后默认删除，`LOCALAI_JOBS_KEEP_UPLOADS=1` 可保留。
 - 参数错误（格式/语言/模型/stems）仍然在入队前返回 400，不会产生任务记录。
 - 声纹 `/speakers/*` 与媒体 `/media/*` 仍是直接调用、不入队（它们不是
   长任务，语义保持不变）。
+- **饿死风险**：同类型持续涌入时，其它类型会一直排队（没有 aging 提权）。
+  这是主人明确要求的取舍；调用方如果在意延迟，应自己控制提交节奏，
+  或把任务拆到不同服务实例。
 

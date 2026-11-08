@@ -35,8 +35,11 @@
 任务队列（详见 ``localai.jobs``）::
 
     LOCALAI_JOBS_RECOVER       重启后遗留 running 的处理：requeue（默认）/ fail
-    LOCALAI_JOBS_AGING_SECONDS 等待超过多少秒提 1 级优先级（默认 60）
-    LOCALAI_JOBS_MAX_PARALLEL  预留的并发度（默认 1；当前实现单 worker）
+    LOCALAI_JOBS_MAX_PARALLEL  总并发硬上限（默认 1 = 不额外限制，由每类并行度决定）
+    LOCALAI_JOBS_PARALLEL_TTS      TTS 同类并行上限（实测无收益，默认 1）
+    LOCALAI_JOBS_PARALLEL_ASR      ASR 同类并行上限（实测默认 1，原因见文档）
+    LOCALAI_JOBS_PARALLEL_SEPARATE 人声分离同类并行上限（实测无收益，默认 1）
+    LOCALAI_JOBS_PARALLEL_EXTRA_MB 每个新增并行任务需预留的显存（默认 600）
     LOCALAI_JOB_TIMEOUT        单个任务超时秒数（默认 600）
     LOCALAI_JOBS_KEEP_UPLOADS  任务完成后是否保留上传文件（默认 0=删除）
     LOCALAI_JOBS_POLL          调度器空转轮询间隔秒（默认 0.2）
@@ -200,8 +203,13 @@ class Config:
 
     # ---- 任务队列（新增，不影响旧配置） ---------------------------------
     jobs_recover: str = "requeue"
-    jobs_aging_seconds: int = 60
+    #: 总并发硬上限。1（默认）= 不额外限制，实际并发由下面每类并行度决定；
+    #: >=2 时再叠一道全局闸门（跨类仍串行，通常用不到）。
     jobs_max_parallel: int = 1
+    jobs_parallel_tts: int = 1
+    jobs_parallel_asr: int = 1
+    jobs_parallel_separate: int = 1
+    jobs_parallel_extra_mb: int = 600
     jobs_timeout: float = 600.0
     jobs_keep_uploads: bool = False
     jobs_poll_interval: float = 0.2
@@ -364,10 +372,15 @@ class Config:
                 == "fail"
                 else "requeue"
             ),
-            jobs_aging_seconds=max(
-                0, _pick_int(60, "LOCALAI_JOBS_AGING_SECONDS")
-            ),
             jobs_max_parallel=max(1, _pick_int(1, "LOCALAI_JOBS_MAX_PARALLEL")),
+            jobs_parallel_tts=max(1, _pick_int(1, "LOCALAI_JOBS_PARALLEL_TTS")),
+            jobs_parallel_asr=max(1, _pick_int(1, "LOCALAI_JOBS_PARALLEL_ASR")),
+            jobs_parallel_separate=max(
+                1, _pick_int(1, "LOCALAI_JOBS_PARALLEL_SEPARATE")
+            ),
+            jobs_parallel_extra_mb=max(
+                0, _pick_int(600, "LOCALAI_JOBS_PARALLEL_EXTRA_MB")
+            ),
             jobs_timeout=max(
                 1.0, _pick_float(600.0, "LOCALAI_JOB_TIMEOUT")
             ),
@@ -447,12 +460,41 @@ class Config:
                 "db_path": str(self.jobs_db_path),
                 "upload_dir": str(self.jobs_upload_dir),
                 "recover": self.jobs_recover,
-                "aging_seconds": self.jobs_aging_seconds,
                 "max_parallel": self.jobs_max_parallel,
+                "per_kind_parallel": self.jobs_parallel_map(),
+                "parallel_extra_mb": self.jobs_parallel_extra_mb,
                 "timeout_seconds": self.jobs_timeout,
                 "keep_uploads": self.jobs_keep_uploads,
             },
         }
+
+    # ---- 任务队列并发度 -------------------------------------------------
+    def jobs_parallel_for(self, kind: str) -> int:
+        """某类任务的配置并行上限（未单独配置的能力固定 1）。"""
+        return {
+            "tts": self.jobs_parallel_tts,
+            "asr": self.jobs_parallel_asr,
+            "separate": self.jobs_parallel_separate,
+        }.get(kind, 1)
+
+    def jobs_parallel_map(self) -> dict[str, int]:
+        """所有能力当前配置的并行上限（给 /jobs/stats、/capabilities）。"""
+        return {
+            "tts": self.jobs_parallel_tts,
+            "asr": self.jobs_parallel_asr,
+            "separate": self.jobs_parallel_separate,
+            "speaker": 1,
+            "media": 1,
+        }
+
+    def jobs_global_cap(self) -> Optional[int]:
+        """总并发硬上限；``None`` 表示不额外限制（由每类并行度决定）。
+
+        ``LOCALAI_JOBS_MAX_PARALLEL`` 默认 1：沿用旧值「1」表示「不额外限制」，
+        避免旧脚本把它当成「只能跑一个」而把同类型并行整个关掉。显式设成
+        2 及以上时才作为全局硬上限生效。
+        """
+        return self.jobs_max_parallel if self.jobs_max_parallel > 1 else None
 
 
 # 进程级唯一配置。导入时即把路径写回环境变量，保证后面任何模块

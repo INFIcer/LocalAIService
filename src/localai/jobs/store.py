@@ -163,6 +163,7 @@ class JobStore:
     @staticmethod
     def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         item = dict(row)
+        item.pop("_rowid", None)  # pick_next 的排序辅助列，不对外暴露
         item["payload"] = _json_loads(item.get("payload")) or {}
         item["result"] = _json_loads(item.get("result"))
         item["meta"] = _json_loads(item.get("meta")) or {}
@@ -363,67 +364,42 @@ class JobStore:
         self,
         *,
         current_kind: Optional[str],
-        aging_seconds: int,
-        now: Optional[datetime] = None,
     ) -> Optional[dict[str, Any]]:
-        """调度器选下一个任务：优先级 + 老化 + 同 kind 批处理。
+        """调度器选下一个任务：**同类型优先 > 优先级 > 提交时间**（没有 aging）。
 
         规则（与 ``docs/SERVICE_API.md`` 一致）::
 
-            有效优先级 = priority + floor(已等待秒数 / aging_seconds)
-            1. 没有 current_kind：取有效优先级最高、created_at 最早的任务；
-            2. current_kind 还有排队任务：
-               - 若别的 kind 的最高有效优先级 **严格大于** 当前 kind，
-                 切过去（防止高优先级任务被批处理饿死）；
-               - 否则继续当前 kind（同模型连续跑，减少加载/卸载）。
-        """
-        return await asyncio.to_thread(
-            self._pick_next_sync, current_kind, max(0, int(aging_seconds)), now
-        )
+            排序键 = (priority DESC, created_at ASC, rowid ASC)
+            1. current_kind 有效、且该 kind 队列非空
+               -> 只在这个 kind 里按排序键取（别的 kind 优先级再高也不切走）；
+            2. 否则在所有 kind 里按排序键取一个，它的 kind 成为新的 current_kind。
 
-    def _pick_next_sync(
-        self,
-        current_kind: Optional[str],
-        aging_seconds: int,
-        now: Optional[datetime],
-    ) -> Optional[dict[str, Any]]:
+        这就是「同类型优先」的全部实现：当前 kind 只要还有排队任务，就绝不
+        切换到别的类型；只有同类彻底清空（唯一的切换出口）才会换 kind。
+        代价是同类型持续涌入时其它类型会被饿死 —— 这是明确接受的取舍，
+        没有 aging、没有提权。
+
+        ``rowid`` 只做同毫秒提交的 FIFO 兜底（``created_at`` 是毫秒精度）。
+        """
+        return await asyncio.to_thread(self._pick_next_sync, current_kind)
+
+    def _pick_next_sync(self, current_kind: Optional[str]) -> Optional[dict[str, Any]]:
         with self._lock:
             rows = self._connection().execute(
-                "SELECT * FROM jobs WHERE state = 'queued'"
+                "SELECT rowid AS _rowid, * FROM jobs WHERE state = 'queued'"
             ).fetchall()
         if not rows:
             return None
-        current_time = now or datetime.now().astimezone()
 
-        def effective(row: sqlite3.Row) -> float:
-            priority = float(row["priority"] or 0)
-            created = _parse_iso(row["created_at"])
-            if aging_seconds <= 0 or created is None:
-                return priority
-            waited = max(0.0, (current_time - created).total_seconds())
-            return priority + waited // aging_seconds
+        def order(row: sqlite3.Row) -> tuple[int, str, int]:
+            return (
+                -int(row["priority"] or 0),
+                row["created_at"] or "",
+                int(row["_rowid"]),
+            )
 
-        def order(row: sqlite3.Row) -> tuple[float, str, str]:
-            return (-effective(row), row["created_at"] or "", row["id"])
-
-        candidates = [row for row in rows]
-        if current_kind:
-            same = [row for row in candidates if row["kind"] == current_kind]
-            others = [row for row in candidates if row["kind"] != current_kind]
-            if same:
-                if others:
-                    best_other = max(effective(row) for row in others)
-                    best_same = max(effective(row) for row in same)
-                    if best_other > best_same:
-                        chosen = min(others, key=order)
-                    else:
-                        chosen = min(same, key=order)
-                else:
-                    chosen = min(same, key=order)
-            else:
-                chosen = min(candidates, key=order)
-        else:
-            chosen = min(candidates, key=order)
+        same = [row for row in rows if row["kind"] == current_kind] if current_kind else []
+        chosen = min(same, key=order) if same else min(rows, key=order)
         return self._row_to_dict(chosen)
 
     async def queued_count(self, kind: Optional[str] = None) -> int:

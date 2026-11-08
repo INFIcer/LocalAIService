@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import threading
 import time
@@ -14,6 +13,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Optional
 
 from ..config import Config, get_config
+from ..core.concurrency import ConcurrencyGate
 
 logger = logging.getLogger("localai.engines")
 
@@ -35,9 +35,31 @@ class BaseAdapter(ABC):
     #: 对外暴露的 HTTP 路径（/capabilities 用来自发现）
     ENDPOINTS: tuple[str, ...] = ()
 
+    #: 是否实测确认「同一个已加载模型可以同时跑多次推理」。
+    #: 默认 False：没实测过的能力一律强制串行（容量 1），宁可不快也不能崩。
+    CAN_INFER_IN_PARALLEL: bool = False
+    #: 并发能力说明（写进日志 / /capabilities，解释为什么被限制成 1）
+    PARALLEL_NOTE: str = "未实测可并发，强制串行"
+
     def __init__(self, cfg: Optional[Config] = None) -> None:
         self.cfg = cfg or get_config()
-        self.infer_lock = asyncio.Lock()
+        requested = int(self.cfg.jobs_parallel_for(self.name))
+        effective = requested if self.CAN_INFER_IN_PARALLEL else 1
+        self.infer_lock = ConcurrencyGate(
+            self.name or type(self).__name__, capacity=effective
+        )
+        #: 配置里要求的并行度（可能被能力限制否决）
+        self.parallel_requested = requested
+        #: 实际生效的并行度
+        self.parallel_capacity = effective
+        self.parallel_note = self.PARALLEL_NOTE
+        if requested > 1 and effective == 1:
+            logger.warning(
+                "能力 %s 配置了并行度 %d，但该模型未确认可并发（%s），强制按 1 串行",
+                self.name,
+                requested,
+                self.PARALLEL_NOTE,
+            )
         self._module: Any = None
         self._module_lock = threading.Lock()
         self._last_activity: float = 0.0
@@ -132,6 +154,14 @@ class BaseAdapter(ABC):
             "idle_unload_seconds": self.idle_unload_seconds(),
             "idle_seconds": None if idle is None else round(idle, 1),
             "estimate_mb": self.estimate_mb() if self.requires_gpu else 0,
+            "parallel": {
+                "requested": self.parallel_requested,
+                "capacity": self.parallel_capacity,
+                "can_infer_in_parallel": self.CAN_INFER_IN_PARALLEL,
+                "note": self.parallel_note,
+                "running": self.infer_lock.in_use,
+                "peak": self.infer_lock.peak,
+            },
             "detail": status.get("detail"),
             "endpoints": list(self.ENDPOINTS),
         }

@@ -300,7 +300,10 @@ priority=0
 ```
 
 - `priority`：默认 0，越大越先；负数表示「不着急」。
-- 服务端会按 kind 批处理（同类任务连续跑），所以提交顺序不等于完成顺序。
+- 排序严格三层：**同类型优先 > `priority` > 提交时间**（没有 aging 提权）。
+  服务端会先把当前 kind 的排队任务跑完才切换类型，所以提交顺序不等于完成顺序；
+  同类任务一直有积压时，其它类型会被饿死（这是有意的取舍）。
+- 已经 `running` 的任务不会被后来的高优先级任务抢占；`priority` 只影响 `queued`。
 - 上传文件落在服务端 `data/uploads/<job_id>/`，任务结束后默认删除；
   插件**不要**依赖这些路径长期存在。
 
@@ -322,7 +325,8 @@ GET /jobs/{id}
   不要 50ms 一次地打，也不要无限轮询（超过 `LOCALAI_JOB_TIMEOUT` 会失败）。
 - 只想看最近任务：`GET /jobs?state=queued&kind=tts&limit=20`；
 - 队列压力：`GET /jobs/stats`（`queued`、`running`、`by_kind`、
-  `oldest_queued_seconds`、`scheduler.current_kind`）。
+  `oldest_queued_seconds`、`scheduler.current_kind`、
+  `scheduler.per_kind_parallel`；没有 `aging_seconds`）。
 
 ### 5.3 取结果
 

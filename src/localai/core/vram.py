@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from ..config import Config, get_config
+from .concurrency import exclusive
 from .errors import InsufficientVramError, is_cuda_oom
 
 logger = logging.getLogger("localai.vram")
@@ -48,18 +49,14 @@ FALLBACK_TOTAL_MB = 8192.0
 FALLBACK_BASE_MB = 800.0
 
 
-class _NullAsyncContext:
-    """没有推理锁时的空异步上下文（让调用方代码保持统一）。"""
-
-    async def __aenter__(self) -> None:
-        return None
-
-    async def __aexit__(self, exc_type, exc, tb) -> bool:
-        return False
-
-
 def _async_lock(lock: Any) -> Any:
-    return lock if lock is not None else _NullAsyncContext()
+    """卸载/加载时需要的「独占」上下文。
+
+    ``adapter.infer_lock`` 现在是容量可调的 :class:`ConcurrencyGate`：
+    ``async with gate`` 只占 1 个槽位，容量 > 1 时并不独占；卸载必须用
+    ``gate.exclusive()`` 等所有推理退出。旧式 ``asyncio.Lock`` 原样返回。
+    """
+    return exclusive(lock)
 
 
 @dataclass

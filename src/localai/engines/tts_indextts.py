@@ -55,6 +55,13 @@ class TtsAdapter(BaseAdapter):
     # TTS 的加载增量会被 WDDM 缓存复用低估，但推理峰值需要保守下限。
     MIN_ESTIMATE_MB = 6200
     ENDPOINTS = ("/tts", "/v1/audio/speech", "/api/v1/tts/tasks")
+    # 实测并行 2 无吞吐收益（4 条短句 8.53s -> 8.06s），且 engine/engine.py
+    # 内部还有 _INFER_LOCK、随机种子是模块级状态，强制串行。
+    CAN_INFER_IN_PARALLEL = False
+    PARALLEL_NOTE = (
+        "IndexTTS 引擎内部有 _INFER_LOCK 且种子/参考音频是模块级状态；"
+        "实测并行 2 无收益（8.53s→8.06s），强制串行"
+    )
 
     @property
     def loader_hint(self) -> str:

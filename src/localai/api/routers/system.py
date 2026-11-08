@@ -161,8 +161,10 @@ async def capabilities(request: Request) -> dict[str, Any]:
         "jobs": {
             "enabled": True,
             "sync_endpoints_use_queue": True,
+            "order": "kind_first > priority > created_at（无 aging）",
             "max_parallel": cfg.jobs_max_parallel,
-            "aging_seconds": cfg.jobs_aging_seconds,
+            "per_kind_parallel": cfg.jobs_parallel_map(),
+            "parallel_extra_mb": cfg.jobs_parallel_extra_mb,
             "timeout_seconds": cfg.jobs_timeout,
             "recover": cfg.jobs_recover,
         },
