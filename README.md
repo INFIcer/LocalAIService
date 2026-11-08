@@ -82,6 +82,11 @@ http://127.0.0.1:7880/ui
 切换模型档位、按分组修改配置（写 `<LOCALAI_HOME>/config.json`，只写改动项）、
 取消任务、启停开机自启、查看日志、二次确认后重启服务。
 
+任务页支持**双击任务行打开详情弹窗**（也可点「详情」按钮）：概要、请求参数原文、
+结果 JSON 与音频/图片预览、完整错误原文、created → started → finished 时间线，
+并可在弹窗内取消 queued/running 任务；弹窗打开期间列表自动刷新会暂停。
+细节见 [`docs/WEBUI.md`](docs/WEBUI.md#11-任务详情弹窗)。
+
 - 接口文档：[`docs/WEBUI.md`](docs/WEBUI.md)（含 `/admin/*` 清单与设置白名单）
 - `/admin/*` 受 `LOCALAI_TOKEN` 保护；`/ui` 与静态资源免鉴权，令牌只存浏览器 localStorage
 - 默认只监听 `127.0.0.1`；非回环地址时页面顶部会显示安全警告

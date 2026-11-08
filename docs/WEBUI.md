@@ -21,7 +21,7 @@ http://127.0.0.1:7880/ui
 | **概览** | GPU 显存进度条、各能力卡片（就绪/已加载/显存估算/当前模型/空闲卸载）、任务队列数字、最近 10 条任务、最近日志；每 3 秒自动刷新，可暂停 |
 | **模型** | 按能力分组的模型表格：名称、是否已下载、大小、是否当前档位、缺失文件；支持「下载」「切换档位」，下载中显示已写入字节/大小 |
 | **设置** | 按分组表单（服务 / 显存 / 空闲卸载 / 并发 / TTS / ASR / 翻译 / 媒体）；每项显示默认值、来源（env/file/default）、是否需要重启；只保存改动项 |
-| **任务** | `/jobs` 队列列表（状态 / 类型 / 优先级 / 等待 / 耗时）、状态筛选、取消、点击查看详情与结果 JSON |
+| **任务** | `/jobs` 队列列表（状态 / 类型 / 优先级 / 等待 / 耗时）、状态筛选、取消、**双击任务行打开详情弹窗**（请求参数 / 结果文件 / 错误原文 / 时间线） |
 | **系统** | 版本 / Python / GPU / 磁盘占用 / 监听地址、开机自启开关、重启服务（输入 `RESTART` 二次确认）、日志查看器（out/err、行数） |
 
 交互约定：
@@ -29,6 +29,36 @@ http://127.0.0.1:7880/ui
 - 所有操作都有 loading / 成功 / 失败提示；失败直接展示后端 JSON 的 `detail`；
 - 令牌只存在浏览器 `localStorage`，页面源码里没有真实 token；
 - 下载任务轮询 `GET /admin/models/tasks/{task_id}`，同一时刻只允许一个下载。
+
+### 1.1 任务详情弹窗
+
+**打开方式**：在「任务」页**双击任意任务行**；也可以点该行「操作」列里的「详情」按钮，
+或先用 Tab 把焦点移到任务行再按 Enter / 空格。概览页「最近任务」同样双击打开。
+移动端没有双击手势，用「详情」按钮即可。
+
+弹窗内容（纵向滚动的五个分区）：
+
+| 分区 | 显示内容 |
+| --- | --- |
+| **概要** | 任务 ID（一键复制）、类型 / 动作（如 `tts.synthesize`）、状态彩色徽章（失败/取消/超时会额外标注）、优先级、创建 / 开始 / 结束时间、等待时长、执行时长、尝试次数、客户端 IP；`meta.cancel_requested` 时显示「取消请求已发出」 |
+| **请求参数** | `payload` 里的文本类字段（`text` / `prompt` / `subtitle` / `ocr` / `transcript` / `content` …）**直接显示原文**并保留换行，可单独复制；下面折叠一份格式化 JSON，长内容可滚动 |
+| **结果** | `result` 的格式化 JSON；递归识别 `path` / `output_path` / `output` / `audio_path` / `file` / `stems` / `frames[]` 等字段里的本地绝对路径：**音频**（.wav/.mp3/.m4a …）给 `<audio controls>`，数据源是 `GET /jobs/{id}/result`；**图片**（.jpg/.png/.webp …）给缩略图（优先 `GET /jobs/{id}/result`，失败回退 `GET /vision/frame?path=…`）；**其它文件**只显示路径 + 「复制路径」。文件不可达时只显示路径，不会让整个弹窗报错 |
+| **错误** | `error` 原文，等宽字体、保留换行、一键复制；没有错误时显示「没有错误」。自动化测试产生的 `voice: "__definitely_missing__"` 之类在这里能完整看到，便于区分测试与真实故障；错误里含「超时 / timeout」时概要区会加「超时」徽章 |
+| **时间线** | created → started → finished 三段，未开始/进行中/已取消都有对应文案；取消的任务会提示「主动取消时 error 为空是正常的」 |
+
+**交互细节**：
+
+- 右上角 `×`、`Esc`、点击遮罩都能关闭；`Tab` 焦点被限制在弹窗内，关闭后焦点回到原任务行；
+- 弹窗打开期间**暂停任务列表的 3 秒自动刷新**（顶部「自动刷新」开关仍然有效），关闭后自动恢复；
+  弹窗内点「刷新详情」只刷新当前任务；
+- 状态是 `queued` / `running` 时底部显示「取消任务 / 请求取消」，调用
+  `POST /jobs/{id}/cancel`，成功后同时刷新详情和列表；终态任务隐藏该按钮；
+- 详情数据来自 `GET /jobs/{id}`；该请求失败时用列表行里已有的完整记录兜底，并在弹窗顶部
+  显示错误原因，不会整页崩；
+- 窄屏（≤820px）弹窗铺满全屏；深色主题与主界面一致；
+- 服务设置了 `LOCALAI_TOKEN` 时，音频/图片通过带 `Authorization` 头的 `fetch` 取成
+  Blob 再播放/预览，不把令牌拼进 URL。
+
 
 ---
 
@@ -122,9 +152,23 @@ curl.exe -s http://127.0.0.1:7880/admin/settings
 curl.exe -s http://127.0.0.1:7880/admin/models
 curl.exe -s http://127.0.0.1:7880/admin/system
 
+# 任务详情弹窗（前端资源里应包含这些函数/选择器）
+curl.exe -s http://127.0.0.1:7880/ui/app.js | Select-String "openJobDetail","modal-job","dblclick"
+
+# 任务详情接口
+curl.exe -s http://127.0.0.1:7880/jobs/<job_id>
+curl.exe -s -o result.bin -D - http://127.0.0.1:7880/jobs/<job_id>/result
+
 # 带令牌时
 curl.exe -s -H "Authorization: Bearer <token>" http://127.0.0.1:7880/admin/settings
 ```
 
+手动验收任务详情：在「任务」页双击一条 `done` 的 TTS 任务，确认弹窗里能看到
+`payload.text` 原文、音频播放器和 result JSON；再双击一条 `failed` 任务，确认
+`error` 原文完整（换行没丢）。打开弹窗后等待 5 秒以上，确认列表没有因自动刷新而
+重绘；关闭弹窗后列表恢复刷新。
+
 测试：`python -m pytest -q`（`tests/test_admin.py` 覆盖设置读写、白名单与范围、
-模型清单字段、档位切换、`/ui`、鉴权、restart 必须 confirm）。
+模型清单字段、档位切换、`/ui`、鉴权、restart 必须 confirm；
+`tests/test_jobs_detail.py` 覆盖任务详情字段、`/jobs/{id}/result` 的音频/图片/其它
+文件下发、目录白名单与 403/409、以及 `app.js` 里的详情弹窗标记）。

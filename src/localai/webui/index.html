@@ -121,15 +121,12 @@
           <span id="jobs-summary" class="hint"></span>
           <button id="jobs-refresh" class="ghost" type="button">刷新</button>
         </div>
+        <p class="hint jobs-hint">双击任意任务行（或点「详情」）打开任务详情：请求参数、结果文件、错误原文与时间线；弹窗打开期间自动刷新会暂停。</p>
         <div class="panel">
           <div class="table-wrap"><table>
             <thead><tr><th>提交时间</th><th>类型</th><th>状态</th><th>优先级</th><th>等待</th><th>耗时</th><th>操作</th></tr></thead>
             <tbody id="jobs-tbody"><tr><td colspan="7" class="empty">正在读取…</td></tr></tbody>
           </table></div>
-        </div>
-        <div class="panel">
-          <div class="panel-head"><h2>任务详情</h2><span class="hint">点击上方任意一行查看</span></div>
-          <pre id="job-detail" class="log-box">未选择任务</pre>
         </div>
       </section>
 
@@ -178,6 +175,30 @@
   </div>
 
   <div id="toast" class="toast hidden" role="status"></div>
+
+  <!-- 任务详情弹窗：双击任务行打开 -->
+  <div id="modal-job" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="job-modal-title">
+    <div class="modal-box job-modal" role="document">
+      <div class="job-modal-head">
+        <div class="job-modal-title">
+          <h2 id="job-modal-title">任务详情</h2>
+          <span id="job-modal-sub" class="hint mono"></span>
+        </div>
+        <button id="job-modal-close" class="ghost small" type="button" aria-label="关闭任务详情">✕</button>
+      </div>
+      <div id="job-modal-body" class="job-modal-body" tabindex="-1">
+        <div class="empty">正在读取…</div>
+      </div>
+      <div class="job-modal-foot">
+        <span id="job-modal-meta" class="hint"></span>
+        <div class="job-modal-actions">
+          <button id="job-modal-cancel" class="danger small" type="button" disabled>取消任务</button>
+          <button id="job-modal-refresh" class="ghost small" type="button">刷新详情</button>
+          <button id="job-modal-close2" class="primary small" type="button">关闭</button>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <!-- 令牌弹窗 -->
   <div id="modal-token" class="modal hidden">

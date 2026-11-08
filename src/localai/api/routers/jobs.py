@@ -38,7 +38,8 @@ logger = logging.getLogger("localai.api.jobs")
 
 router = APIRouter(tags=["jobs"])
 
-_AUDIO_SUFFIXES = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".opus", ".aac"}
+#: ``result`` 里可能存放产物路径的字段，按优先级依次尝试。
+_RESULT_PATH_KEYS = ("path", "output_path", "output", "audio_path", "file")
 
 
 def _public(job: dict[str, Any], *, with_ok: bool = False) -> dict[str, Any]:
@@ -51,6 +52,53 @@ def _public(job: dict[str, Any], *, with_ok: bool = False) -> dict[str, Any]:
 
 def _not_found(job_id: str) -> HTTPException:
     return HTTPException(status_code=404, detail=f"任务不存在：{job_id}")
+
+
+def _result_roots(cfg: Any) -> list[Path]:
+    """``/jobs/{id}/result`` 允许读取的根目录：输出、下载、任务上传。"""
+    roots: list[Path] = []
+    for base in (cfg.output_dir, cfg.downloads_dir, cfg.jobs_upload_dir):
+        try:
+            roots.append(Path(base).resolve())
+        except (OSError, RuntimeError):
+            continue
+    return roots
+
+
+def _is_within(path: Path, base: Path) -> bool:
+    try:
+        path.relative_to(base)
+        return True
+    except ValueError:
+        return False
+
+
+def _locate_result_file(cfg: Any, result: dict[str, Any]) -> tuple[Optional[Path], str]:
+    """在 ``result`` 里找可下发的产物文件。
+
+    返回 ``(path, error)``：
+    - ``path`` 非空：文件存在且位于允许目录，直接下发；
+    - ``error`` 非空：路径存在但越出允许目录（403），或路径非法；
+    - 两者都为空：没有可下发的文件，接口回退到 JSON 结果。
+    """
+    roots = _result_roots(cfg)
+    for key in _RESULT_PATH_KEYS:
+        raw = result.get(key)
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        try:
+            resolved = Path(raw.strip()).expanduser().resolve()
+        except (OSError, RuntimeError) as exc:
+            return None, f"结果路径不合法：{exc}"
+        if not resolved.is_file():
+            continue
+        if not any(_is_within(resolved, root) for root in roots):
+            return None, (
+                "任务结果文件不在允许的目录（outputs/、data/downloads/、"
+                f"data/uploads/）下，已拒绝读取：{resolved}"
+            )
+        return resolved, ""
+    return None, ""
 
 
 def _queued_response(job_id: str) -> dict[str, Any]:
@@ -334,7 +382,7 @@ async def cancel_job(job_id: str, request: Request) -> dict[str, Any]:
     }
 
 
-@router.get("/jobs/{job_id}/result", summary="取任务结果；音频直接返回文件")
+@router.get("/jobs/{job_id}/result", summary="取任务结果；结果文件直接返回（音频/图片/其它按 MIME）")
 async def job_result(job_id: str, request: Request):
     store = get_jobs_store(request)
     job = await store.get(job_id)
@@ -352,15 +400,25 @@ async def job_result(job_id: str, request: Request):
             },
         )
     result = job.get("result") or {}
-    raw_path = result.get("path") or result.get("output_path")
-    if raw_path:
-        path = Path(str(raw_path))
-        if path.is_file() and path.suffix.lower() in _AUDIO_SUFFIXES:
-            media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-            return FileResponse(
-                path,
-                media_type=media_type,
-                filename=path.name,
-                headers={"Cache-Control": "no-store"},
-            )
+    path, path_error = _locate_result_file(get_cfg(request), result)
+    if path_error:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "ok": False,
+                "id": job_id,
+                "state": "done",
+                "error": "result_path_not_allowed",
+                "detail": path_error,
+            },
+        )
+    if path is not None:
+        media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        return FileResponse(
+            path,
+            media_type=media_type,
+            filename=path.name,
+            content_disposition_type="inline",
+            headers={"Cache-Control": "no-store"},
+        )
     return JSONResponse({"ok": True, "id": job_id, "state": "done", "result": result})

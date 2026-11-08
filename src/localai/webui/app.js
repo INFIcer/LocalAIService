@@ -16,6 +16,13 @@ const state = {
   jobs: [],
   system: null,
   restartPolling: false,
+  jobDetailOpen: false,
+  jobDetailId: null,
+  jobDetailData: null,
+  jobDetailBlobs: [],
+  jobDetailReturnFocus: null,
+  lastJobInteraction: 0,
+  copyPayloads: {},
 };
 
 const VIEW_META = {
@@ -342,7 +349,8 @@ function renderRecentJobs(data) {
     if (started && finished) elapsed = fmtDuration((finished - started) / 1000);
     else if (started) elapsed = fmtDuration((now - started.getTime()) / 1000);
     return `
-      <tr class="clickable" data-job-id="${escapeHtml(job.id)}">
+      <tr class="clickable" data-job-id="${escapeHtml(job.id)}" tabindex="0" role="button"
+          aria-label="任务 ${escapeHtml(job.id)}，按回车或单击查看详情">
         <td title="${escapeHtml(job.id)}">${escapeHtml(timeAgo(job.created_at))}</td>
         <td>${escapeHtml(job.kind || "")}</td>
         <td>${statePill(job.state)}</td>
@@ -350,9 +358,17 @@ function renderRecentJobs(data) {
       </tr>`;
   }).join("");
   $$("#recent-jobs tr[data-job-id]").forEach((row) => {
+    const jobId = row.dataset.jobId;
     row.addEventListener("click", () => {
       switchView("jobs");
-      showJobDetail(row.dataset.jobId);
+      openJobDetail(jobId);
+    });
+    row.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        switchView("jobs");
+        openJobDetail(jobId);
+      }
     });
   });
 }
@@ -725,19 +741,38 @@ async function loadJobs() {
     else if (started) duration = fmtDuration((now - started.getTime()) / 1000);
     const terminal = ["done", "failed", "canceled"].includes(job.state);
     return `
-      <tr class="clickable" data-job-id="${escapeHtml(job.id)}">
+      <tr class="clickable job-row" data-job-id="${escapeHtml(job.id)}" tabindex="0"
+          role="button" aria-label="任务 ${escapeHtml(job.id)}，按回车或双击查看详情">
         <td title="${escapeHtml(job.id)}">${escapeHtml(fmtClock(job.created_at))}</td>
         <td>${escapeHtml(job.kind)}<div class="path">${escapeHtml(job.action || "")}</div></td>
         <td>${statePill(job.state)}</td>
         <td>${escapeHtml(job.priority == null ? 0 : job.priority)}</td>
         <td>${escapeHtml(wait)}</td>
         <td>${escapeHtml(duration)}</td>
-        <td>${terminal ? '<span class="faint">—</span>' : `<button class="small danger" data-cancel="${escapeHtml(job.id)}">取消</button>`}</td>
+        <td>
+          <div class="actions">
+            <button class="small ghost" data-detail="${escapeHtml(job.id)}" type="button">详情</button>
+            ${terminal ? '<span class="faint">—</span>' : `<button class="small danger" data-cancel="${escapeHtml(job.id)}" type="button">取消</button>`}
+          </div>
+        </td>
       </tr>`;
   }).join("");
 
   $$("#jobs-tbody tr[data-job-id]").forEach((row) => {
-    row.addEventListener("click", () => showJobDetail(row.dataset.jobId));
+    const jobId = row.dataset.jobId;
+    row.addEventListener("dblclick", () => openJobDetail(jobId));
+    row.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        openJobDetail(jobId);
+      }
+    });
+  });
+  $$("#jobs-tbody [data-detail]").forEach((btn) => {
+    btn.addEventListener("click", (event) => {
+      event.stopPropagation();
+      openJobDetail(btn.dataset.detail);
+    });
   });
   $$("#jobs-tbody [data-cancel]").forEach((btn) => {
     btn.addEventListener("click", (event) => {
@@ -747,14 +782,444 @@ async function loadJobs() {
   });
 }
 
-async function showJobDetail(jobId) {
-  const box = $("#job-detail");
-  box.textContent = `正在读取任务 ${jobId}…`;
+/* ------------------------------------------------------------------ */
+/* 任务详情弹窗                                                       */
+/* ------------------------------------------------------------------ */
+const AUDIO_RE = /\.(wav|mp3|m4a|flac|ogg|opus|aac)$/i;
+const IMAGE_RE = /\.(png|jpe?g|webp|gif|bmp)$/i;
+const TEXT_KEY_RE = /(text|prompt|subtitle|ocr|transcript|content|query|note|description|summary)/i;
+
+function fmtMaybe(value) {
+  return value == null || value === "" ? "--" : String(value);
+}
+
+function copyButton(text, label = "复制") {
+  const key = `copy-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+  state.copyPayloads[key] = String(text == null ? "" : text);
+  return `<button class="small ghost" type="button" data-copy-key="${key}">${escapeHtml(label)}</button>`;
+}
+
+async function copyText(text) {
   try {
-    const data = await api(`/jobs/${encodeURIComponent(jobId)}`);
-    box.textContent = JSON.stringify(data, null, 2);
+    await navigator.clipboard.writeText(text);
+    toast("已复制到剪贴板", "ok", 1600);
+    return;
   } catch (err) {
-    box.textContent = `读取失败：${err.message || String(err)}`;
+    // 非 https / 旧浏览器没有 clipboard API，退回隐藏 textarea。
+  }
+  const area = document.createElement("textarea");
+  area.value = text;
+  area.style.position = "fixed";
+  area.style.opacity = "0";
+  document.body.appendChild(area);
+  area.select();
+  try {
+    document.execCommand("copy");
+    toast("已复制到剪贴板", "ok", 1600);
+  } catch (err) {
+    toast("复制失败，请手动选中文本", "error");
+  } finally {
+    area.remove();
+  }
+}
+
+function jsonBlock(value, emptyText = "（空）") {
+  if (value == null || (typeof value === "object" && !Object.keys(value).length)) {
+    return `<div class="empty">${escapeHtml(emptyText)}</div>`;
+  }
+  const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  return `<pre class="log-box detail-json">${escapeHtml(text)}</pre>`;
+}
+
+function collectTextFields(obj, prefix = "", out = []) {
+  if (!obj || typeof obj !== "object" || out.length >= 12) return out;
+  Object.entries(obj).forEach(([key, value]) => {
+    const full = prefix ? `${prefix}.${key}` : key;
+    if (typeof value === "string" && value.trim() && TEXT_KEY_RE.test(key)) {
+      out.push([full, value]);
+    } else if (value && typeof value === "object" && !Array.isArray(value) && prefix.split(".").length < 2) {
+      collectTextFields(value, full, out);
+    }
+  });
+  return out;
+}
+
+function renderTextFields(payload) {
+  const fields = collectTextFields(payload);
+  if (!fields.length) return "";
+  return `<div class="detail-texts">${fields.map(([key, value]) => `
+    <div class="detail-text-field">
+      <div class="detail-text-label">${escapeHtml(key)} ${copyButton(value, "复制原文")}</div>
+      <pre class="detail-text">${escapeHtml(value)}</pre>
+    </div>`).join("")}</div>`;
+}
+
+function looksLikePath(text) {
+  return typeof text === "string" &&
+    text.length > 1 &&
+    !/[\r\n]/.test(text) &&
+    (/^[A-Za-z]:[\\/]/.test(text) || text.startsWith("\\\\") || text.startsWith("/"));
+}
+
+function collectResultPaths(value, out = [], depth = 0) {
+  if (depth > 6 || value == null) return out;
+  if (typeof value === "string") {
+    if (looksLikePath(value) && !out.some((item) => item.path === value)) {
+      out.push({ path: value });
+    }
+    return out;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectResultPaths(item, out, depth + 1));
+    return out;
+  }
+  if (typeof value === "object") {
+    Object.values(value).forEach((item) => collectResultPaths(item, out, depth + 1));
+  }
+  return out;
+}
+
+function primaryResultPath(job) {
+  const result = (job && job.result) || {};
+  for (const key of ["path", "output_path", "output", "audio_path", "file"]) {
+    if (typeof result[key] === "string" && result[key]) return result[key];
+  }
+  return "";
+}
+
+function renderResultFiles(job) {
+  const paths = collectResultPaths(job.result);
+  if (!paths.length) {
+    return '<div class="hint">结果里没有可识别的本地文件路径。</div>';
+  }
+  const primary = primaryResultPath(job);
+  return `<div class="detail-files">${paths.map(({ path }) => {
+    const isPrimary = primary && path === primary;
+    let tag = "文件";
+    let media = '<div class="hint">此类型不内嵌预览，可复制路径后在本地打开。</div>';
+    if (AUDIO_RE.test(path)) {
+      tag = "音频";
+      media = isPrimary
+        ? '<audio class="detail-audio" controls preload="none" data-primary-audio></audio><div class="hint" data-media-note>正在加载音频…</div>'
+        : '<div class="hint">该音频不是任务主结果，无法直接串流；可复制路径在本地播放。</div>';
+    } else if (IMAGE_RE.test(path)) {
+      tag = "图片";
+      if (isPrimary) {
+        media = '<img class="detail-thumb" alt="任务结果图片" data-primary-image hidden><div class="hint" data-media-note>正在加载缩略图…</div>';
+      } else {
+        media = `<img class="detail-thumb" alt="结果图片" data-frame-path="${escapeHtml(path)}" hidden><div class="hint" data-media-note>正在加载缩略图…</div>`;
+      }
+    }
+    return `<div class="detail-file">
+      <div class="detail-file-head"><span class="tag">${tag}</span><span class="detail-file-path mono">${escapeHtml(path)}</span></div>
+      ${media}
+      <div class="actions">${copyButton(path, "复制路径")}</div>
+    </div>`;
+  }).join("")}</div>`;
+}
+
+async function fetchBlob(path) {
+  const headers = {};
+  if (state.token) headers.Authorization = `Bearer ${state.token}`;
+  const response = await fetch(path, { headers, cache: "no-store" });
+  if (!response.ok) {
+    let detail = `HTTP ${response.status}`;
+    try {
+      const body = await response.json();
+      detail = (body && (body.detail || body.error)) || detail;
+    } catch (err) {
+      // 非 JSON（例如 401 空响应）直接用状态码。
+    }
+    throw new Error(String(detail));
+  }
+  return response.blob();
+}
+
+function trackBlobUrl(blob) {
+  const url = URL.createObjectURL(blob);
+  state.jobDetailBlobs.push(url);
+  return url;
+}
+
+function revokeJobBlobs() {
+  (state.jobDetailBlobs || []).forEach((url) => {
+    try { URL.revokeObjectURL(url); } catch (err) { /* 已释放则忽略 */ }
+  });
+  state.jobDetailBlobs = [];
+}
+
+async function attachJobMedia(job) {
+  revokeJobBlobs();
+  const body = $("#job-modal-body");
+  if (!body) return;
+  const resultEndpoint = `/jobs/${encodeURIComponent(job.id)}/result`;
+  const primary = primaryResultPath(job);
+
+  const audio = $("[data-primary-audio]", body);
+  if (audio && primary && AUDIO_RE.test(primary)) {
+    const note = audio.parentElement ? audio.parentElement.querySelector("[data-media-note]") : null;
+    try {
+      const blob = await fetchBlob(resultEndpoint);
+      if (blob.type.startsWith("audio/")) {
+        audio.src = trackBlobUrl(blob);
+        if (note) note.textContent = `${blob.type} · ${fmtBytes(blob.size)}`;
+      } else if (note) {
+        note.textContent = "该接口没有返回音频（可能是任务结果 JSON），请复制路径在本地播放。";
+      }
+    } catch (err) {
+      if (note) note.textContent = `加载音频失败：${err.message || String(err)}`;
+    }
+  }
+
+  const images = $$("img[data-primary-image], img[data-frame-path]", body);
+  for (const img of images) {
+    const note = img.parentElement ? img.parentElement.querySelector("[data-media-note]") : null;
+    const fromFrame = img.dataset.framePath;
+    const requests = [];
+    if (!fromFrame) requests.push(resultEndpoint);
+    if (fromFrame || !primary || !AUDIO_RE.test(primary)) {
+      const path = fromFrame || primary;
+      if (path) requests.push(`/vision/frame?path=${encodeURIComponent(path)}`);
+    }
+    let loaded = false;
+    for (const request of requests) {
+      try {
+        const blob = await fetchBlob(request);
+        if (!blob.type.startsWith("image/")) continue;
+        img.src = trackBlobUrl(blob);
+        img.hidden = false;
+        if (note) note.textContent = `${blob.type} · ${fmtBytes(blob.size)}`;
+        loaded = true;
+        break;
+      } catch (err) {
+        // 换下一个数据源；都失败再显示提示。
+      }
+    }
+    if (!loaded && note) {
+      note.textContent = "缩略图不可用（路径不在可预览目录或文件已删除）；可复制路径后在本地打开。";
+    }
+  }
+}
+
+async function loadJobDetail(jobId) {
+  let detail = null;
+  let loadError = "";
+  try {
+    detail = await api(`/jobs/${encodeURIComponent(jobId)}`);
+  } catch (err) {
+    loadError = err.message || String(err);
+  }
+  if (!state.jobDetailOpen || state.jobDetailId !== jobId) return;
+  const fallback = (state.jobs || []).find((job) => job.id === jobId) || null;
+  if (!detail && !fallback) {
+    renderJobDetailError(loadError || "任务不存在");
+    return;
+  }
+  // 列表行里已经有完整记录；详情接口失败时用它兜底，成功时以详情为准。
+  const job = Object.assign({}, fallback || {}, detail || {});
+  state.jobDetailData = job;
+  renderJobDetail(job, loadError);
+}
+
+function waitDuration(job) {
+  const created = parseTime(job.created_at);
+  const started = parseTime(job.started_at);
+  if (created && started) return fmtDuration((started - created) / 1000);
+  if (created && job.state === "queued") {
+    return `${fmtDuration((Date.now() - created.getTime()) / 1000)}（排队中）`;
+  }
+  return "--";
+}
+
+function runDuration(job) {
+  const started = parseTime(job.started_at);
+  const finished = parseTime(job.finished_at);
+  if (started && finished) return fmtDuration((finished - started) / 1000);
+  if (started && job.state === "running") {
+    return `${fmtDuration((Date.now() - started.getTime()) / 1000)}（进行中）`;
+  }
+  return "--";
+}
+
+function renderTimeline(job) {
+  const stateText = String(job.state || "unknown");
+  const steps = [
+    ["创建", job.created_at],
+    ["开始执行", job.started_at],
+    ["结束", job.finished_at],
+  ];
+  const items = steps.map(([label, value], index) => {
+    const date = parseTime(value);
+    let text = date ? fmtClock(value) : "—";
+    if (!date) {
+      if (stateText === "queued" && index > 0) text = "尚未开始（排队中）";
+      else if (stateText === "running" && index === 2) text = "进行中…";
+      else if (stateText === "canceled") text = "已取消";
+    }
+    const cls = date ? "done" : index === 0 && stateText !== "queued" ? "done" : "pending";
+    return `<div class="timeline-item ${cls}">
+      <span class="timeline-dot"></span>
+      <span class="timeline-label">${escapeHtml(label)}</span>
+      <span class="timeline-time mono">${escapeHtml(text)}</span>
+    </div>`;
+  }).join("");
+
+  const errorText = String(job.error || "");
+  const notes = [];
+  if (stateText === "canceled") {
+    notes.push("该任务已取消：如果是主动取消，error 为空是正常现象；有 error 时说明执行器报错后任务被终止。");
+  }
+  if (/超时|timeout|timed out/i.test(errorText)) {
+    notes.push("错误信息里出现了「超时 / timeout」，这次失败是执行超时，不是测试用例产生的。");
+  }
+  if (stateText === "running" && (job.meta || {}).cancel_requested) {
+    notes.push("已请求取消，正在等待执行器退出（running 状态可能还会持续几秒）。");
+  }
+  return `<div class="detail-section">
+    <h3 class="detail-h">时间线</h3>
+    <div class="timeline">${items}</div>
+    ${notes.map((note) => `<div class="detail-note">${escapeHtml(note)}</div>`).join("")}
+  </div>`;
+}
+
+function renderJobDetail(job, loadError) {
+  const box = $("#job-modal-body");
+  if (!box) return;
+  const stateText = String(job.state || "unknown");
+  const terminal = ["done", "failed", "canceled"].includes(stateText);
+  const errorText = String(job.error || "");
+  const timeout = /超时|timeout|timed out/i.test(errorText);
+
+  $("#job-modal-sub").textContent = [job.kind, job.action].filter(Boolean).join(" · ") || "任务";
+  $("#job-modal-meta").textContent = `任务 ${job.id}`;
+  const cancelBtn = $("#job-modal-cancel");
+  cancelBtn.disabled = terminal;
+  cancelBtn.classList.toggle("hidden", terminal);
+  if (!terminal) cancelBtn.textContent = stateText === "running" ? "请求取消" : "取消任务";
+
+  const summary = [
+    ["任务 ID", `<span class="mono">${escapeHtml(job.id || "--")}</span> ${copyButton(job.id || "", "复制 ID")}`],
+    ["类型 / 动作", `${escapeHtml(job.kind || "--")} / <span class="mono">${escapeHtml(job.action || "--")}</span>`],
+    ["状态", `${statePill(job.state)}${timeout ? ' <span class="pill bad">超时</span>' : ""}`],
+    ["优先级", escapeHtml(fmtMaybe(job.priority))],
+    ["创建时间", escapeHtml(job.created_at ? fmtClock(job.created_at) : "--")],
+    ["开始时间", escapeHtml(job.started_at ? fmtClock(job.started_at) : "--")],
+    ["结束时间", escapeHtml(job.finished_at ? fmtClock(job.finished_at) : "--")],
+    ["等待时长", escapeHtml(waitDuration(job))],
+    ["执行时长", escapeHtml(runDuration(job))],
+    ["尝试次数", escapeHtml(fmtMaybe(job.attempts))],
+    ["客户端 IP", escapeHtml(job.client_ip || "--")],
+  ];
+  if ((job.meta || {}).cancel_requested) summary.push(["取消请求", "已发出（等待执行器退出）"]);
+
+  const body = [
+    loadError ? `<div class="banner error">读取完整详情失败：${escapeHtml(loadError)}；下面用任务列表里的缓存数据展示，可点「刷新详情」重试。</div>` : "",
+    `<div class="detail-section">
+      <h3 class="detail-h">概要</h3>
+      <div class="detail-grid">${summary.map(([label, value], index) => `
+        <div class="detail-kv${index === 0 ? " detail-kv-wide" : ""}"><span class="detail-label">${escapeHtml(label)}</span><span class="detail-value">${value}</span></div>`).join("")}
+      </div>
+    </div>`,
+    `<div class="detail-section">
+      <h3 class="detail-h">请求参数 <span class="hint">payload</span></h3>
+      ${renderTextFields(job.payload || {})}
+      ${Object.keys(job.payload || {}).length
+        ? `<details class="detail-json-toggle" open><summary>完整 JSON</summary>${jsonBlock(job.payload, "payload 为空")}</details>`
+        : '<div class="empty">payload 为空</div>'}
+    </div>`,
+    `<div class="detail-section">
+      <h3 class="detail-h">结果 <span class="hint">result</span></h3>
+      ${job.result == null
+        ? `<div class="empty">${stateText === "done" ? "任务完成但没有结果" : `任务状态为 ${escapeHtml(stateText)}，暂无结果`}</div>`
+        : `${jsonBlock(job.result, "result 为空")}${renderResultFiles(job)}`}
+    </div>`,
+    `<div class="detail-section">
+      <h3 class="detail-h">错误 <span class="hint">error 原文</span></h3>
+      ${errorText
+        ? `<div class="detail-error-head"><span class="hint">等宽显示、保留换行</span>${copyButton(errorText, "复制错误")}</div>
+           <pre class="log-box detail-error">${escapeHtml(errorText)}</pre>`
+        : '<div class="empty">没有错误（任务正常结束）</div>'}
+    </div>`,
+    renderTimeline(job),
+  ];
+  box.innerHTML = body.join("");
+  attachJobMedia(job);
+}
+
+function renderJobDetailError(message) {
+  const box = $("#job-modal-body");
+  if (!box) return;
+  $("#job-modal-sub").textContent = "";
+  $("#job-modal-meta").textContent = "读取失败";
+  const cancelBtn = $("#job-modal-cancel");
+  cancelBtn.disabled = true;
+  cancelBtn.classList.add("hidden");
+  box.innerHTML = `<div class="banner error">读取任务详情失败：${escapeHtml(message || "未知错误")}</div>
+    <div class="empty">可以点「刷新详情」重试，或关闭弹窗后刷新任务列表。</div>`;
+}
+
+async function openJobDetail(jobId) {
+  const modal = $("#modal-job");
+  if (!modal) return;
+  if (!state.jobDetailOpen) {
+    state.jobDetailReturnFocus = document.activeElement;
+  }
+  state.jobDetailOpen = true;
+  state.jobDetailId = jobId;
+  state.jobDetailData = null;
+  state.copyPayloads = {};
+  modal.classList.remove("hidden");
+  document.body.classList.add("modal-open");
+  $("#job-modal-sub").textContent = jobId;
+  $("#job-modal-meta").textContent = "";
+  $("#job-modal-body").innerHTML = '<div class="empty">正在读取任务详情…</div>';
+  const cancelBtn = $("#job-modal-cancel");
+  cancelBtn.disabled = true;
+  cancelBtn.classList.add("hidden");
+  setTimeout(() => {
+    const button = $("#job-modal-close");
+    if (button) button.focus();
+  }, 20);
+  await loadJobDetail(jobId);
+}
+
+function closeJobDetail() {
+  if (!state.jobDetailOpen) return;
+  state.jobDetailOpen = false;
+  state.jobDetailId = null;
+  state.jobDetailData = null;
+  state.copyPayloads = {};
+  revokeJobBlobs();
+  const modal = $("#modal-job");
+  if (modal) modal.classList.add("hidden");
+  document.body.classList.remove("modal-open");
+  const box = $("#job-modal-body");
+  if (box) box.innerHTML = "";
+  const focus = state.jobDetailReturnFocus;
+  state.jobDetailReturnFocus = null;
+  if (focus && typeof focus.focus === "function") {
+    try { focus.focus(); } catch (err) { /* 元素已不在 DOM 里 */ }
+  }
+}
+
+async function refreshJobDetail() {
+  if (!state.jobDetailId) return;
+  await loadJobDetail(state.jobDetailId);
+}
+
+async function cancelJobFromDetail() {
+  const jobId = state.jobDetailId;
+  if (!jobId) return;
+  const button = $("#job-modal-cancel");
+  button.disabled = true;
+  try {
+    const data = await api(`/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST" });
+    toast(`任务 ${jobId} 已请求取消（状态 ${data.state}）`, "ok");
+    await loadJobs().catch(() => {});
+    if (state.jobDetailOpen && state.jobDetailId === jobId) await loadJobDetail(jobId);
+  } catch (err) {
+    toast(err.message || String(err), "error");
+    button.disabled = false;
   }
 }
 
@@ -1057,6 +1522,10 @@ function bindEvents() {
   $("#settings-save").addEventListener("click", saveSettings);
   $("#jobs-refresh").addEventListener("click", () => loadJobs().catch((err) => toast(err.message, "error")));
   $("#jobs-filter").addEventListener("change", () => loadJobs().catch((err) => toast(err.message, "error")));
+  // 双击任务行时不要让 3 秒自动刷新在两次点击之间重绘表格（会吃掉第二次点击）。
+  $("#jobs-tbody").addEventListener("pointerdown", (event) => {
+    if (event.target.closest("tr[data-job-id]")) state.lastJobInteraction = Date.now();
+  }, true);
   $("#log-refresh").addEventListener("click", loadLogs);
   $("#log-file").addEventListener("change", loadLogs);
   $("#autostart-toggle").addEventListener("change", (event) => toggleAutostart(event.target.checked));
@@ -1089,23 +1558,66 @@ function bindEvents() {
     if (handler) handler();
   });
 
+  // 任务详情弹窗
+  $("#job-modal-close").addEventListener("click", closeJobDetail);
+  $("#job-modal-close2").addEventListener("click", closeJobDetail);
+  $("#job-modal-refresh").addEventListener("click", () => {
+    refreshJobDetail().catch((err) => toast(err.message || String(err), "error"));
+  });
+  $("#job-modal-cancel").addEventListener("click", cancelJobFromDetail);
+  $("#job-modal-body").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-copy-key]");
+    if (!button) return;
+    const text = state.copyPayloads[button.dataset.copyKey];
+    if (text != null) copyText(text);
+  });
+  document.addEventListener("keydown", (event) => {
+    if (!state.jobDetailOpen) return;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeJobDetail();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    // 简单焦点圈：Tab 只在弹窗内循环，避免焦点跑到遮罩后面的列表。
+    const focusable = $$('#modal-job button, #modal-job [href], #modal-job input, #modal-job select, #modal-job textarea, #modal-job [tabindex]:not([tabindex="-1"])')
+      .filter((el) => !el.disabled && !el.classList.contains("hidden") && el.offsetParent !== null);
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  });
+
   $$(".modal").forEach((modal) => {
     modal.addEventListener("click", (event) => {
       if (event.target === modal) {
         if (modal.id === "modal-token") hideTokenModal();
         if (modal.id === "modal-confirm") hideConfirm();
+        if (modal.id === "modal-job") closeJobDetail();
       }
     });
   });
 
   setInterval(() => {
-    if (state.autoRefresh && state.view === "overview" && !document.hidden) {
-      refreshOverview(true).catch(() => {});
+    if (!state.autoRefresh || document.hidden) return;
+    if (state.jobDetailOpen) return; // 详情弹窗打开时暂停列表刷新，避免打断阅读。
+    if (state.view === "overview") refreshOverview(true).catch(() => {});
+    // 刚点过任务行（可能是双击的第一下）时跳过这一次，保护双击手势。
+    if (state.view === "jobs" && Date.now() - state.lastJobInteraction > 1500) {
+      loadJobs().catch(() => {});
     }
   }, 3000);
 
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden && state.view === "overview") refreshOverview(true).catch(() => {});
+    if (document.hidden) return;
+    if (state.view === "overview") refreshOverview(true).catch(() => {});
+    if (state.view === "jobs" && !state.jobDetailOpen) loadJobs().catch(() => {});
   });
 }
 
