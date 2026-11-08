@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>LocalAIService 控制台</title>
+  <link rel="stylesheet" href="/ui/styles.css">
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-logo">🐟</div>
+        <div class="brand-text">
+          <strong>LocalAIService</strong>
+          <span>控制台</span>
+        </div>
+      </div>
+      <nav class="nav" aria-label="主导航">
+        <button class="nav-item active" data-view="overview"><span class="nav-icon">📊</span><span>概览</span></button>
+        <button class="nav-item" data-view="models"><span class="nav-icon">🧠</span><span>模型</span></button>
+        <button class="nav-item" data-view="settings"><span class="nav-icon">⚙️</span><span>设置</span></button>
+        <button class="nav-item" data-view="jobs"><span class="nav-icon">🗂️</span><span>任务</span></button>
+        <button class="nav-item" data-view="system"><span class="nav-icon">🖥️</span><span>系统</span></button>
+      </nav>
+      <div class="sidebar-foot">
+        <div class="conn-line"><span id="side-dot" class="dot"></span><span id="side-status">连接中…</span></div>
+        <button id="token-btn" class="ghost small" type="button">🔑 令牌</button>
+        <a class="ghost small linklike" href="/docs" target="_blank" rel="noopener">📘 API 文档</a>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <h1 id="view-title">概览</h1>
+          <p id="view-sub">服务状态、显存与任务队列一屏看完</p>
+        </div>
+        <div class="top-actions">
+          <span id="conn-pill" class="pill muted">检测中</span>
+          <label class="switch-label" title="每 3 秒自动刷新概览">
+            <input id="auto-refresh" type="checkbox" checked>
+            <span>自动刷新</span>
+          </label>
+          <button id="refresh-btn" class="primary" type="button">刷新</button>
+        </div>
+      </header>
+
+      <div id="warning-banner" class="banner warn hidden"></div>
+      <div id="error-banner" class="banner error hidden"></div>
+
+      <!-- 概览 -->
+      <section id="view-overview" class="view active">
+        <div class="overview-top">
+          <div id="gpu-card" class="panel gpu-panel">
+            <div class="panel-head"><h2>GPU 显存</h2><span id="gpu-state" class="pill muted">读取中</span></div>
+            <div class="gpu-numbers"><strong id="gpu-used">--</strong><span id="gpu-total">/ -- MB</span></div>
+            <div class="progress"><div id="gpu-bar" class="progress-fill"></div></div>
+            <div class="gpu-meta"><span id="gpu-free">空闲 -- MB</span><span id="gpu-margin">安全余量 -- MB</span></div>
+          </div>
+          <div id="job-stat-grid" class="stat-grid"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head"><h2>能力状态</h2><span class="hint">启动 0 模型，首次请求才加载；空闲自动卸载</span></div>
+          <div id="cap-grid" class="cap-grid"><div class="empty">正在读取…</div></div>
+        </div>
+
+        <div class="overview-bottom">
+          <div class="panel">
+            <div class="panel-head"><h2>最近任务</h2><span class="hint">最多 10 条</span></div>
+            <div class="table-wrap"><table>
+              <thead><tr><th>时间</th><th>类型</th><th>状态</th><th>耗时</th></tr></thead>
+              <tbody id="recent-jobs"><tr><td colspan="4" class="empty">正在读取…</td></tr></tbody>
+            </table></div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h2>最近日志</h2><span class="hint">logs/service.out.log</span></div>
+            <pre id="recent-logs" class="log-box small">正在读取…</pre>
+          </div>
+        </div>
+      </section>
+
+      <!-- 模型 -->
+      <section id="view-models" class="view">
+        <div id="download-task" class="banner info hidden"></div>
+        <div class="toolbar">
+          <span id="models-summary" class="hint">正在读取模型清单…</span>
+          <button id="models-refresh" class="ghost" type="button">刷新清单</button>
+        </div>
+        <div id="models-container"><div class="empty">正在读取…</div></div>
+      </section>
+
+      <!-- 设置 -->
+      <section id="view-settings" class="view">
+        <div class="toolbar">
+          <span class="hint">只保存改动项；来源 <b>env</b> 的项会被环境变量覆盖，保存后仍以环境变量为准。</span>
+          <div class="toolbar-actions">
+            <button id="settings-reload" class="ghost" type="button">重新读取</button>
+            <button id="settings-save" class="primary" type="button">保存设置</button>
+          </div>
+        </div>
+        <div id="settings-result" class="banner hidden"></div>
+        <div id="settings-container"><div class="empty">正在读取…</div></div>
+      </section>
+
+      <!-- 任务 -->
+      <section id="view-jobs" class="view">
+        <div class="toolbar">
+          <label class="field-inline">状态
+            <select id="jobs-filter">
+              <option value="">全部</option>
+              <option value="queued">排队 queued</option>
+              <option value="running">运行 running</option>
+              <option value="done">完成 done</option>
+              <option value="failed">失败 failed</option>
+              <option value="canceled">取消 canceled</option>
+            </select>
+          </label>
+          <span id="jobs-summary" class="hint"></span>
+          <button id="jobs-refresh" class="ghost" type="button">刷新</button>
+        </div>
+        <div class="panel">
+          <div class="table-wrap"><table>
+            <thead><tr><th>提交时间</th><th>类型</th><th>状态</th><th>优先级</th><th>等待</th><th>耗时</th><th>操作</th></tr></thead>
+            <tbody id="jobs-tbody"><tr><td colspan="7" class="empty">正在读取…</td></tr></tbody>
+          </table></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>任务详情</h2><span class="hint">点击上方任意一行查看</span></div>
+          <pre id="job-detail" class="log-box">未选择任务</pre>
+        </div>
+      </section>
+
+      <!-- 系统 -->
+      <section id="view-system" class="view">
+        <div id="system-grid" class="system-grid"><div class="empty">正在读取…</div></div>
+
+        <div class="panel">
+          <div class="panel-head"><h2>开机自启</h2><span id="autostart-state" class="pill muted">读取中</span></div>
+          <div class="row-between">
+            <div>
+              <p class="hint">Windows 计划任务 <code>LocalAIService-Service</code>，动作指向 <code>start_ai_service.ps1</code>。</p>
+              <p id="autostart-detail" class="hint"></p>
+            </div>
+            <label class="switch-label big">
+              <input id="autostart-toggle" type="checkbox">
+              <span>启用</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="panel danger-panel">
+          <div class="panel-head"><h2>重启服务</h2><span class="pill warn">高风险</span></div>
+          <p class="hint">先释放 7880 端口，再用 <code>start_ai_service.ps1</code> 在后台拉起。重启期间接口会短暂不可用，任务队列会按配置恢复。</p>
+          <button id="restart-btn" class="danger" type="button">🔄 重启服务（需二次确认）</button>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head"><h2>日志查看器</h2><span id="log-meta" class="hint"></span></div>
+          <div class="toolbar">
+            <label class="field-inline">文件
+              <select id="log-file">
+                <option value="service">service.out.log</option>
+                <option value="err">service.err.log</option>
+              </select>
+            </label>
+            <label class="field-inline">行数
+              <input id="log-lines" type="number" min="10" max="5000" step="10" value="200">
+            </label>
+            <button id="log-refresh" class="ghost" type="button">刷新日志</button>
+          </div>
+          <pre id="logs-output" class="log-box">点击「刷新日志」加载</pre>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast hidden" role="status"></div>
+
+  <!-- 令牌弹窗 -->
+  <div id="modal-token" class="modal hidden">
+    <div class="modal-box">
+      <h2>访问令牌</h2>
+      <p class="hint">服务端设置了 <code>LOCALAI_TOKEN</code>。令牌只保存在本浏览器的 localStorage，不会写进页面源码。</p>
+      <input id="token-input" type="password" autocomplete="off" placeholder="粘贴 Bearer 令牌">
+      <div class="modal-actions">
+        <button id="token-clear" class="ghost" type="button">清除</button>
+        <button id="token-cancel" class="ghost" type="button">取消</button>
+        <button id="token-save" class="primary" type="button">保存并重试</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 通用二次确认 -->
+  <div id="modal-confirm" class="modal hidden">
+    <div class="modal-box">
+      <h2 id="confirm-title">确认</h2>
+      <p id="confirm-message" class="hint"></p>
+      <label class="field-inline" id="confirm-type-wrap">请输入 <code>RESTART</code> 继续
+        <input id="confirm-type" type="text" autocomplete="off" placeholder="RESTART">
+      </label>
+      <div class="modal-actions">
+        <button id="confirm-cancel" class="ghost" type="button">取消</button>
+        <button id="confirm-ok" class="danger" type="button">确认执行</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/ui/app.js"></script>
+</body>
+</html>

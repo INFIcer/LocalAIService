@@ -66,12 +66,13 @@ async def translate(payload: TranslateRequest, request: Request) -> dict[str, An
         request, payload.source, payload.target, texts[0]
     )
     adapter = _adapter(request)
+    cfg = get_cfg(request)
     outcome = await adapter.infer(
         texts,
         source=source_code,
         target=target_code,
-        batch_size=payload.batch_size,
-        max_len=payload.max_len,
+        batch_size=payload.batch_size or cfg.translate_batch_size,
+        max_len=payload.max_len or cfg.translate_max_len,
     )
     docs = outcome.get("docs") or [{}]
     return {
@@ -95,12 +96,13 @@ async def translate_batch(
         request, payload.source, payload.target, sample
     )
     adapter = _adapter(request)
+    cfg = get_cfg(request)
     outcome = await adapter.infer(
         texts,
         source=source_code,
         target=target_code,
-        batch_size=payload.batch_size,
-        max_len=payload.max_len,
+        batch_size=payload.batch_size or cfg.translate_batch_size,
+        max_len=payload.max_len or cfg.translate_max_len,
     )
     docs = outcome.get("docs") or []
     return {
@@ -162,8 +164,8 @@ async def create_translate_job(
                 "source": source_code,
                 "target": target_code,
                 "engine": engine_name,
-                "max_len": payload.max_len,
-                "batch_size": payload.batch_size,
+                "max_len": payload.max_len or cfg.translate_max_len,
+                "batch_size": payload.batch_size or cfg.translate_batch_size,
             },
             cfg,
         )

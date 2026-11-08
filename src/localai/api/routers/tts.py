@@ -75,10 +75,11 @@ async def _synthesize(
 
 @router.post("/tts", summary="语音合成，返回 WAV 二进制")
 async def tts(payload: TTSRequest, request: Request) -> Response:
+    cfg = get_cfg(request)
     result = await _synthesize(
         request,
         text=payload.text,
-        voice_name=payload.voice,
+        voice_name=payload.voice or cfg.tts_default_voice,
         speed=payload.speed,
         emotion=payload.emotion,
         seed=payload.seed,
@@ -107,7 +108,7 @@ async def openai_speech(payload: SpeechRequest, request: Request) -> Response:
     result = await _synthesize(
         request,
         text=payload.input,
-        voice_name=payload.voice,
+        voice_name=payload.voice or get_cfg(request).tts_default_voice,
         speed=payload.speed,
         emotion=payload.emotion,
         seed=payload.seed,

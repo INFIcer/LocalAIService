@@ -59,6 +59,7 @@ data/
 .env.*
 *.local
 secrets.json
+config.json
 *.token
 bili_credential.json
 

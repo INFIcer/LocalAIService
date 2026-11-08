@@ -215,7 +215,7 @@ def prepare_payload(
         source = _text(data.get("source")) or "auto"
         target = _text(data.get("target")) or "en"
         try:
-            max_len = max(32, min(1024, int(data.get("max_len") or 400)))
+            max_len = max(32, min(1024, int(data.get("max_len") or cfg.translate_max_len)))
         except (TypeError, ValueError) as exc:
             raise ValueError(f"max_len 必须是整数：{data.get('max_len')!r}") from exc
         try:
@@ -491,7 +491,7 @@ async def _run_translate(payload: dict[str, Any], ctx: JobContext) -> dict[str, 
             source=payload.get("source") or "auto",
             target=payload.get("target") or "en",
             batch_size=payload.get("batch_size"),
-            max_len=int(payload.get("max_len") or 400),
+            max_len=int(payload.get("max_len") or ctx.cfg.translate_max_len),
         )
     except (InsufficientVramError, TranslateBackendError):
         raise

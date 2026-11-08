@@ -85,6 +85,8 @@ async def create_tts_job(payload: JobTtsRequest, request: Request) -> dict[str, 
     scheduler = get_scheduler(request)
     cfg = get_cfg(request)
     data = payload.model_dump(exclude={"priority"}, exclude_none=False)
+    if not data.get("voice"):
+        data["voice"] = cfg.tts_default_voice
     try:
         action, normalized = prepare_payload("tts", "tts.synthesize", data, cfg)
     except ValueError as exc:

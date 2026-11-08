@@ -11,7 +11,9 @@ from ..constants import TTS_MAX_TEXT
 
 class TTSRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=TTS_MAX_TEXT, description="要合成的文本")
-    voice: str = Field("default", description="<HOME>/voices 下的音色名（文件名去扩展名）")
+    voice: Optional[str] = Field(
+        None, description="<HOME>/voices 下的音色名（文件名去扩展名）；不填用服务端默认音色"
+    )
     speed: float = Field(1.0, ge=0.5, le=2.0, description="语速，1.0 正常；范围 0.5~2.0")
     emotion: Optional[str] = Field(None, description="可选：8 维情感向量或情感文本")
     seed: Optional[int] = Field(None, ge=0, le=4294967295, description="随机种子；不填随机")
@@ -23,7 +25,7 @@ class SpeechRequest(BaseModel):
 
     model: str = Field("indextts")
     input: str = Field(..., min_length=1, max_length=TTS_MAX_TEXT)
-    voice: str = Field("default")
+    voice: Optional[str] = Field(None, description="不填用服务端默认音色")
     response_format: str = Field("wav")
     speed: float = Field(1.0, ge=0.5, le=2.0)
     language: Optional[str] = None
@@ -75,8 +77,12 @@ class TranslateRequest(BaseModel):
     source: str = Field("auto", description="auto / zh / en / zho_Hans ...；auto 自动检测")
     target: str = Field("en", description="目标语言：en / ja / eng_Latn ...")
     engine: Optional[str] = Field("nllb", description="翻译引擎；目前只支持 nllb")
-    max_len: int = Field(400, ge=32, le=1024, description="每块最大 token 数")
-    batch_size: int = Field(8, ge=1, le=64, description="内部推理批大小")
+    max_len: Optional[int] = Field(
+        None, ge=32, le=1024, description="每块最大 token 数；不填用服务端默认值"
+    )
+    batch_size: Optional[int] = Field(
+        None, ge=1, le=64, description="内部推理批大小；不填用服务端默认值"
+    )
 
 
 class TranslateBatchRequest(BaseModel):
@@ -86,8 +92,8 @@ class TranslateBatchRequest(BaseModel):
     source: str = Field("auto", description="auto / zh / en / zho_Hans ...")
     target: str = Field("en", description="目标语言")
     engine: Optional[str] = Field("nllb", description="翻译引擎；目前只支持 nllb")
-    max_len: int = Field(400, ge=32, le=1024)
-    batch_size: int = Field(8, ge=1, le=64)
+    max_len: Optional[int] = Field(None, ge=32, le=1024)
+    batch_size: Optional[int] = Field(None, ge=1, le=64)
 
 
 class JobTranslateRequest(TranslateBatchRequest):

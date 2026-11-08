@@ -15,6 +15,7 @@
     LOCALAI_HOST / LOCALAI_PORT
     LOCALAI_ENGINE_DIR        原生引擎目录（默认 <HOME>/engine）
     LOCALAI_TTS_BACKEND       engine / comfy
+    LOCALAI_TTS_DEFAULT_VOICE 请求未给 voice 时的默认音色（默认 default）
     LOCALAI_MODEL_DIR         IndexTTS-2.5 权重目录
     LOCALAI_ASR_MODEL_DIR     SenseVoiceSmall 目录
     LOCALAI_CAMPPUS_DIR       campplus 目录
@@ -43,6 +44,7 @@
     LOCALAI_TRANSLATE_FP16    GPU 上是否用 fp16（默认 1；设 0 用 fp32）
     LOCALAI_TRANSLATE_NUM_BEAMS 翻译 beam 数（默认 4，范围 1~8）
     LOCALAI_TRANSLATE_BATCH_SIZE 翻译默认批大小（默认 8，范围 1~32）
+    LOCALAI_TRANSLATE_MAX_LEN  翻译默认单块 token 上限（默认 400，范围 32~1024）
     LOCALAI_TOKEN             可选的 Bearer 鉴权令牌（默认空=不鉴权）
 
 任务队列（详见 ``localai.jobs``）::
@@ -60,6 +62,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import shutil
 from dataclasses import dataclass, field
@@ -67,6 +71,12 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .constants import ASR_ENGINES, WHISPER_SIZES
+from .settings_spec import SETTINGS, coerce_value, env_present
+
+logger = logging.getLogger("localai.config")
+
+#: 管理界面写入的配置文件（相对 ``LOCALAI_HOME``）。
+CONFIG_FILE_NAME = "config.json"
 
 # 本机现有的 ffmpeg 常见位置；换机器探测不到就走 PATH。
 DEFAULT_FFMPEG = r"C:\Users\Administrator\Documents\videoTrans\ffmpeg\bin\ffmpeg.exe"
@@ -175,6 +185,77 @@ def _resolve_ffprobe(ffmpeg: Optional[Path]) -> tuple[Optional[Path], str]:
     return None, "missing"
 
 
+def config_file_path(home: Optional[Path] = None) -> Path:
+    """管理界面配置文件路径：``<LOCALAI_HOME>/config.json``。"""
+    return Path(home or _default_home()) / CONFIG_FILE_NAME
+
+
+def load_config_file(home: Optional[Path] = None) -> dict[str, Any]:
+    """读取 ``config.json``；不存在或不是合法 JSON 对象时返回空字典。
+
+    这里故意不抛异常：一个手滑写坏的配置文件不应该让服务起不来，
+    而是按「没有文件」处理，管理界面会显示来源为 default。
+    """
+    path = config_file_path(home)
+    try:
+        if not path.is_file():
+            return {}
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        logger.warning("读取配置文件失败，按空配置处理：%s（%s）", path, exc)
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _apply_config_file(
+    cfg: "Config",
+    home: Path,
+    overrides: Optional[dict[str, bool]] = None,
+) -> None:
+    """把 ``config.json`` 里的白名单值覆盖到配置对象上。
+
+    优先级固定为 **环境变量 > config.json > 代码默认值**：只要某个键在启动时
+    被环境变量覆盖（``overrides[key]`` 为真），这里就跳过，避免管理界面写入
+    的值看起来生效、实际却被启动脚本压住。
+    """
+    data = load_config_file(home)
+    if not data:
+        return
+    flags = overrides or {}
+    for item in SETTINGS:
+        if item.key not in data:
+            continue
+        if flags.get(item.key):
+            continue
+        try:
+            value = coerce_value(item, data[item.key])
+        except ValueError as exc:
+            logger.warning("忽略配置文件里的非法值 %s=%r：%s", item.key, data[item.key], exc)
+            continue
+
+        if item.key == "asr_parallel":
+            # 调度器与原生引擎必须同值，避免「调度开 2、引擎仍 1」。
+            cfg.asr_parallel = int(value)
+            cfg.jobs_parallel_asr = int(value)
+        elif item.key == "ffmpeg":
+            if value:
+                cfg.ffmpeg = Path(str(value)).expanduser()
+                cfg.ffmpeg_source = "file"
+                sibling = cfg.ffmpeg.with_name(
+                    "ffprobe.exe" if os.name == "nt" else "ffprobe"
+                )
+                if sibling.is_file():
+                    cfg.ffprobe = sibling
+                    cfg.ffprobe_source = "file"
+            else:
+                cfg.ffmpeg = None
+                cfg.ffmpeg_source = "missing"
+        elif item.key == "token":
+            cfg.token = str(value or "")
+        else:
+            setattr(cfg, item.key, value)
+
+
 @dataclass(slots=True)
 class Config:
     """一次服务进程的完整配置。"""
@@ -185,6 +266,8 @@ class Config:
     engine_dir: Path = field(default_factory=Path)
 
     tts_backend: str = "engine"
+    #: 请求没有显式给 voice 时使用的音色名。
+    tts_default_voice: str = "default"
     model_dir: Path = field(default_factory=Path)
     asr_model_dir: Path = field(default_factory=Path)
     #: 分段转写用的 fsmn-vad 权重目录（SenseVoice 没有原生时间戳）。
@@ -203,6 +286,8 @@ class Config:
     translate_fp16: bool = True
     translate_num_beams: int = 4
     translate_batch_size: int = 8
+    #: 请求没有显式给 max_len 时使用的默认单块 token 上限。
+    translate_max_len: int = 400
     speaker_model_dir: Path = field(default_factory=Path)
     comfy_model_dir: Path = field(default_factory=Path)
     comfy_base: str = "http://127.0.0.1:8188"
@@ -231,6 +316,8 @@ class Config:
     log_level: str = "INFO"
     poll_interval: float = 0.4
     job_timeout: float = 180.0
+    #: 启动时哪些管理设置被环境变量覆盖（键 -> bool），供 /admin/settings 判断来源。
+    env_overrides: dict[str, bool] = field(default_factory=dict)
 
     # ---- 任务队列（新增，不影响旧配置） ---------------------------------
     jobs_recover: str = "requeue"
@@ -356,12 +443,15 @@ class Config:
         if whisper_model not in WHISPER_SIZES:
             whisper_model = "small"
 
-        return cls(
+        cfg = cls(
             home=root,
             host=_pick("LOCALAI_HOST", "INDEX_TTS_HOST", default="127.0.0.1") or "127.0.0.1",
             port=_pick_int(7880, "LOCALAI_PORT", "INDEX_TTS_PORT"),
             engine_dir=engine_dir,
             tts_backend=backend,
+            tts_default_voice=(
+                _pick("LOCALAI_TTS_DEFAULT_VOICE", default="default") or "default"
+            ).strip(),
             model_dir=Path(
                 _pick(
                     "LOCALAI_MODEL_DIR",
@@ -410,6 +500,9 @@ class Config:
             ),
             translate_batch_size=max(
                 1, min(32, _pick_int(8, "LOCALAI_TRANSLATE_BATCH_SIZE"))
+            ),
+            translate_max_len=max(
+                32, min(1024, _pick_int(400, "LOCALAI_TRANSLATE_MAX_LEN"))
             ),
             speaker_model_dir=Path(
                 _pick(
@@ -495,6 +588,17 @@ class Config:
             ),
         )
 
+        # 记录「启动时哪些键被环境变量覆盖」，必须在 export_env() 之前算：
+        # export_env 会把配置写回同名环境变量，事后再判断会把 file/default
+        # 误判成 env。
+        cfg.env_overrides = {item.key: False for item in SETTINGS}
+        for item in SETTINGS:
+            cfg.env_overrides[item.key] = env_present(item)
+
+        # 文件覆盖只对「没有被环境变量覆盖」的键生效。
+        _apply_config_file(cfg, root, cfg.env_overrides)
+        return cfg
+
     # ---- 给原生引擎写回环境变量 -----------------------------------------
     def export_env(self) -> None:
         """把配置写回环境变量，供 ``engine/`` 下的原生引擎模块读取。
@@ -509,6 +613,7 @@ class Config:
         asr_parallel = self.asr_parallel_effective()
         mapping = {
             "TTS_BACKEND": self.tts_backend,
+            "LOCALAI_TTS_DEFAULT_VOICE": self.tts_default_voice,
             "LOCALAI_ASR_PARALLEL": str(asr_parallel),
             "LOCALAI_JOBS_PARALLEL_ASR": str(asr_parallel),
             "INDEX_TTS_HOME": str(self.home),
@@ -526,6 +631,7 @@ class Config:
             "LOCALAI_TRANSLATE_FP16": "1" if self.translate_fp16 else "0",
             "LOCALAI_TRANSLATE_NUM_BEAMS": str(self.translate_num_beams),
             "LOCALAI_TRANSLATE_BATCH_SIZE": str(self.translate_batch_size),
+            "LOCALAI_TRANSLATE_MAX_LEN": str(self.translate_max_len),
             "INDEX_TTS_CAMPPUS_DIR": str(self.speaker_model_dir),
             "INDEX_TTS_SPEAKERS_DIR": str(self.speakers_dir),
             "INDEX_TTS_TORCH_HOME": str(self.torch_home),
@@ -559,6 +665,7 @@ class Config:
             "base_url": self.base_url,
             "engine_dir": str(self.engine_dir),
             "tts_backend": self.tts_backend,
+            "tts_default_voice": self.tts_default_voice,
             "model_dir": str(self.model_dir),
             "asr_model_dir": str(self.asr_model_dir),
             "asr_engine": self.asr_engine,
@@ -577,6 +684,7 @@ class Config:
                 "fp16": self.translate_fp16,
                 "num_beams": self.translate_num_beams,
                 "batch_size": self.translate_batch_size,
+                "max_len": self.translate_max_len,
             },
             "speaker_model_dir": str(self.speaker_model_dir),
             "voices_dir": str(self.voices_dir),

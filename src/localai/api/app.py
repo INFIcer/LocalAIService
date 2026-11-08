@@ -14,13 +14,16 @@ import hmac
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
 from .. import __version__
+from ..admin.models import ModelDownloader
 from ..config import Config, ensure_directories, get_config
 from ..core.errors import (
     AsrBackendError,
@@ -38,6 +41,7 @@ from ..core.vram import register_adapters
 from ..engines import build_registry
 from ..jobs import JobScheduler, JobStore
 from .routers import (
+    admin,
     asr,
     jobs,
     media,
@@ -50,8 +54,18 @@ from .routers import (
 
 logger = logging.getLogger("localai.api")
 
-# 这些路径不要求鉴权：健康检查、能力发现、OpenAPI 文档。
+# 这些路径不要求鉴权：健康检查、能力发现、OpenAPI 文档、纯静态管理页面。
+# 注意：只放行页面与静态资源，``/admin/*`` 仍然受全局令牌保护。
 _AUTH_EXEMPT = {"/health", "/capabilities", "/docs", "/redoc", "/openapi.json"}
+
+
+def _auth_exempt(path: str) -> bool:
+    """判断路径是否免鉴权（/ui 页面本身需要能打开，否则无法输入令牌）。"""
+    if path in _AUTH_EXEMPT:
+        return True
+    if path == "/" or path == "/ui" or path.startswith("/ui/"):
+        return True
+    return False
 
 
 def _http_client(cfg: Config) -> httpx.AsyncClient:
@@ -74,6 +88,7 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
         ensure_directories(cfg)
         app.state.client = _http_client(cfg)
         app.state.idle_tasks = []
+        app.state.idle_watchdogs = []
 
         # 任务库先于调度器初始化：启动时先把上次遗留的 running 恢复掉。
         store = JobStore(cfg.jobs_db_path)
@@ -150,6 +165,9 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
             watchdog = IdleWatchdog(adapter, seconds)
             task = asyncio.create_task(watchdog.run())
             app.state.idle_tasks.append(task)
+            app.state.idle_watchdogs.append(
+                {"name": adapter.name, "watchdog": watchdog, "task": task}
+            )
 
         try:
             yield
@@ -193,6 +211,9 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
     app.state.registry = registry
     app.state.vram = vram
     app.state.started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    # 管理界面的模型下载任务管理器（单例；同一时刻只跑一个下载）。
+    app.state.model_downloader = ModelDownloader()
+    app.state.restart_task = None
 
     # ------------------------------------------------------------------
     # 异常 -> JSON（字段与旧版保持一致）
@@ -357,7 +378,7 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
     # ------------------------------------------------------------------
     @app.middleware("http")
     async def _auth_middleware(request: Request, call_next: Any) -> Any:
-        if not cfg.token or request.url.path in _AUTH_EXEMPT:
+        if not cfg.token or _auth_exempt(request.url.path):
             return await call_next(request)
         provided = ""
         authorization = request.headers.get("authorization", "")
@@ -388,6 +409,26 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
     app.include_router(speakers.router)
     app.include_router(separate.router)
     app.include_router(media.router)
+    app.include_router(admin.router)
+
+    # ------------------------------------------------------------------
+    # 管理界面：纯静态、无构建步骤。
+    # /ui 显式返回 index.html（避免依赖 StaticFiles 的 307 跳转），
+    # /ui/ 与静态资源由 mount 处理。
+    # ------------------------------------------------------------------
+    webui_dir = Path(__file__).resolve().parents[1] / "webui"
+    if webui_dir.is_dir():
+        index_file = webui_dir / "index.html"
+
+        @app.get("/", include_in_schema=False)
+        async def _root_redirect() -> RedirectResponse:
+            return RedirectResponse(url="/ui", status_code=307)
+
+        @app.get("/ui", include_in_schema=False)
+        async def _ui_index() -> FileResponse:
+            return FileResponse(index_file, media_type="text/html; charset=utf-8")
+
+        app.mount("/ui", StaticFiles(directory=str(webui_dir), html=True), name="ui")
 
     return app
 
