@@ -21,6 +21,11 @@ SenseVoiceSmall 语音识别引擎
    本模块把语言 / 情感 / 事件标签解析成结构化字段，正文去掉全部标签。
    解析逻辑是纯函数 ``parse_rich_tags()``，可以单独测试。
 5. **离线**：``AutoModel(model=<本地目录>)`` 直接读本地权重，不联网。
+6. **可控并发**：推理闸门容量由 ``LOCALAI_ASR_PARALLEL`` 决定（默认 1）。
+   容量 1 时与旧版的一把 ``RLock`` 完全等价：同一时刻只有一个推理；容量
+   2~4 时最多允许对应数量的 SenseVoice 推理同时进入。模型加载 / 卸载属于
+   「结构性操作」，仍然独占：加载只在模型为空时发生（此时不可能有推理），
+   卸载则先把全部推理槽位收干，再释放模型和 CUDA 缓存。
 
 对外主要函数
 ------------
@@ -48,8 +53,9 @@ import re
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 # 必须在 import torch 之前设置：和 TTS 引擎保持一致，减少 8G 卡上的碎片化。
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -93,13 +99,171 @@ USE_ITN = os.environ.get("INDEX_TTS_ASR_USE_ITN", "1").strip().lower() not in (
     "off",
 )
 
+
 logger = logging.getLogger("sensevoice-asr")
 
-# 加载锁与推理锁分开：
-# - 加载锁保证只构造一次 AutoModel；
-# - 推理锁保证同一时刻只有一个请求在用模型（CTC 推理虽然无状态，但显存峰值可控）。
+
+def _read_parallel_capacity() -> int:
+    """读取推理并发容量：默认 1，限制在 1~4。
+
+    1 = 完全沿用旧版串行行为；2~4 = 允许同一时刻有 N 个 SenseVoice 推理。
+    非法值静默回落到 1，避免一个笔误把服务变成不可用或开得过大。
+    """
+    raw = os.environ.get("LOCALAI_ASR_PARALLEL", "1")
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        logger.warning("LOCALAI_ASR_PARALLEL=%r 不是整数，按 1（串行）处理", raw)
+        return 1
+    return max(1, min(4, value))
+
+
+def _read_unload_timeout() -> float:
+    """读取卸载等待超时；非法值回落到 30 秒。"""
+    raw = os.environ.get("LOCALAI_ASR_UNLOAD_TIMEOUT", "30")
+    try:
+        return max(1.0, float(str(raw).strip() or "30"))
+    except (TypeError, ValueError):
+        logger.warning("LOCALAI_ASR_UNLOAD_TIMEOUT=%r 不是数字，按 30 秒处理", raw)
+        return 30.0
+
+
+#: 本进程实际生效的推理并发容量（导入时读取一次，服务层会在 import 前注入）。
+ASR_PARALLEL = _read_parallel_capacity()
+
+#: 卸载时等待所有推理退出的最长时间（秒）；超时只记日志、不强行拆模型。
+ASR_UNLOAD_TIMEOUT = _read_unload_timeout()
+
+
+class _InferenceDrainTimeout(RuntimeError):
+    """卸载时等待推理退出的时间超时。"""
+
+
+class _InferenceGate:
+    """可配置容量的推理闸门，用法类似 ``threading.BoundedSemaphore``。
+
+    为什么要自己包一层
+    ------------------
+    - 推理路径只做 ``with gate.slot():``，内部只拿信号量，**不嵌套任何独占锁**，
+      因此不会出现「推理等独占锁、卸载等推理」的死锁；
+    - 卸载走 ``with gate.exclusive():``：按容量逐个收干所有槽位。收干期间新的
+      推理会阻塞在信号量上，等卸载结束才继续，保证「卸载时绝不会有推理在跑」；
+    - 统计 ``in_use / peak`` 给 ``/asr/status``、``/capabilities`` 看。
+
+    容量 1 时，``slot()`` 的行为与旧版的 ``RLock`` 完全一致：同一时刻只有一个
+    线程能进入临界区。与 ``RLock`` 的唯一区别是不支持同线程重入，而本模块的
+    推理路径没有重入，所以语义不受影响。
+    """
+
+    def __init__(self, capacity: int) -> None:
+        self._capacity = max(1, int(capacity))
+        self._semaphore = threading.BoundedSemaphore(self._capacity)
+        self._state_lock = threading.Lock()
+        self._in_use = 0
+        self._peak = 0
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity
+
+    @property
+    def in_use(self) -> int:
+        with self._state_lock:
+            return self._in_use
+
+    @property
+    def peak(self) -> int:
+        with self._state_lock:
+            return self._peak
+
+    @contextmanager
+    def slot(self) -> Iterator[None]:
+        """占一个推理槽位；退出时**一定**归还，不会把计数搞乱。"""
+        self._semaphore.acquire()
+        with self._state_lock:
+            self._in_use += 1
+            if self._in_use > self._peak:
+                self._peak = self._in_use
+        try:
+            yield
+        finally:
+            with self._state_lock:
+                self._in_use = max(0, self._in_use - 1)
+            self._semaphore.release()
+
+    @contextmanager
+    def exclusive(self, timeout: float = ASR_UNLOAD_TIMEOUT) -> Iterator[None]:
+        """收干全部槽位后独占；用于卸载模型。
+
+        超时抛 :class:`_InferenceDrainTimeout`。已经收上来的槽位会在 ``finally``
+        里按实际数量归还，**不会多 release**（BoundedSemaphore 会因此报错）。
+        """
+        capacity = self._capacity
+        acquired = 0
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        try:
+            while acquired < capacity:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not self._semaphore.acquire(timeout=remaining):
+                    raise _InferenceDrainTimeout(
+                        f"等待推理退出超过 {timeout:.1f} 秒（已收 {acquired}/{capacity} 个槽位）"
+                    )
+                acquired += 1
+            yield
+        finally:
+            for _ in range(acquired):
+                self._semaphore.release()
+
+    def snapshot(self) -> dict[str, Any]:
+        """只读快照（给状态接口 / 日志）。"""
+        with self._state_lock:
+            return {
+                "capacity": self._capacity,
+                "in_use": self._in_use,
+                "peak": self._peak,
+            }
+
+
+# 加载锁与推理闸门分开：
+# - 加载锁（_LOAD_LOCK）是结构性操作的互斥锁：同一时刻只构造 / 释放一次模型；
+# - 推理闸门（_INFER_GATE）限制并发推理数，容量 1 时就是旧版的串行锁。
+# 获取顺序固定为「先推理槽位，后加载锁」；卸载也先收干推理槽位再拿加载锁，
+# 两者顺序一致，因此不会互相等待成环。
 _LOAD_LOCK = threading.RLock()
-_INFER_LOCK = threading.RLock()
+_INFER_GATE = _InferenceGate(ASR_PARALLEL)
+
+
+def configure_parallel(capacity: int) -> int:
+    """服务层启动时把引擎闸门对齐到配置容量；返回最终容量。
+
+    正常启动时本模块还没被 import，直接按环境变量构造即可；但如果模块已经被
+    import（例如测试或嵌入调用），这里允许在**没有推理在跑**时安全换挡。
+    有推理正在跑时拒绝换挡并返回当前容量，避免把正在等待的调用丢掉。
+    """
+    global ASR_PARALLEL, _INFER_GATE
+
+    wanted = max(1, min(4, int(capacity)))
+    with _LOAD_LOCK:
+        active = _INFER_GATE.in_use
+        if active > 0:
+            logger.warning(
+                "拒绝调整 ASR 并发容量 %d -> %d：当前仍有 %d 个推理在跑",
+                _INFER_GATE.capacity,
+                wanted,
+                active,
+            )
+            return _INFER_GATE.capacity
+        if wanted != _INFER_GATE.capacity:
+            logger.info(
+                "ASR 并发容量调整：%d -> %d（无推理在跑，安全换挡）",
+                _INFER_GATE.capacity,
+                wanted,
+            )
+            ASR_PARALLEL = wanted
+            _INFER_GATE = _InferenceGate(wanted)
+    os.environ["LOCALAI_ASR_PARALLEL"] = str(wanted)
+    return wanted
+
 
 _model: Any = None
 _load_seconds: Optional[float] = None
@@ -270,7 +434,20 @@ def model_status() -> dict[str, Any]:
         "load_seconds": round(_load_seconds, 2) if _load_seconds is not None else None,
         "load_error": _load_error,
         "device": _loaded_device or DEVICE,
+        "parallel": parallel_status(),
     }
+
+
+def parallel_status() -> dict[str, Any]:
+    """推理并发配置与实时占用（给 /asr/status、/capabilities 用）。"""
+    snapshot = _INFER_GATE.snapshot()
+    snapshot.update(
+        {
+            "env": "LOCALAI_ASR_PARALLEL",
+            "unload_timeout_seconds": ASR_UNLOAD_TIMEOUT,
+        }
+    )
+    return snapshot
 
 
 def is_loaded() -> bool:
@@ -334,7 +511,13 @@ def _build_model(device: str):
 
 
 def ensure_loaded():
-    """加载并返回常驻的 AutoModel 实例；失败会抛出 AsrError。"""
+    """加载并返回常驻的 AutoModel 实例；失败会抛出 AsrError。
+
+    结构性互斥：整段构造过程都在 ``_LOAD_LOCK`` 里，且只有 ``_model is None``
+    时才会真正构造。模型为空时不可能有推理在跑；一旦构造完成，等待同一把锁的
+    其它调用会直接复用新模型。因此「加载时不能有并发推理」由模型生命周期
+    本身 + 加载锁共同保证。
+    """
     global _model, _load_seconds, _load_error, _loaded_device
 
     if _model is not None:
@@ -395,28 +578,48 @@ def _free_cuda() -> None:
 
 
 def unload() -> None:
-    """释放 SenseVoice 模型和显存；重复调用安全。"""
+    """释放 SenseVoice 模型和显存；重复调用安全。
+
+    卸载是结构性操作，必须独占：
+    1. 先收干推理闸门的全部槽位，期间新的推理会排队等待；
+    2. 再拿 ``_LOAD_LOCK``，释放模型引用并清 CUDA 缓存；
+    3. 最后按实际收到的槽位数归还信号量。
+
+    如果等待超过 ``LOCALAI_ASR_UNLOAD_TIMEOUT``（默认 30 秒）仍有推理在跑，
+    只记错误日志并放弃本次卸载，模型保持现状——**绝不把正在推理的模型拆掉**，
+    也不会把信号量计数搞乱（下一次空闲回收还可以再试）。
+    """
     global _model, _load_seconds, _load_error, _loaded_device
 
-    with _LOAD_LOCK:
-        if _model is None:
-            return
-        # 先断引用，再 gc；AutoModel 内部还持有 model / tokenizer / frontend。
-        try:
-            inner = getattr(_model, "model", None)
-            if inner is not None:
+    try:
+        with _INFER_GATE.exclusive(timeout=ASR_UNLOAD_TIMEOUT):
+            with _LOAD_LOCK:
+                if _model is None:
+                    return
+                # 先断引用，再 gc；AutoModel 内部还持有 model / tokenizer / frontend。
                 try:
-                    inner.to("cpu")
-                except Exception:  # noqa: BLE001 - 某些模块没有 to()
+                    inner = getattr(_model, "model", None)
+                    if inner is not None:
+                        try:
+                            inner.to("cpu")
+                        except Exception:  # noqa: BLE001 - 某些模块没有 to()
+                            pass
+                except Exception:  # noqa: BLE001
                     pass
-        except Exception:  # noqa: BLE001
-            pass
-        _model = None
-        _load_seconds = None
-        _load_error = None
-        _loaded_device = None
+                _model = None
+                _load_seconds = None
+                _load_error = None
+                _loaded_device = None
 
-    _free_cuda()
+            # 在独占窗口内清缓存：避免新推理在 gc / empty_cache 期间进来。
+            _free_cuda()
+    except _InferenceDrainTimeout as exc:
+        logger.error(
+            "SenseVoice 卸载已放弃：仍有推理在跑，%s；模型保持加载，稍后空闲回收再试",
+            exc,
+        )
+        return
+
     logger.info("SenseVoice 已卸载，显存已释放")
 
 
@@ -462,11 +665,16 @@ def transcribe(audio_path: str, language: str = "auto") -> dict[str, Any]:
         raise AsrError(f"音频文件不存在：{path}")
 
     language = (language or "auto").strip().lower() or "auto"
-    model = ensure_loaded()
 
-    started = time.perf_counter()
-    try:
-        with _INFER_LOCK:
+    # 推理路径只拿信号量槽位，不嵌套任何独占锁：
+    # - 容量 1：与旧版 _INFER_LOCK 完全一致，同一时刻只有一个推理；
+    # - 容量 >1：最多 N 个推理同时进入；
+    # - 模型加载放在槽位内：模型为空时槽位持有者负责加载，其它槽位会等
+    #   ensure_loaded() 里的加载锁；加载完成前不会有任何真正推理。
+    with _INFER_GATE.slot():
+        model = ensure_loaded()
+        started = time.perf_counter()
+        try:
             _log_vram("ASR 推理前")
             results = model.generate(
                 input=str(path),
@@ -478,11 +686,11 @@ def transcribe(audio_path: str, language: str = "auto") -> dict[str, Any]:
                 merge_length_s=MERGE_LENGTH_S,
             )
             _log_vram("ASR 推理后")
-    except Exception as exc:  # noqa: BLE001 - 统一包成 AsrError
-        logger.exception("SenseVoice 识别失败")
-        raise AsrError(f"SenseVoice 识别失败：{type(exc).__name__}: {exc}") from exc
+        except Exception as exc:  # noqa: BLE001 - 统一包成 AsrError
+            logger.exception("SenseVoice 识别失败")
+            raise AsrError(f"SenseVoice 识别失败：{type(exc).__name__}: {exc}") from exc
 
-    elapsed = time.perf_counter() - started
+        elapsed = time.perf_counter() - started
 
     if not results:
         raise AsrError("SenseVoice 没有返回识别结果")

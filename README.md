@@ -447,9 +447,10 @@ ASR 也照 TTS 的模式做：
 - `_ASR_INFER_LOCK`（asyncio）：识别和卸载互斥，正在识别时不会被看门狗卸掉；
 - `_ENGINE_INFER_LOCK`（asyncio）：TTS 自己的推理/卸载锁，和 ASR 完全独立；
 - `_SPEAKER_INFER_LOCK`（asyncio）：声纹自己的推理/卸载锁，和上面两把都独立；
-- `asr_engine.py` 内部还有 `_LOAD_LOCK` / `_INFER_LOCK`（threading），
-  `speaker_engine.py` 内部有 `_LOAD_LOCK`（threading），
-  防止并发重复加载和并发推理；
+- `asr_engine.py` 内部用 `_LOAD_LOCK`（threading，保护加载/卸载）+
+  `_InferenceGate`（容量可配的推理信号量，默认 1 = 串行；设
+  `LOCALAI_ASR_PARALLEL=2~4` 才放开并发）；
+  `speaker_engine.py` 内部有 `_LOAD_LOCK`（threading），防止并发重复加载；
 - 三个看门狗任务各自检查自己的空闲时间，只动自己的模型。
 
 ### 环境变量
@@ -457,6 +458,7 @@ ASR 也照 TTS 的模式做：
 | 变量 | 默认 | 说明 |
 |---|---:|---|
 | `INDEX_TTS_ASR_IDLE_UNLOAD` | `900` | ASR 空闲卸载秒数；`0` = 关闭 |
+| `LOCALAI_ASR_PARALLEL` | `1` | ASR 引擎并发容量（1=串行，2~4=可并发；默认 1） |
 | `INDEX_TTS_ASR_MODEL_DIR` | `E:\LocalAIService\models\SenseVoiceSmall` | 模型目录 |
 | `INDEX_TTS_ASR_DEVICE` | `cuda:0` | 推理设备；排错可设 `cpu` |
 | `INDEX_TTS_ASR_ALLOW_CPU_FALLBACK` | `1` | CUDA 显存不足时是否回退 CPU |
@@ -1649,7 +1651,8 @@ Windows 的 WDDM 会把一部分显存分页/复用，nvidia-smi 和 torch 的�
 
 ### 17.7 锁与并发
 
-- 每个能力仍有自己的推理锁（`_ENGINE_INFER_LOCK` 等），同一能力的请求串行；
+- 每个能力仍有自己的推理闸门（`_ENGINE_INFER_LOCK` 等），容量默认 1 = 串行；
+  ASR 可显式设 `LOCALAI_ASR_PARALLEL=2` 放开两路（`docs/SERVICE_API.md` 有实测）；
 - 管家另有 `_VRAM_LOAD_LOCK`，保证「判断显存 + 加载」不会两个请求同时做；
 - `ensure_capacity` 内部的 `_op_lock` 串行化「查显存 + 卸模型」；
 - 请求顺序固定：**先拿自己的推理锁 → begin_use → 再进管家**；

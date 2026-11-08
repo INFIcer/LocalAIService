@@ -308,6 +308,7 @@ class JobScheduler:
             "running": len(self._running),
             "max_parallel": self.cfg.jobs_max_parallel,
             "per_kind_parallel": self.parallel_map(),
+            "asr_parallel": self._parallel_limit("asr"),
             "parallel_extra_mb": self.cfg.jobs_parallel_extra_mb,
             "parallel_degraded": dict(self._degraded),
             "concurrency": self._concurrency_snapshot(),

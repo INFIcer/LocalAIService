@@ -20,7 +20,7 @@ from ...constants import (
     MEDIA_MAX_BYTES,
 )
 from ...jobs import prepare_payload
-from ..deps import get_cfg
+from ..deps import get_cfg, get_registry
 from ..job_helpers import cleanup_job_upload, submit_and_wait
 from ..uploads import save_job_upload
 
@@ -47,6 +47,7 @@ async def asr_status_endpoint(request: Request) -> dict[str, Any]:
         "loaded": bool(status["loaded"]),
         "idle_seconds": None if idle is None else round(idle, 1),
         "idle_unload_seconds": cfg.asr_idle_unload,
+        "parallel": status.get("parallel"),
         "detail": status["detail"],
     }
 

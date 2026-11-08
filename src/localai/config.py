@@ -30,6 +30,8 @@
     LOCALAI_ASR_IDLE_UNLOAD
     LOCALAI_SPEAKER_IDLE_UNLOAD
     LOCALAI_SEPARATE_IDLE_UNLOAD
+    LOCALAI_ASR_PARALLEL      识别引擎并发容量（默认 1=串行，范围 1~4）
+    LOCALAI_ASR_UNLOAD_TIMEOUT 识别引擎卸载等待推理退出的超时秒数（默认 30）
     LOCALAI_TOKEN             可选的 Bearer 鉴权令牌（默认空=不鉴权）
 
 任务队列（详见 ``localai.jobs``）::
@@ -37,7 +39,7 @@
     LOCALAI_JOBS_RECOVER       重启后遗留 running 的处理：requeue（默认）/ fail
     LOCALAI_JOBS_MAX_PARALLEL  总并发硬上限（默认 1 = 不额外限制，由每类并行度决定）
     LOCALAI_JOBS_PARALLEL_TTS      TTS 同类并行上限（实测无收益，默认 1）
-    LOCALAI_JOBS_PARALLEL_ASR      ASR 同类并行上限（实测默认 1，原因见文档）
+    LOCALAI_JOBS_PARALLEL_ASR      ASR 同类并行上限（默认跟随 LOCALAI_ASR_PARALLEL）
     LOCALAI_JOBS_PARALLEL_SEPARATE 人声分离同类并行上限（实测无收益，默认 1）
     LOCALAI_JOBS_PARALLEL_EXTRA_MB 每个新增并行任务需预留的显存（默认 600）
     LOCALAI_JOB_TIMEOUT        单个任务超时秒数（默认 600）
@@ -214,6 +216,11 @@ class Config:
     jobs_keep_uploads: bool = False
     jobs_poll_interval: float = 0.2
 
+    #: 识别引擎（SenseVoice）真实并发容量：1（默认）= 完全串行，范围 1~4。
+    #: 这是原生引擎 ``LOCALAI_ASR_PARALLEL`` 的服务层投影；调度器与适配器
+    #: 都从它对齐，避免「调度开 2、引擎仍串行」的两套配置打架。
+    asr_parallel: int = 1
+
     # ---- 派生目录 -------------------------------------------------------
     @property
     def data_dir(self) -> Path:
@@ -286,6 +293,19 @@ class Config:
                 default=str(torch_home / "hub" / "checkpoints"),
             )
         ).expanduser()
+
+        # 识别并发：新变量 LOCALAI_ASR_PARALLEL 优先；只设旧的
+        # LOCALAI_JOBS_PARALLEL_ASR 时也认。两者最终投影到同一个值，
+        # 再分别注入原生引擎和调度器，避免「调度开 2、引擎仍 1」。
+        asr_parallel = max(
+            1,
+            min(
+                4,
+                _pick_int(
+                    1, "LOCALAI_ASR_PARALLEL", "LOCALAI_JOBS_PARALLEL_ASR"
+                ),
+            ),
+        )
 
         return cls(
             home=root,
@@ -374,10 +394,11 @@ class Config:
             ),
             jobs_max_parallel=max(1, _pick_int(1, "LOCALAI_JOBS_MAX_PARALLEL")),
             jobs_parallel_tts=max(1, _pick_int(1, "LOCALAI_JOBS_PARALLEL_TTS")),
-            jobs_parallel_asr=max(1, _pick_int(1, "LOCALAI_JOBS_PARALLEL_ASR")),
+            jobs_parallel_asr=asr_parallel,
             jobs_parallel_separate=max(
                 1, _pick_int(1, "LOCALAI_JOBS_PARALLEL_SEPARATE")
             ),
+            asr_parallel=asr_parallel,
             jobs_parallel_extra_mb=max(
                 0, _pick_int(600, "LOCALAI_JOBS_PARALLEL_EXTRA_MB")
             ),
@@ -398,8 +419,14 @@ class Config:
         ``INDEX_TTS_*`` 环境变量并据此推导路径；服务层统一在这里注入，
         保证「配置只有一个来源」，同时不修改这些模块。
         """
+        # 识别并发以「真正生效的闸门容量」为准写回；
+        # LOCALAI_ASR_PARALLEL（原生引擎）与 LOCALAI_JOBS_PARALLEL_ASR
+        # （调度器）始终同值，避免两处配置打架。
+        asr_parallel = self.asr_parallel_effective()
         mapping = {
             "TTS_BACKEND": self.tts_backend,
+            "LOCALAI_ASR_PARALLEL": str(asr_parallel),
+            "LOCALAI_JOBS_PARALLEL_ASR": str(asr_parallel),
             "INDEX_TTS_HOME": str(self.home),
             "INDEX_TTS_MODEL_DIR": str(self.model_dir),
             "INDEX_TTS_ASR_MODEL_DIR": str(self.asr_model_dir),
@@ -449,6 +476,7 @@ class Config:
             "ffprobe": str(self.ffprobe) if self.ffprobe else None,
             "ffprobe_source": self.ffprobe_source,
             "vram_margin_mb": self.vram_margin_mb,
+            "asr_parallel": self.asr_parallel_effective(),
             "idle_unload": {
                 "tts": self.idle_unload,
                 "asr": self.asr_idle_unload,
@@ -469,11 +497,23 @@ class Config:
         }
 
     # ---- 任务队列并发度 -------------------------------------------------
+    def asr_parallel_effective(self) -> int:
+        """识别并发最终生效值（两个配置字段取较大者，夹在 1~4）。
+
+        ``from_env()`` 会让 ``asr_parallel`` 与 ``jobs_parallel_asr`` 相同；
+        这里取 max 是为了兼容直接构造 / ``dataclasses.replace`` 只改其中一个
+        字段的旧代码，避免「字段显示 2、适配器却仍 1」。
+        """
+        return max(
+            1, min(4, max(int(self.asr_parallel), int(self.jobs_parallel_asr)))
+        )
+
     def jobs_parallel_for(self, kind: str) -> int:
         """某类任务的配置并行上限（未单独配置的能力固定 1）。"""
+        if kind == "asr":
+            return self.asr_parallel_effective()
         return {
             "tts": self.jobs_parallel_tts,
-            "asr": self.jobs_parallel_asr,
             "separate": self.jobs_parallel_separate,
         }.get(kind, 1)
 
@@ -481,7 +521,7 @@ class Config:
         """所有能力当前配置的并行上限（给 /jobs/stats、/capabilities）。"""
         return {
             "tts": self.jobs_parallel_tts,
-            "asr": self.jobs_parallel_asr,
+            "asr": self.asr_parallel_effective(),
             "separate": self.jobs_parallel_separate,
             "speaker": 1,
             "media": 1,

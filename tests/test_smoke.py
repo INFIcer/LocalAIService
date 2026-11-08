@@ -124,6 +124,16 @@ def test_capabilities(client: TestClient) -> None:
         assert "ready" in caps[name] and "loaded" in caps[name]
         assert "endpoints" in caps[name]
     assert caps["media"]["requires_gpu"] is False
+    assert caps["asr"]["parallel"]["capacity"] == get_config().asr_parallel
+    assert body["jobs"]["asr_parallel"] == get_config().asr_parallel
+
+
+def test_asr_status_exposes_parallel_config(client: TestClient) -> None:
+    response = client.get("/asr/status")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["parallel"]["capacity"] == get_config().asr_parallel
+    assert body["parallel"]["env"] == "LOCALAI_ASR_PARALLEL"
 
 
 def test_voices(client: TestClient) -> None:

@@ -164,6 +164,7 @@ async def capabilities(request: Request) -> dict[str, Any]:
             "order": "kind_first > priority > created_at（无 aging）",
             "max_parallel": cfg.jobs_max_parallel,
             "per_kind_parallel": cfg.jobs_parallel_map(),
+            "asr_parallel": cfg.asr_parallel_effective(),
             "parallel_extra_mb": cfg.jobs_parallel_extra_mb,
             "timeout_seconds": cfg.jobs_timeout,
             "recover": cfg.jobs_recover,
