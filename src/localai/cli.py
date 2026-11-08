@@ -313,6 +313,24 @@ def _doctor_models(cfg: Config) -> list[tuple[str, str, bool, str]]:
         )
     )
 
+    # 视觉（VLM）：可选能力，缺失只提示；llama.cpp 二进制与 GGUF 都在 models/vision/。
+    try:
+        from .engines._native import import_engine_module
+
+        vision_status = import_engine_module("vision_engine").model_status()
+        vision_ok = bool(vision_status.get("ready"))
+        vision_detail = (
+            f"llama.cpp {vision_status.get('runtime_version')}，"
+            f"权重 {vision_status.get('model_size_mb')}MB + 投影层 "
+            f"{vision_status.get('mmproj_size_mb')}MB"
+            if vision_ok
+            else "可选：未安装（下载：POST /admin/models/download capability=vision）"
+        )
+    except Exception as exc:  # noqa: BLE001 - 视觉状态不影响整体体检
+        vision_ok = False
+        vision_detail = f"可选：状态读取失败（{type(exc).__name__}: {exc}）"
+    rows.append(("Qwen2.5-VL-3B（视觉）", str(cfg.vision_dir), vision_ok, vision_detail))
+
     ft_missing = _check_files(cfg.demucs_repo, DEMUCS_FT_FILES)[1]
     rows.append(
         (
@@ -442,6 +460,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             or "faster-whisper" in name
             or "fsmn-vad" in name
             or "NLLB" in name
+            or "视觉" in name
         ):
             # 可选组件：缺失只提示，不算问题、不增加警告（doctor 要能 0 警告）。
             mark = INFO
@@ -491,7 +510,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         f"tts={cfg.idle_unload}s asr={cfg.asr_idle_unload}s "
         f"whisper={cfg.whisper_idle_unload}s "
         f"speaker={cfg.speaker_idle_unload}s separate={cfg.separate_idle_unload}s "
-        f"translate={cfg.translate_idle_unload}s"
+        f"translate={cfg.translate_idle_unload}s vision={cfg.vision_idle_unload}s"
     )
     print(
         f"       翻译：nllb-200-distilled-600M fp16={'开' if cfg.translate_fp16 else '关'}"
@@ -499,6 +518,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     )
     print(f"       默认识别引擎：{cfg.asr_engine}；whisper 档位：{cfg.whisper_model}"
           f"（{cfg.whisper_device}/{cfg.whisper_compute}）")
+    print(
+        f"       视觉：Qwen2.5-VL-3B Q4_K_M（llama.cpp，端口 {cfg.vision_port}）"
+        f" 默认 planner={cfg.vision_planner} 空闲 {cfg.vision_idle_unload}s 卸载"
+    )
     print(f"       鉴权：{'已启用（LOCALAI_TOKEN）' if cfg.token else '未启用（默认）'}")
 
     print("\n" + "-" * 72)
@@ -544,7 +567,22 @@ def cmd_models_list(args: argparse.Namespace) -> int:
     print(f"    {cfg.speaker_model_dir}  ({_dir_size_mb(cfg.speaker_model_dir)} MB)")
     print(f"    {len(present)}/{len(MODEL_SPECS['speaker']['required'])} 就绪" + (f"，缺：{', '.join(missing)}" if missing else ""))
 
-    print("\n[4] 人声分离 / Demucs")
+    print("\n[4] 视觉 / Qwen2.5-VL-3B")
+    try:
+        from .engines._native import import_engine_module
+
+        vision_status = import_engine_module("vision_engine").model_status()
+        print(f"    {cfg.vision_dir}  ({_dir_size_mb(cfg.vision_dir)} MB)")
+        print(
+            "    "
+            + ("就绪" if vision_status.get("ready") else "未安装")
+            + f"：llama.cpp {vision_status.get('runtime_version')}，"
+            + f"权重 {vision_status.get('model_size_mb')}MB + 投影层 {vision_status.get('mmproj_size_mb')}MB"
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"    状态读取失败：{type(exc).__name__}: {exc}")
+
+    print("\n[5] 人声分离 / Demucs")
     print(f"    {cfg.demucs_repo}  ({_dir_size_mb(cfg.demucs_repo)} MB)")
     for model, files in DEMUCS_FILES.items():
         _, missing = _check_files(cfg.demucs_repo, files)

@@ -130,6 +130,7 @@ class BaseAdapter(ABC):
             "speaker": self.cfg.speaker_idle_unload,
             "separate": self.cfg.separate_idle_unload,
             "translate": self.cfg.translate_idle_unload,
+            "vision": self.cfg.vision_idle_unload,
         }.get(self.name, 0)
 
     # ------------------------------------------------------------------

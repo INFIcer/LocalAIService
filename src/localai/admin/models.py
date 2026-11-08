@@ -61,6 +61,7 @@ CAPABILITY_TITLES = {
     "separate": "人声分离",
     "vad": "语音端点检测",
     "download": "通用下载",
+    "vision": "视觉理解 / 关键帧",
 }
 
 #: 下载时 capability 的别名。
@@ -80,6 +81,10 @@ _CAPABILITY_ALIASES = {
     "demucs": "separate",
     "vad": "vad",
     "fsmn-vad": "vad",
+    "vision": "vision",
+    "vlm": "vision",
+    "qwen2.5-vl": "vision",
+    "qwen2.5-vl-3b": "vision",
 }
 
 
@@ -323,6 +328,51 @@ def model_catalog(cfg: Config) -> list[dict[str, Any]]:
             note="SenseVoice 分段转写用；whisper 不需要",
         )
     )
+    # ---- 视觉 / 关键帧（llama.cpp + Qwen2.5-VL-3B GGUF） --------------
+    try:
+        from ..engines._native import import_engine_module as _import_engine
+
+        vision_module = _import_engine("vision_engine")
+        vision_status = vision_module.model_status()
+    except Exception as exc:  # noqa: BLE001 - 状态读取失败不影响其它模型
+        vision_status = {
+            "ready": False,
+            "model": "Qwen2.5-VL-3B-Instruct-Q4_K_M",
+            "missing": [f"状态读取失败：{type(exc).__name__}: {exc}"],
+            "detail": str(exc),
+            "model_dir": str(cfg.vision_dir),
+            "model_size_mb": 0,
+            "mmproj_size_mb": 0,
+            "runtime_version": None,
+            "port": cfg.vision_port,
+            "loaded": False,
+        }
+    vision_expected = [
+        cfg.vision_server_file,
+        cfg.vision_model_file,
+        cfg.vision_mmproj_file,
+    ]
+    items.append(
+        _item(
+            capability="vision",
+            name="Qwen2.5-VL-3B-Instruct-Q4_K_M",
+            path=cfg.vision_dir,
+            expected=vision_expected,
+            present=bool(vision_status.get("ready")),
+            missing=list(vision_status.get("missing") or []),
+            size_mb=_dir_size_mb(cfg.vision_dir),
+            active=True,
+            options=["qwen2.5-vl-3b"],
+            note=(
+                f"llama.cpp {vision_status.get('runtime_version') or '构建'}，"
+                f"端口 {vision_status.get('port') or cfg.vision_port}，"
+                f"权重 {vision_status.get('model_size_mb')}MB + 投影层 "
+                f"{vision_status.get('mmproj_size_mb')}MB；"
+                + ("已加载" if vision_status.get("loaded") else "首次视觉请求时加载")
+            ),
+        )
+    )
+
     # ---- yt-dlp（不是权重，但同样在模型页展示版本与状态） --------------
     try:
         from ..engines._native import import_engine_module
@@ -420,6 +470,11 @@ class ModelDownloader:
         if cap == "vad":
             return cap, "fsmn-vad", cfg.asr_vad_dir
 
+        if cap == "vision":
+            if lower not in ("", "qwen2.5-vl-3b", "qwen2.5-vl-3b-instruct"):
+                raise DownloadError("视觉模型名只能是 qwen2.5-vl-3b（或留空）")
+            return cap, "Qwen2.5-VL-3B-Instruct-Q4_K_M", cfg.vision_dir
+
         raise DownloadError(f"不支持的 capability={capability!r}")
 
     # ---- 启动 ---------------------------------------------------------
@@ -510,6 +565,14 @@ class ModelDownloader:
                 task["elapsed_seconds"] = round(time.perf_counter() - started, 1)
 
 
+def vision_status() -> dict[str, Any]:
+    """视觉模型状态（下载后复查用；失败按未就绪处理）。"""
+    try:
+        return import_engine_module("vision_engine").model_status()
+    except Exception:  # noqa: BLE001
+        return {"ready": False, "missing": ["vision_engine 不可用"]}
+
+
 def separate_names() -> tuple[str, ...]:
     return ("htdemucs", "htdemucs_6s", "htdemucs_ft")
 
@@ -534,6 +597,8 @@ def _missing_after(cfg: Config, capability: str, name: str) -> list[str]:
         return _check_files(cfg.speaker_model_dir, MODEL_SPECS["speaker"]["required"])[1]
     if capability == "vad":
         return _check_files(cfg.asr_vad_dir, VAD_REQUIRED)[1]
+    if capability == "vision":
+        return list(vision_status().get("missing") or [])
     if capability == "separate":
         if name == "htdemucs_ft":
             return _check_files(cfg.demucs_repo, DEMUCS_FT_FILES)[1]
@@ -558,6 +623,13 @@ def _download_one(cfg: Config, capability: str, name: str) -> str:
         module = import_engine_module("asr_engine")
         getattr(module, "_ensure_vad_weights")()
         return "modelscope"
+
+    if capability == "vision":
+        module = import_engine_module("vision_engine")
+        module.ensure_assets(
+            progress=lambda text: logger.info("视觉模型下载：%s", text)
+        )
+        return "modelscope + llama.cpp release"
 
     # 其余复用 `localai models download` 的同一份代码。
     from ..cli import _download_demucs, _download_snapshot

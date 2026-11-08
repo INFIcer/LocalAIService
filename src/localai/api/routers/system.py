@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import platform
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -71,6 +72,19 @@ async def health(request: Request) -> dict[str, Any]:
         "idle_unload_seconds": cfg.separate_idle_unload,
         "model": sep.get("loaded_model") or sep.get("model") or "htdemucs",
     }
+    vision_status = registry.get("vision").status()
+    vision_health = {
+        "ready": bool(vision_status.get("ready")),
+        "loaded": bool(vision_status.get("loaded")),
+        "model": vision_status.get("model"),
+        "runtime": vision_status.get("runtime"),
+        "runtime_version": vision_status.get("runtime_version"),
+        "port": vision_status.get("port"),
+        "idle_unload_seconds": cfg.vision_idle_unload,
+        "model_size_mb": vision_status.get("model_size_mb"),
+        "mmproj_size_mb": vision_status.get("mmproj_size_mb"),
+        "detail": vision_status.get("detail"),
+    }
     download_health = registry.get("download").status()
     download_health = {
         "ready": bool(download_health.get("ready")),
@@ -115,6 +129,7 @@ async def health(request: Request) -> dict[str, Any]:
             "speaker": speaker_health,
             "separate": separate_health,
             "download": download_health,
+            "vision": vision_health,
             "vram": vram_health,
             "media": media.health(),
             "comfy": "disabled",
@@ -142,6 +157,7 @@ async def health(request: Request) -> dict[str, Any]:
         "speaker": speaker_health,
         "separate": separate_health,
         "download": download_health,
+        "vision": vision_health,
         "vram": vram_health,
         "media": media.health(),
         "jobs": jobs_health,
@@ -216,6 +232,23 @@ async def capabilities(request: Request) -> dict[str, Any]:
             "ssrf": "只允许 http/https；私有/回环/链路本地地址与 file:// 一律拒绝",
             "cookies": "B站自动读取本机凭证；其它站点需显式传 Netscape cookie 文件",
         },
+        "vision": {
+            **registry.get("vision").status(),
+            "planner_default": cfg.vision_planner,
+            "planners": ["hybrid", "agent"],
+            "idle_unload_seconds": cfg.vision_idle_unload,
+            "phash_distance": cfg.vision_phash_distance,
+            "prompts_dir": str(Path(cfg.home) / "docs" / "prompts"),
+            "endpoints": [
+                "/vision/describe",
+                "/vision/scan",
+                "/vision/frames",
+                "/vision/status",
+                "/jobs/vision",
+            ],
+            "limits": {"target_frames": [1, 10], "max_rounds": [1, 12]},
+            "note": "llama.cpp 子进程；启动 0 模型，首次请求才加载；与 TTS 按 LRU 互卸",
+        },
         "translate": {
             "engine": "nllb",
             "model": "nllb-200-distilled-600M",
@@ -272,6 +305,7 @@ async def capabilities(request: Request) -> dict[str, Any]:
                 "speaker": cfg.speaker_idle_unload,
                 "separate": cfg.separate_idle_unload,
                 "translate": cfg.translate_idle_unload,
+                "vision": cfg.vision_idle_unload,
             },
         },
         "files": {

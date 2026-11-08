@@ -117,6 +117,13 @@ class SeparateBackendError(LocalAIError):
     error_code = "separate_error"
 
 
+class VisionBackendError(LocalAIError):
+    """视觉（VLM）引擎加载/推理失败。"""
+
+    status_code = 503
+    error_code = "vision_error"
+
+
 # ---------------------------------------------------------------------------
 # 任务队列（localai.jobs）
 # ---------------------------------------------------------------------------

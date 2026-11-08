@@ -23,6 +23,7 @@ from .separate_demucs import SeparateAdapter
 from .speaker_campplus import SpeakerAdapter
 from .translate_nllb import TranslateAdapter
 from .tts_indextts import TtsAdapter
+from .vision_vlm import VisionAdapter
 
 __all__ = [
     "BaseAdapter",
@@ -34,6 +35,7 @@ __all__ = [
     "MediaAdapter",
     "DownloadAdapter",
     "TranslateAdapter",
+    "VisionAdapter",
     "build_registry",
 ]
 
@@ -51,4 +53,6 @@ def build_registry(cfg: Optional[Config] = None) -> EngineRegistry:
     registry.register(SeparateAdapter(cfg))
     registry.register(MediaAdapter(cfg))
     registry.register(DownloadAdapter(cfg))
+    # 视觉（VLM）放最后：/vram 里排在旧能力后面，不影响旧展示顺序。
+    registry.register(VisionAdapter(cfg))
     return registry

@@ -34,6 +34,7 @@ from ..core.errors import (
     SeparateBackendError,
     SpeakerBackendError,
     TranslateBackendError,
+    VisionBackendError,
     VoiceNotFound,
 )
 from ..core.idle import IdleWatchdog
@@ -50,6 +51,7 @@ from .routers import (
     system,
     translate,
     tts,
+    vision,
 )
 
 logger = logging.getLogger("localai.api")
@@ -155,6 +157,15 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
         logger.info("人声分离模型状态：%s", sep_status["detail"])
         logger.info("Demucs 权重目录：%s（首次 /separate 请求时加载）", sep_status.get("weights_dir"))
 
+        vision_status = registry.get("vision").status()
+        logger.info("视觉模型状态：%s", vision_status["detail"])
+        logger.info(
+            "视觉模型目录：%s（llama-server 端口 %s，首次视觉请求时加载；空闲 %ds 卸载）",
+            cfg.vision_dir,
+            cfg.vision_port,
+            cfg.vision_idle_unload,
+        )
+
         # 每个 GPU 能力一个独立看门狗；TTS 只在 engine 后端下启用。
         for adapter in registry.gpu_adapters():
             if adapter.name == "tts" and cfg.tts_backend != "engine":
@@ -192,6 +203,13 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
                     await task
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     pass
+            # 视觉模型跑在独立子进程里，退出时必须显式停掉，避免留下孤儿进程。
+            vision_adapter = registry.find("vision")
+            if vision_adapter is not None:
+                try:
+                    await asyncio.to_thread(vision_adapter.unload)
+                except Exception:  # noqa: BLE001
+                    logger.exception("停止视觉引擎时出错")
             await app.state.client.aclose()
 
     app = FastAPI(
@@ -334,6 +352,14 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
             content={"ok": False, "error": "separate_error", "detail": exc.message},
         )
 
+    @app.exception_handler(VisionBackendError)
+    async def _vision_error_handler(request: Request, exc: VisionBackendError) -> JSONResponse:
+        logger.error("视觉引擎错误：%s | %s", exc.message, exc.detail or "")
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"ok": False, "error": "vision_error", "detail": exc.message},
+        )
+
     @app.exception_handler(InsufficientVramError)
     async def _insufficient_vram_handler(
         request: Request, exc: InsufficientVramError
@@ -409,6 +435,7 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
     app.include_router(speakers.router)
     app.include_router(separate.router)
     app.include_router(media.router)
+    app.include_router(vision.router)
     app.include_router(admin.router)
 
     # ------------------------------------------------------------------

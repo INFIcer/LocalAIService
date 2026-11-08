@@ -122,9 +122,44 @@ class MediaAnalyzeRequest(BaseModel):
     max_frames: int = Field(0, ge=0, le=200, description="0=不抽帧；>0 均匀+场景吸附抽帧")
     quality: str = Field("720p", description="720p / best / audio")
     subtitles: bool = Field(True, description="优先使用站点字幕")
+    filter: str = Field(
+        "",
+        description="可选 vision：分析完直接让 VLM 挑关键帧（不传保持旧行为）",
+    )
+    target_frames: int = Field(
+        3, ge=1, le=10, description="filter=vision 时挑几张关键帧"
+    )
 
 
 class JobAnalyzeRequest(MediaAnalyzeRequest):
     """POST /jobs/analyze：异步链接分析。"""
+
+    priority: int = 0
+
+
+class VisionFramesRequest(BaseModel):
+    """POST /vision/frames：按字幕 + 时长循环抽帧。
+
+    ``video_path`` 与 ``job_id`` 二选一：前者是服务端本地路径，后者先查任务
+    结果里的 ``path``（例如刚跑完的下载 / 分析任务）。
+    """
+
+    video_path: Optional[str] = Field(None, description="服务端本地的视频路径")
+    job_id: Optional[str] = Field(None, description="任务 id（结果里带 path 时用它）")
+    target_frames: int = Field(3, ge=1, le=10, description="要凑够几张有效关键帧")
+    planner: str = Field(
+        "hybrid", description="hybrid=逐帧评分补抽（默认）/ agent=多轮代理协议"
+    )
+    max_rounds: int = Field(6, ge=1, le=12, description="最多补抽轮数")
+    subtitles: Optional[list[dict[str, Any]]] = Field(
+        None, description="可选：[{start,end,text}]；不给就找同目录字幕或跑 ASR"
+    )
+    scene_times: Optional[list[float]] = Field(
+        None, description="可选：已知场景边界（秒）；不给就现场检测"
+    )
+
+
+class JobVisionRequest(VisionFramesRequest):
+    """POST /jobs/vision：异步关键帧挑选。"""
 
     priority: int = 0

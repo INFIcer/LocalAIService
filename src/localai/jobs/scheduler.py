@@ -84,7 +84,7 @@ class JobScheduler:
         self.client = client
         self.vram = vram
         self.executor = executor or execute_job
-        self.ctx = JobContext(cfg=cfg, registry=registry, client=client)
+        self.ctx = JobContext(cfg=cfg, registry=registry, client=client, store=store)
 
         self.current_kind: Optional[str] = None
         self.batch_streak = 0

@@ -342,6 +342,24 @@ def system_info(
     except Exception as exc:  # noqa: BLE001
         download_block = {"yt_dlp_version": None, "error": f"{type(exc).__name__}: {exc}"}
 
+    # 视觉模型状态（模型页 / 系统页都能看到版本与加载状态）。
+    try:
+        vision_status = registry.get("vision").status()
+        vision_block = {
+            "model": vision_status.get("model"),
+            "runtime": vision_status.get("runtime"),
+            "runtime_version": vision_status.get("runtime_version"),
+            "ready": bool(vision_status.get("ready")),
+            "loaded": bool(vision_status.get("loaded")),
+            "port": vision_status.get("port"),
+            "model_size_mb": vision_status.get("model_size_mb"),
+            "mmproj_size_mb": vision_status.get("mmproj_size_mb"),
+            "planner": cfg.vision_planner,
+            "idle_unload_seconds": cfg.vision_idle_unload,
+        }
+    except Exception as exc:  # noqa: BLE001 - 系统页不能因此挂掉
+        vision_block = {"ready": False, "error": f"{type(exc).__name__}: {exc}"}
+
     return {
         "ok": True,
         "service": {
@@ -368,6 +386,7 @@ def system_info(
         "gpu": _gpu_info(vram),
         "disk": disk,
         "models_loaded": loaded,
+        "vision": vision_block,
         "download": download_block,
         "jobs": jobs_stats or {},
         "autostart": scheduled_task_status(),

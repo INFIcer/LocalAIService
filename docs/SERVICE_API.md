@@ -1522,3 +1522,239 @@ B站字幕抽查（与音频内容一致）：
   当视频保存。
 - 不做站内爬取 / 批量抓取，一次只下载用户明确给出的一个公开链接。
 
+---
+
+## 15. 视觉 / 关键帧挑选（Qwen2.5-VL-3B）
+
+本地小视觉模型（VLM）+ 「按字幕和时长循环抽帧，直到凑够 N 张有效关键帧」的代理。
+启动仍然 0 模型：第一次视觉请求才拉起 ``llama.cpp`` 的 ``llama-server.exe``
+子进程（只监听 ``127.0.0.1:7891``），和 TTS / ASR / 翻译一样由显存管家按 LRU
+互卸；空闲 ``LOCALAI_VISION_IDLE_UNLOAD``（默认 900 秒）后自动停掉。
+
+### 15.1 接口一览
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| POST | `/vision/describe` | 单张图片理解（multipart），默认用单帧评分提示词 |
+| POST | `/vision/scan` | 多图批量：multipart 上传或 JSON 路径列表；`task=score/caption/ocr` |
+| POST | `/vision/frames` | 按字幕 + 场景 + VLM 循环抽帧，凑够 N 张 |
+| POST | `/jobs/vision` | 异步版 `/vision/frames`（kind=vision，可查进度/取消） |
+| GET | `/vision/status` | 模型、进程、显存估算、默认 planner、提示词文件 |
+| POST | `/media/analyze` | 旧接口新增可选 `filter="vision"` + `target_frames` |
+
+### 15.2 `POST /vision/describe`
+
+multipart，字段名固定 ``file``；可选 ``prompt``（覆盖用户消息）与 ``time``（秒）。
+系统提示词固定读 ``docs/prompts/vlm_frame_score.md``，所以返回通常是评分 JSON。
+
+```powershell
+curl.exe -s -X POST http://127.0.0.1:7880/vision/describe `
+  -F "file=@outputs\frames\xxx\frame_0002_215.600s.jpg"
+```
+
+```json
+{
+  "ok": true,
+  "text": "```json\n{\n  \"usable\": false,\n  \"kind\": \"blank\",\n  \"score\": 1,\n  \"ocr_text\": \"\",\n  \"summary\": \"视频片段空白，无信息\",\n  \"why\": \"视频片段空白，无信息\"\n}\n```",
+  "parsed": {"usable": false, "kind": "blank", "score": 1, "ocr_text": "", "summary": "视频片段空白，无信息", "why": "视频片段空白，无信息"},
+  "elapsed_ms": 985,
+  "model": "Qwen2.5-VL-3B-Instruct-Q4_K_M",
+  "prompt_file": "docs/prompts/vlm_frame_score.md"
+}
+```
+
+- 只接受真正的图片（JPEG/PNG/WebP/GIF/BMP，按文件头判断），其它一律 400；
+- 上传文件在处理完立即删除；
+- 模型偶尔会包 markdown 围栏，服务端同时返回 `parsed`（容错解析结果）。
+
+### 15.3 `POST /vision/scan`
+
+两种请求体：
+
+```powershell
+# 1) multipart 多图（字段名随意，可多张）
+curl.exe -s -X POST http://127.0.0.1:7880/vision/scan -F "task=score" -F "file=@a.jpg" -F "file=@b.jpg"
+
+# 2) JSON 路径列表（服务端本机文件）
+curl.exe -s -X POST http://127.0.0.1:7880/vision/scan -H "Content-Type: application/json" `
+  -d "{\"task\":\"score\",\"images\":[\"E:/a.jpg\",\"E:/b.jpg\"]}"
+```
+
+返回 ``{ok,task,count,results:[{index,path,text,parsed}],elapsed_ms,model}``。
+``task`` 决定提示词：`score`=评分 JSON、`caption`=一句话描述 JSON、`ocr`=纯文字。
+一次最多 16 张；模型只加载一次，逐张推理（llama-server 单 slot）。
+
+### 15.4 `POST /vision/frames`
+
+```json
+{
+  "video_path": "E:/LocalAIService/data/downloads/2026-11-08/xxx.mp4",
+  "target_frames": 3,
+  "planner": "hybrid",
+  "max_rounds": 6,
+  "subtitles": [{"start": 0.08, "end": 0.68, "text": "本期盘点"}],
+  "scene_times": [1.52, 3.04]
+}
+```
+
+``video_path`` 与 ``job_id`` 二选一（``job_id`` 会从任务结果的 ``path`` 取视频）。
+``subtitles`` / ``scene_times`` 可选：不给就找同目录站点字幕（``*.zh.srt`` 等），
+没字幕再跑 ``/asr/segments`` 同款分段识别；场景点没给就现场 ``/media/scenes``。
+
+响应：
+
+```json
+{
+  "ok": true,
+  "video": "...",
+  "duration": 431.267,
+  "target": 3,
+  "rounds_used": 1,
+  "frames": [
+    {"time": 5.085, "path": "...", "score": 4, "kind": "chart",
+     "ocr_text": "...", "summary": "...", "why": "..."}
+  ],
+  "stats": {"candidates": 12, "vlm_calls": 8, "blank_skipped": 0,
+            "duplicates_skipped": 4, "elapsed_ms": 20653,
+            "planner": "hybrid", "max_rounds": 6, "subtitles": 209},
+  "subtitles_from": "site"
+}
+```
+
+字段：``target`` 1~10；``planner`` ``hybrid``（默认）/``agent``；``max_rounds`` 1~12。
+凑不够时如实少给，并带 ``detail``/``stats.shortfall``；VLM 不可用时带
+``degraded=true`` + ``degraded_reason``，帧仍来自确定性回退。
+
+**两种 planner 的区别**
+
+| | `hybrid`（默认） | `agent` |
+| --- | --- | --- |
+| 规划 | 字幕关键词 + 场景点 + 均匀补充（确定性） | 先用 `vlm_frame_plan.md` 让模型规划，再按代理协议循环 |
+| 评分 | 每帧一次 `vlm_frame_score.md`，取 `usable && score>=3` 的前 N | 同左；模型每轮输出 `{"action":"extract","times":[...]}` 或 `{"action":"final","frames":[...]}` |
+| 轮数 | 分数不够就补抽 4~8 个新点，最多 `max_rounds` | 模型自己决定下一批点；`round>=max_rounds` 强制结束 |
+| 速度 | 快、可控 | 多几次纯文本调用，适合复杂讲解视频 |
+| 解析容错 | 去 markdown 围栏 + 第一个 `{` 到最后一个 `}` + 容忍尾逗号 | 同左 |
+
+**算法（两条 planner 共用）**
+
+1. ffprobe 取时长；字幕按「调用方 > 同目录站点字幕 > ASR」；
+2. 生成候选点（字幕关键词位 > 场景切换点 > 均匀补充，点间距 ≥3 秒）；
+3. 先抽 8~16 张，做**感知哈希去重**（dHash 汉明距离，默认阈值 6）+ **亮度/方差预筛**
+   （近纯色、低方差直接判 `blank`，不调 VLM）；
+4. 对非空白帧调 VLM 评分；同一张幻灯片按「感知哈希 / OCR 相似度 / summary」
+   只留一张；
+5. 不够就补抽；VLM 连续失败两次提前终止，退回方差 + 场景点的确定性结果。
+
+抽帧宽度固定 768px（够看清幻灯片正文，又把视觉 token 控制在 ~1000）。
+结果图片落在 ``outputs/frames/vision_<时间戳>_<随机>/``。
+
+### 15.5 `POST /jobs/vision`
+
+请求体同 `/vision/frames`，额外 ``priority``；提交后轮询 ``GET /jobs/{id}``。
+``kind=vision`` 在队列里固定同类并行 1；进度写 ``meta.progress``（stage/percent），
+``POST /jobs/{id}/cancel`` 在下一轮检查点退出。
+
+```powershell
+curl.exe -s -X POST http://127.0.0.1:7880/jobs/vision -H "Content-Type: application/json" `
+  -d "{\"video_path\":\"E:/.../a.mp4\",\"target_frames\":3,\"planner\":\"hybrid\"}"
+```
+
+### 15.6 `/media/analyze` 的 `filter="vision"`
+
+```json
+{"url": "https://...", "filter": "vision", "target_frames": 3}
+```
+
+在「下载 -> 字幕/ASR -> 场景边界」之后，直接复用当前字幕与场景点挑关键帧，
+结果里多出：
+
+```json
+"vision_frames": [{"time": 5.085, "path": "...", "score": 4, "kind": "chart", "...": "..."}],
+"vision": {"planner": "hybrid", "rounds_used": 1, "vlm_calls": 8,
+           "degraded": false, "degraded_reason": null}
+```
+
+不传 ``filter``（或传空）时行为与旧版完全一致，``frames`` 仍是原来的均匀抽帧。
+
+### 15.7 `GET /vision/status`
+
+```json
+{
+  "ok": true, "ready": true, "loaded": false,
+  "model": "Qwen2.5-VL-3B-Instruct-Q4_K_M",
+  "runtime": "llama.cpp", "runtime_version": "b12202", "port": 7891,
+  "model_size_mb": 1840.5, "mmproj_size_mb": 805.6,
+  "vram_estimate_mb": 3400, "planner_default": "hybrid",
+  "prompts": {"dir": "...", "score": true, "agent": true, "plan": true},
+  "endpoints": ["/vision/describe", "/vision/scan", "/vision/frames",
+                "/vision/status", "/jobs/vision"],
+  "limits": {"target_frames": [1, 10], "max_rounds": [1, 12]}
+}
+```
+
+该接口**不会加载模型**：只读文件与进程状态。
+
+### 15.8 模型、显存与降级
+
+| 项目 | 值 |
+| --- | --- |
+| 路线 | llama.cpp 子进程（Vulkan 构建）+ Qwen2.5-VL-3B-Instruct GGUF |
+| 文本模型 | `models/vision/Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf`（约 1.84GB） |
+| 视觉投影 | `models/vision/mmproj-Q8_0.gguf`（约 0.81GB；由 F16 用 llama-quantize 压到 Q8） |
+| 运行时 | `models/vision/llama-server.exe` + DLL（约 37MB zip，解压后 ~100MB） |
+| 显存 | 权重约 2.65GB + 上下文/计算缓冲，整卡增量约 **3.4GB**（≤3.5GB 目标） |
+| 单帧耗时 | 预热后约 **0.8~2 秒**（768px，400 token 输出） |
+| 空闲卸载 | `LOCALAI_VISION_IDLE_UNLOAD`（默认 900，0=关） |
+| 端口 | `LOCALAI_VISION_PORT`（默认 7891，只监听 127.0.0.1） |
+
+- 安装：``POST /admin/models/download {"capability":"vision"}``，或把上面三个文件
+  手动放进 ``models/vision/``；``localai doctor`` 会显示版本与缺失文件。
+- 8G 卡上 VLM 与 TTS 不能同时驻留：加载前显存管家会按 LRU 卸掉最久没用的模型；
+  视觉模型在独立子进程里，卸掉即释放，不会留下 torch 碎片。
+- **降级**：模型缺失/进程崩溃/请求超时/VLM 全部失败时，``/vision/frames`` 返回
+  ``degraded=true`` + 方差筛选结果；``/vision/describe`` 返回 503（``vision_error``）。
+  进程不会因为视觉失败而崩；下一次请求会自动重拉 llama-server。
+
+**相关环境变量**
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `LOCALAI_VISION_DIR` | `<HOME>/models/vision` | 二进制 + GGUF 目录 |
+| `LOCALAI_VISION_PORT` | 7891 | llama-server 端口（仅回环） |
+| `LOCALAI_VISION_CTX` | 4096 | 上下文长度（agent 协议需要放完整提示词） |
+| `LOCALAI_VISION_GPU_LAYERS` | 99 | 卸载到 GPU 的层数 |
+| `LOCALAI_VISION_TIMEOUT` | 120 | 单次推理超时秒数 |
+| `LOCALAI_VISION_IDLE_UNLOAD` | 900 | 空闲卸载秒数，0=关 |
+| `LOCALAI_VISION_PLANNER` | hybrid | 默认 planner |
+| `LOCALAI_VISION_PHASH_DISTANCE` | 6 | 感知哈希去重阈值 |
+| `LOCALAI_VISION_MODEL` / `_MMPROJ` / `_SERVER` | 见上表 | 覆盖文件名 |
+
+### 15.9 实测（RTX 3070 8GB，2026-11-08）
+
+| 场景 | 结果 |
+| --- | --- |
+| 431 秒 B 站视频（209 段站点字幕），hybrid，target=3 | **3 帧 / 1 轮 / VLM 8 次 / 20.7s**；选点 **5.085s、163.725s、224.265s** |
+| 同上，agent，target=3 | **3 帧 / 2 轮 / VLM 14 次 / 27.1s**（先按 `vlm_frame_plan.md` 规划，再走 `extract` 补抽与 `final` 决策；选点与 hybrid 相同：5.085 / 163.725 / 224.265） |
+| 10 秒短视频（Big Buck Bunny，无音轨），hybrid，target=2 | **2 帧 / 1 轮 / VLM 3 次 / 9.5s**，无死循环；ASR 因无音轨失败后按无字幕继续 |
+| 空章节页 `/vision/describe` | `usable=false`、`kind=blank`、`score=1` |
+| 显存 | 加载后整卡 used 约 **4.6GB**（基线约 1.2GB，增量约 **3.4GB**）；卸载后回落到基线 |
+| 二次复用 | 同一进程第二次挑帧不再加载模型，llama-server 保持常驻，单帧约 1 秒 |
+
+**人工核对（431 秒视频，target=3）**
+
+- 旧均匀抽帧：71.9s（RTF 排行图）/ 215.6s（**空章节页**）/ 359.4s（总结页）；
+- 新 hybrid：5.085s（工具总览 UI）、163.725s（「同一句词，四种语气」对比页）、
+  224.265s（商用许可清单，正文完整）。空章节页被排除，后两张明显比均匀抽帧有信息量；
+  第一张是片头工具总览，信息量一般但不再是纯章节页/转场。
+
+### 15.10 已知限制
+
+- 3B 小模型会**幻觉 OCR**：字幕提示词在场时，偶尔把字幕内容写进 `ocr_text`；
+  关键帧本身仍按画面筛，建议调用方把 `ocr_text` 当辅助信息。
+- Qwen2.5-VL 的视觉投影层用 Q8 量化以压到 3.5GB 显存，极端小字 OCR 可能弱于 F16；
+  需要更高精度可设 `LOCALAI_VISION_MMPROJ=mmproj-F16.gguf`（显存约 +0.5GB）。
+- 首次在新机器上跑视觉图会现场编译 Vulkan shader（约 8~10 秒），之后进入
+  1~2 秒/帧；服务启动时会自动做一次小图预热。
+- `agent` planner 的质量取决于小模型是否按协议输出 JSON；解析失败会退回
+  `hybrid` 的确定性补抽，不会卡死。
+- 一次最多 10 张关键帧、12 轮；超过请分多次或先缩小视频区间。

@@ -61,6 +61,7 @@ DEFAULT_ACTION = {
     "translate": "translate.text",
     "download": "download.fetch",
     "analyze": "analyze.url",
+    "vision": "vision.frames",
 }
 
 #: 每种 kind 允许的 action。
@@ -73,6 +74,7 @@ KIND_ACTIONS = {
     "translate": {"translate.text"},
     "download": {"download.fetch"},
     "analyze": {"analyze.url"},
+    "vision": {"vision.frames"},
 }
 
 _SPEAKER_OFF_VALUES = {"0", "false", "off", "no", "none", ""}
@@ -104,6 +106,8 @@ class JobContext:
     cfg: Config
     registry: Any
     client: Any = None
+    #: 任务库（vision 任务按 job_id 取视频路径时用）。
+    store: Any = None
     #: 进度上报（下载 / 分析任务用）；由调度器为每个任务注入，写进 jobs.meta。
     progress: Optional[Callable[[dict[str, Any]], None]] = None
     #: 取消查询；返回 True 时执行器应在下一个检查点退出。
@@ -341,7 +345,73 @@ def prepare_payload(
         if not 0 <= max_frames <= 200:
             raise ValueError("max_frames 必须在 0~200 之间（0=不抽帧）")
         normalized.update({"engine": raw_engine, "max_frames": max_frames})
+        raw_filter = (_text(data.get("filter")) or "").lower()
+        if raw_filter in ("", "none", "off"):
+            normalized["filter"] = ""
+        elif raw_filter == "vision":
+            normalized["filter"] = "vision"
+        else:
+            raise ValueError("filter 只支持空字符串（旧行为）或 vision")
+        try:
+            target_frames = int(data.get("target_frames") or 3)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"target_frames 必须是整数：{data.get('target_frames')!r}") from exc
+        if not 1 <= target_frames <= 10:
+            raise ValueError("target_frames 必须在 1~10 之间")
+        normalized["target_frames"] = target_frames
         return act, normalized
+
+    if kind == "vision":
+        raw_path = _text(data.get("video_path") or data.get("file") or data.get("path"))
+        job_id = _text(data.get("job_id"))
+        if not raw_path and not job_id:
+            raise ValueError("关键帧任务需要 video_path 或 job_id")
+        video_path: Optional[Path] = None
+        if raw_path:
+            video_path = Path(raw_path)
+            if not video_path.is_file():
+                raise ValueError(f"视频不存在：{video_path}")
+            from ..constants import MEDIA_VIDEO_EXTENSIONS
+
+            if video_path.suffix.lower() not in MEDIA_VIDEO_EXTENSIONS:
+                raise ValueError(
+                    f"不支持的文件类型 {video_path.suffix or '(无扩展名)'}；"
+                    "关键帧只接受视频文件"
+                )
+        try:
+            target_frames = int(data.get("target_frames") or 3)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"target_frames 必须是整数：{data.get('target_frames')!r}") from exc
+        if not 1 <= target_frames <= 10:
+            raise ValueError("target_frames 必须在 1~10 之间")
+        planner = (_text(data.get("planner")) or "hybrid").lower()
+        if planner not in ("hybrid", "agent"):
+            raise ValueError("planner 只支持 hybrid / agent")
+        try:
+            max_rounds = int(data.get("max_rounds") or 6)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"max_rounds 必须是整数：{data.get('max_rounds')!r}") from exc
+        if not 1 <= max_rounds <= 12:
+            raise ValueError("max_rounds 必须在 1~12 之间")
+        subtitles = data.get("subtitles")
+        if subtitles is not None and not isinstance(subtitles, (list, str)):
+            raise ValueError("subtitles 必须是 [{start,end,text}] 或字幕文件路径")
+        raw_scenes = data.get("scene_times")
+        scene_times: Optional[list[float]] = None
+        if raw_scenes is not None:
+            try:
+                scene_times = [round(float(item), 3) for item in raw_scenes]
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"scene_times 必须是数字列表：{exc}") from exc
+        return act, {
+            "video_path": str(video_path) if video_path else None,
+            "job_id": job_id or None,
+            "target_frames": target_frames,
+            "planner": planner,
+            "max_rounds": max_rounds,
+            "subtitles": subtitles,
+            "scene_times": scene_times,
+        }
 
     # media
     file_path = _require_file(data, cfg)
@@ -803,6 +873,23 @@ async def _run_analyze(payload: dict[str, Any], ctx: JobContext) -> dict[str, An
                 "extract_frames", str(path), str(out_dir), times=times
             )
 
+    # filter=vision：分析完成后直接让 VLM 按字幕+场景挑关键帧（不传则旧行为不变）。
+    vision_result: Optional[dict[str, Any]] = None
+    if payload.get("filter") == "vision":
+        from ..core.frames_agent import FramesAgent
+
+        ctx.report({"stage": "vision", "percent": 88, "status": "running"})
+        vision_result = await FramesAgent(cfg, ctx.registry).run(
+            path,
+            target_frames=int(payload.get("target_frames") or 3),
+            planner=payload.get("planner") or cfg.vision_planner,
+            max_rounds=int(payload.get("max_rounds") or 6),
+            subtitles=segments,
+            scene_times=[float(item.get("time") or 0) for item in scenes],
+            on_progress=ctx.report,
+            is_canceled=ctx.is_canceled,
+        )
+
     elapsed = round(time.perf_counter() - started, 1)
     result = {
         "ok": True,
@@ -815,6 +902,18 @@ async def _run_analyze(payload: dict[str, Any], ctx: JobContext) -> dict[str, An
         "segments": segments,
         "scenes": scenes,
         "frames": frames,
+        "vision_frames": (vision_result or {}).get("frames") or [],
+        "vision": (
+            {
+                "planner": (vision_result or {}).get("stats", {}).get("planner"),
+                "rounds_used": vision_result.get("rounds_used"),
+                "vlm_calls": (vision_result or {}).get("stats", {}).get("vlm_calls"),
+                "degraded": bool(vision_result.get("degraded")),
+                "degraded_reason": vision_result.get("degraded_reason"),
+            }
+            if vision_result is not None
+            else None
+        ),
         "scenes_json": scene_result.get("json_path"),
         "asr": {
             "engine": asr_info.get("engine"),
@@ -843,6 +942,40 @@ async def _run_analyze(payload: dict[str, Any], ctx: JobContext) -> dict[str, An
     return result
 
 
+async def _run_vision(payload: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
+    """关键帧挑选任务：把 ``/vision/frames`` 的逻辑搬进队列，支持进度/取消。"""
+    from ..core.frames_agent import FramesAgent
+
+    raw_path = str(payload.get("video_path") or "").strip()
+    video_path = Path(raw_path) if raw_path else None
+    if video_path is None:
+        job_id = str(payload.get("job_id") or "").strip()
+        if not job_id or ctx.store is None:
+            raise ValueError("关键帧任务需要 video_path 或可查询的 job_id")
+        job = await ctx.store.get(job_id)
+        if job is None:
+            raise ValueError(f"任务不存在：{job_id}")
+        result = job.get("result") or {}
+        candidate = result.get("path") or result.get("video") or result.get("output_path")
+        if not candidate:
+            raise ValueError(f"任务 {job_id} 的结果里没有视频路径")
+        video_path = Path(str(candidate))
+    if not video_path.is_file():
+        raise ValueError(f"视频不存在：{video_path}")
+
+    outcome = await FramesAgent(ctx.cfg, ctx.registry).run(
+        video_path,
+        target_frames=int(payload.get("target_frames") or 3),
+        planner=payload.get("planner") or "hybrid",
+        max_rounds=int(payload.get("max_rounds") or 6),
+        subtitles=payload.get("subtitles"),
+        scene_times=payload.get("scene_times"),
+        on_progress=ctx.report,
+        is_canceled=ctx.is_canceled,
+    )
+    return outcome
+
+
 async def execute_job(job: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     """按 ``kind/action`` 分派到具体能力；返回 JSON 可序列化结果。"""
     kind = job["kind"]
@@ -864,4 +997,6 @@ async def execute_job(job: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         return await _run_download(payload, ctx)
     if kind == "analyze":
         return await _run_analyze(payload, ctx)
+    if kind == "vision":
+        return await _run_vision(payload, ctx)
     raise ValueError(f"未知任务类型：{kind}")

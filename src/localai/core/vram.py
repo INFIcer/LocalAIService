@@ -285,7 +285,21 @@ class VramManager:
         return free, FALLBACK_TOTAL_MB
 
     def read_memory(self, *, initialize: bool = False) -> tuple[float, float]:
-        """返回 (空闲 MB, 总显存 MB)。"""
+        """返回 (空闲 MB, 总显存 MB)。
+
+        特例：视觉模型跑在 Vulkan 子进程里，Windows 上 CUDA 的
+        ``mem_get_info`` 经常看不到这块占用，会把空闲报高；这种时候
+        强制用 nvidia-smi 的真实数据。
+        """
+        with self._lock:
+            vision_loaded = any(
+                entry.name == "vision" and entry.is_loaded()
+                for entry in self._entries.values()
+            )
+        if vision_loaded:
+            smi = self._read_memory_nvidia_smi()
+            if smi is not None:
+                return smi
         result = self._read_memory_torch(initialize=initialize)
         if result is None:
             result = self._read_memory_nvidia_smi()
@@ -619,6 +633,17 @@ class VramManager:
         if before_free_mb is None or after_free_mb is None:
             return None
         measured = float(before_free_mb) - float(after_free_mb)
+        return self.record_measured(name, measured)
+
+    def record_measured(self, name: str, measured_mb: Optional[float]) -> Optional[int]:
+        """用已知的真实增量校准估算。
+
+        视觉模型跑在独立子进程里，CUDA 的 ``mem_get_info`` 统计不到，
+        由适配器用 nvidia-smi 测出增量后调用这里。
+        """
+        if measured_mb is None:
+            return None
+        measured = float(measured_mb)
         # 小于 8MB 视为统计噪声（例如模型已经在别处加载过），不校准。
         if measured < 8:
             return None
@@ -717,11 +742,28 @@ async def ensure_model_loaded(adapter: Any, loader: Optional[Callable[[], Any]] 
             vram.touch(name)
             return []
 
+        # 视觉模型跑在独立 llama-server 里，Windows 上 CUDA 的 mem_get_info
+        # 看不到 Vulkan 已经占用的显存，可能把空闲报高，导致 TTS 与 VLM
+        # 同时挤在 8G 卡上（实际会触发 WDDM 换页）。所以在加载任何其它
+        # GPU 模型前，先显式卸掉视觉模型；这是唯一一个跨进程的显存占用。
+        extra_released: list[str] = []
+        if name != "vision" and "vision" in vram.loaded_names():
+            try:
+                outcome = await vram.unload_models(["vision"])
+                extra_released = list(outcome.get("released") or [])
+                if extra_released:
+                    logger.info(
+                        "加载 %s 前先卸载视觉模型（跨进程显存，CUDA 统计不可靠）",
+                        name,
+                    )
+            except Exception as exc:  # noqa: BLE001 - 卸不掉就继续走容量检查
+                logger.warning("加载 %s 前卸载视觉模型失败：%s", name, exc)
+
         capacity = await vram.ensure_capacity(name)
         if not capacity.get("ok"):
             raise InsufficientVramError(capacity)
 
-        released = list(capacity.get("released") or [])
+        released = extra_released + list(capacity.get("released") or [])
         before_free, _ = await asyncio.to_thread(lambda: vram.read_memory(initialize=True))
         load_call = loader or adapter.load
         try:
@@ -751,7 +793,10 @@ async def ensure_model_loaded(adapter: Any, loader: Optional[Callable[[], Any]] 
             raise
 
         after_free, _ = await asyncio.to_thread(lambda: vram.read_memory(initialize=True))
-        vram.record_load(name, before_free, after_free)
+        # 视觉模型跑在子进程里，torch 的差值不可信；估算由适配器用
+        # nvidia-smi 实测后调用 record_measured 校准，这里不要重复记。
+        if name != "vision":
+            vram.record_load(name, before_free, after_free)
         vram.touch(name)
         logger.info(
             "模型加载完成：%s（加载前后空闲 %.0f -> %.0f MB，本次腾出 %s）",

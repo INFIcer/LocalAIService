@@ -47,6 +47,20 @@
     LOCALAI_TRANSLATE_MAX_LEN  翻译默认单块 token 上限（默认 400，范围 32~1024）
     LOCALAI_TOKEN             可选的 Bearer 鉴权令牌（默认空=不鉴权）
 
+视觉 / 关键帧挑选（新增，见 ``docs/SERVICE_API.md``）::
+
+    LOCALAI_VISION_DIR        视觉模型目录（默认 <HOME>/models/vision）
+    LOCALAI_VISION_PORT       本地 llama-server 端口（默认 7891，只监听 127.0.0.1）
+    LOCALAI_VISION_IDLE_UNLOAD 视觉模型空闲卸载秒数（默认 900，0=关闭）
+    LOCALAI_VISION_CTX        llama-server 上下文长度（默认 8192）
+    LOCALAI_VISION_GPU_LAYERS 卸载到 GPU 的层数（默认 99=全部）
+    LOCALAI_VISION_TIMEOUT    单次视觉推理超时秒数（默认 120）
+    LOCALAI_VISION_MODEL      GGUF 文件名（默认 Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf）
+    LOCALAI_VISION_MMPROJ     视觉投影文件名（默认 mmproj-F16.gguf）
+    LOCALAI_VISION_SERVER     llama-server.exe 文件名（默认 llama-server.exe）
+    LOCALAI_VISION_PLANNER    关键帧默认 planner：hybrid（默认）/ agent
+    LOCALAI_VISION_PHASH_DISTANCE 感知哈希去重汉明距离阈值（默认 6）
+
 下载 / 链接分析（新增，见 ``docs/SERVICE_API.md``）::
 
     LOCALAI_DOWNLOAD_MAX_MB      单个下载文件大小上限（默认 2048）
@@ -300,6 +314,19 @@ class Config:
     download_max_mb: int = 2048
     download_sync_max_mb: int = 200
     download_timeout: float = 1800.0
+    #: 视觉（VLM）：llama.cpp 本地服务 + Qwen2.5-VL-3B GGUF。
+    vision_dir: Path = field(default_factory=Path)
+    vision_port: int = 7891
+    vision_idle_unload: int = 900
+    vision_ctx: int = 4096
+    vision_gpu_layers: int = 99
+    vision_timeout: float = 120.0
+    vision_model_file: str = "Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf"
+    vision_mmproj_file: str = "mmproj-Q8_0.gguf"
+    vision_server_file: str = "llama-server.exe"
+    #: 关键帧挑选默认 planner（hybrid / agent）与去重汉明距离阈值。
+    vision_planner: str = "hybrid"
+    vision_phash_distance: int = 6
     #: 可选：显式指定 B站 cookie JSON；空=沿用引擎里的本机默认路径。
     bili_cookie_file: str = ""
     speaker_model_dir: Path = field(default_factory=Path)
@@ -528,6 +555,35 @@ class Config:
                 1, _pick_int(200, "LOCALAI_DOWNLOAD_SYNC_MAX_MB")
             ),
             download_timeout=max(1.0, _pick_float(1800.0, "LOCALAI_DOWNLOAD_TIMEOUT")),
+            vision_dir=Path(
+                _pick(
+                    "LOCALAI_VISION_DIR",
+                    default=str(root / "models" / "vision"),
+                )
+            ).expanduser(),
+            vision_port=max(1, min(65535, _pick_int(7891, "LOCALAI_VISION_PORT"))),
+            vision_idle_unload=_pick_int(900, "LOCALAI_VISION_IDLE_UNLOAD"),
+            vision_ctx=max(2048, min(32768, _pick_int(4096, "LOCALAI_VISION_CTX"))),
+            vision_gpu_layers=max(0, min(999, _pick_int(99, "LOCALAI_VISION_GPU_LAYERS"))),
+            vision_timeout=max(10.0, _pick_float(120.0, "LOCALAI_VISION_TIMEOUT")),
+            vision_model_file=(
+                _pick("LOCALAI_VISION_MODEL", default="Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf")
+                or "Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf"
+            ).strip(),
+            vision_mmproj_file=(
+                _pick("LOCALAI_VISION_MMPROJ", default="mmproj-Q8_0.gguf")
+                or "mmproj-Q8_0.gguf"
+            ).strip(),
+            vision_server_file=(
+                _pick("LOCALAI_VISION_SERVER", default="llama-server.exe")
+                or "llama-server.exe"
+            ).strip(),
+            vision_planner=(
+                _pick("LOCALAI_VISION_PLANNER", default="hybrid") or "hybrid"
+            ).strip().lower(),
+            vision_phash_distance=max(
+                0, min(32, _pick_int(6, "LOCALAI_VISION_PHASH_DISTANCE"))
+            ),
             bili_cookie_file=(_pick("LOCALAI_BILI_COOKIE") or "").strip(),
             speaker_model_dir=Path(
                 _pick(
@@ -616,6 +672,12 @@ class Config:
         # 记录「启动时哪些键被环境变量覆盖」，必须在 export_env() 之前算：
         # export_env 会把配置写回同名环境变量，事后再判断会把 file/default
         # 误判成 env。
+        if cfg.vision_planner not in ("hybrid", "agent"):
+            logger.warning(
+                "LOCALAI_VISION_PLANNER=%r 不合法，回落到 hybrid（可选 hybrid / agent）",
+                cfg.vision_planner,
+            )
+            cfg.vision_planner = "hybrid"
         cfg.env_overrides = {item.key: False for item in SETTINGS}
         for item in SETTINGS:
             cfg.env_overrides[item.key] = env_present(item)
@@ -673,6 +735,17 @@ class Config:
             "LOCALAI_DOWNLOAD_MAX_MB": str(self.download_max_mb),
             "LOCALAI_DOWNLOAD_SYNC_MAX_MB": str(self.download_sync_max_mb),
             "LOCALAI_DOWNLOAD_TIMEOUT": str(int(self.download_timeout)),
+            "LOCALAI_VISION_DIR": str(self.vision_dir),
+            "LOCALAI_VISION_PORT": str(self.vision_port),
+            "LOCALAI_VISION_IDLE_UNLOAD": str(self.vision_idle_unload),
+            "LOCALAI_VISION_CTX": str(self.vision_ctx),
+            "LOCALAI_VISION_GPU_LAYERS": str(self.vision_gpu_layers),
+            "LOCALAI_VISION_TIMEOUT": str(self.vision_timeout),
+            "LOCALAI_VISION_MODEL": self.vision_model_file,
+            "LOCALAI_VISION_MMPROJ": self.vision_mmproj_file,
+            "LOCALAI_VISION_SERVER": self.vision_server_file,
+            "LOCALAI_VISION_PLANNER": self.vision_planner,
+            "LOCALAI_VISION_PHASH_DISTANCE": str(self.vision_phash_distance),
             "TORCH_HOME": str(self.torch_home),
         }
         if self.bili_cookie_file:
@@ -723,6 +796,18 @@ class Config:
                 "timeout_seconds": self.download_timeout,
                 "bili_cookie_file": self.bili_cookie_file or None,
             },
+            "vision": {
+                "dir": str(self.vision_dir),
+                "port": self.vision_port,
+                "model_file": self.vision_model_file,
+                "mmproj_file": self.vision_mmproj_file,
+                "server_file": self.vision_server_file,
+                "idle_unload": self.vision_idle_unload,
+                "ctx": self.vision_ctx,
+                "gpu_layers": self.vision_gpu_layers,
+                "planner": self.vision_planner,
+                "phash_distance": self.vision_phash_distance,
+            },
             "speaker_model_dir": str(self.speaker_model_dir),
             "voices_dir": str(self.voices_dir),
             "output_dir": str(self.output_dir),
@@ -743,6 +828,7 @@ class Config:
                 "speaker": self.speaker_idle_unload,
                 "separate": self.separate_idle_unload,
                 "translate": self.translate_idle_unload,
+                "vision": self.vision_idle_unload,
             },
             "auth_required": bool(self.token),
             "jobs": {
@@ -780,16 +866,20 @@ class Config:
             "separate": self.jobs_parallel_separate,
             "download": 1,
             "analyze": 1,
+            "vision": 1,
         }.get(kind, 1)
 
     def job_timeout_for(self, kind: str) -> float:
         """某类任务的执行超时（秒）。
 
         下载 / 链接分析可能是几十分钟的长任务，用 ``LOCALAI_DOWNLOAD_TIMEOUT``；
-        其余能力沿用旧的 ``LOCALAI_JOB_TIMEOUT``，旧语义不变。
+        关键帧挑选可能要多轮 VLM 推理，至少给 20 分钟；其余能力沿用旧的
+        ``LOCALAI_JOB_TIMEOUT``，旧语义不变。
         """
         if kind in ("download", "analyze"):
             return float(self.download_timeout)
+        if kind == "vision":
+            return max(float(self.jobs_timeout), 1200.0)
         return float(self.jobs_timeout)
 
     def jobs_parallel_map(self) -> dict[str, int]:
@@ -803,6 +893,7 @@ class Config:
             "translate": 1,
             "download": 1,
             "analyze": 1,
+            "vision": 1,
         }
 
     def jobs_global_cap(self) -> Optional[int]:
@@ -848,6 +939,7 @@ def ensure_directories(cfg: Optional[Config] = None) -> list[Path]:
         cfg.data_dir,
         cfg.jobs_upload_dir,
         cfg.downloads_dir,
+        cfg.vision_dir,
     ]
     created: list[Path] = []
     for path in wanted:

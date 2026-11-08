@@ -657,3 +657,77 @@ POST /media/analyze
   `cookies` 字段传给服务端；**不要**把 cookie 内容写进日志/界面；
 - 服务端不会把 cookie 值写日志，也不会提交进仓库；
 - 只下载用户明确给出的公开链接；失败一次就如实展示错误，不要反复重试到被封。
+
+---
+
+## 13. 场景四：插件要关键帧就调 `/vision/frames`
+
+### 13.1 什么时候用
+
+- 用户上传/转发一段视频，想要「几张能代表内容的截图」；
+- 自动化报告、视频摘要、封面候选：需要避开章节页、转场、空镜；
+- 已经下载过视频（`/media/download` 或 `/media/analyze` 返回了 `path`），
+  不要自己抽均匀帧——把路径交给服务端。
+
+### 13.2 推荐调用（异步）
+
+```json
+POST /jobs/vision
+{
+  "video_path": "E:/LocalAIService/data/downloads/2026-11-08/xxx.mp4",
+  "target_frames": 3,
+  "planner": "hybrid",
+  "max_rounds": 6
+}
+```
+
+返回 `{ok:true,id,state:"queued"}`；轮询 `GET /jobs/{id}`：
+
+```json
+{"state":"done","result":{
+  "ok":true,"duration":431.267,"target":3,"rounds_used":1,
+  "frames":[{"time":5.085,"path":"...","score":4,"kind":"chart",
+             "ocr_text":"...","summary":"...","why":"..."}],
+  "stats":{"candidates":12,"vlm_calls":8,"elapsed_ms":20653},
+  "subtitles_from":"site"}}
+```
+
+- 也可以直接 `POST /vision/frames` 同步等（讲解视频 20~60 秒，长视频更久）；
+- 刚跑完 `/jobs/analyze` 时，直接传 `{"job_id":"<id>","target_frames":3}`，
+  服务端会从上个任务结果的 `path` 取视频，不用自己拼路径。
+
+### 13.3 参数怎么选
+
+- `target_frames`：1~10；封面/摘要一般 3，长教程最多 5~6；
+- `planner`：默认 `hybrid`（快、稳定）；视频里图表/演示很多时再试 `agent`；
+- `max_rounds`：默认 6；短视频 2~3 就够，长视频不要超过 8；
+- `subtitles` / `scene_times`：如果插件自己已经有（例如 `/asr/segments`、
+  `/media/scenes` 的结果），直接传，能省一次识别/检测；
+- 不传 `subtitles` 时，服务端优先找视频同目录的 `*.srt/*.vtt`，其次跑 ASR。
+
+### 13.4 结果怎么用
+
+- `frames[].path` 是服务端本机绝对路径，插件可以直接读文件或转成 `file://`；
+- `time` 是精确到毫秒的时间点，可做「点击跳到视频对应位置」；
+- `kind` 可用于挑封面：`chart/table/code/demo` 优先，`blank/transition` 已排除；
+- `ocr_text` 是小模型识别结果，**可能幻觉**，展示时可以标「自动识别」；
+- `score>=3` 且 `usable=true` 才会返回；凑不够时 `frames` 会少于 `target_frames`，
+  不要重试到死，按实际数量展示。
+
+### 13.5 降级与错误
+
+| 情况 | 响应 | 插件行为 |
+| --- | --- | --- |
+| 模型未安装 / 进程崩溃 / 全部超时 | `ok:true` + `degraded:true` + `degraded_reason`，帧来自方差回退 | 正常展示，提示「自动挑帧（降级）」 |
+| VLM 单次调用失败 | 该帧跳过；连续两次失败提前结束并降级 | 同上 |
+| `video_path` 不存在 / 不是视频 | 400 | 提示用户换文件，不要重试 |
+| 显存不足（TTS 正忙且腾不出来） | 507 `insufficient_vram` | 提示稍后重试，或先 `/vram/unload` |
+| 任务取消 | 409 / `state=canceled` | 停止轮询 |
+
+### 13.6 不要做的事
+
+- 不要自己按 0%/50%/100% 抽帧再让用户选——章节页/转场会浪费用户注意力；
+- 不要并发提交多个 `/vision/frames`：视觉模型单 slot，且和 TTS 抢显存；
+- 不要把 `models/vision/` 里的 GGUF 复制进插件目录；路径由服务端
+  `/vision/status` 和 `/capabilities` 给出；
+- 不要在插件里起第二个 llama-server：端口 7891 由服务管理。
