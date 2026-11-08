@@ -383,6 +383,9 @@ async function loadModels() {
 function modelActionButtons(item) {
   const cap = item.capability;
   const name = item.name;
+  if (cap === "download") {
+    return '<span class="hint">由 engine/.venv 的 pip 管理</span>';
+  }
   const canActivate = cap === "whisper" || cap === "asr";
   const downloadLabel = item.present ? "重新下载" : "下载";
   const buttons = [
@@ -783,6 +786,7 @@ function renderSystem(data) {
   const disk = data.disk || {};
   const listen = data.listen || {};
   const jobs = data.jobs || {};
+  const download = data.download || {};
   const loaded = Array.isArray(data.models_loaded) ? data.models_loaded : [];
 
   const diskRows = [
@@ -805,6 +809,7 @@ function renderSystem(data) {
       <div class="kv"><span>已运行</span><span>${escapeHtml(fmtDuration(service.uptime_seconds))}</span></div>
       <div class="kv"><span>监听</span><span>${escapeHtml(`${listen.host || "--"}:${listen.port || "--"}`)}</span></div>
       <div class="kv"><span>已加载模型</span><span>${escapeHtml(loaded.length ? loaded.join("、") : "无（0 模型）")}</span></div>
+      <div class="kv"><span>yt-dlp</span><span><span id="ytdlp-version">${escapeHtml(download.yt_dlp_version || "未安装")}</span> <button id="ytdlp-check" class="small ghost" type="button">检查更新</button></span></div>
     </div>
     <div class="panel">
       <div class="panel-head"><h2>GPU</h2><span class="pill ${gpu.total_mb ? "ok" : "muted"}">${gpu.total_mb ? "正常" : "不可用"}</span></div>
@@ -825,6 +830,23 @@ function renderSystem(data) {
       <div class="kv"><span>配置</span><span>${escapeHtml((data.paths || {}).config_file || "--")}</span></div>
       <div class="kv"><span>日志</span><span>${escapeHtml((data.paths || {}).logs || "--")}</span></div>
     </div>`;
+
+  const checkBtn = $("#ytdlp-check");
+  if (checkBtn) {
+    checkBtn.addEventListener("click", async () => {
+      checkBtn.disabled = true;
+      try {
+        const status = await api("/media/download/status");
+        const version = (status.yt_dlp || {}).version || "未安装";
+        $("#ytdlp-version").textContent = version;
+        toast(`当前 yt-dlp ${version}；升级：engine\\.venv\\Scripts\\python -m pip install -U yt-dlp`, "ok", 7000);
+      } catch (err) {
+        toast(err.message || String(err), "error");
+      } finally {
+        checkBtn.disabled = false;
+      }
+    });
+  }
 }
 
 function renderAutostart(info) {

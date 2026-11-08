@@ -274,6 +274,33 @@ class JobStore:
         """running 任务：只打 ``meta.cancel_requested``，等执行器退出后再置 canceled。"""
         return await asyncio.to_thread(self._set_cancel_requested_sync, job_id)
 
+    async def update_meta(self, job_id: str, patch: dict[str, Any]) -> bool:
+        """把 ``patch`` 合并进任务 meta（下载进度用；只更新 running 任务）。
+
+        合并是浅合并：``{"progress": {...}}`` 会整体替换旧的 progress，
+        正是进度上报需要的语义。任务已结束或不存在时返回 False。
+        """
+        return await asyncio.to_thread(self._update_meta_sync, job_id, patch)
+
+    def _update_meta_sync(self, job_id: str, patch: dict[str, Any]) -> bool:
+        with self._lock:
+            conn = self._connection()
+            row = conn.execute(
+                "SELECT meta, state FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None or row["state"] != "running":
+                return False
+            meta = _json_loads(row["meta"]) or {}
+            if not isinstance(meta, dict):
+                meta = {}
+            meta.update(patch or {})
+            conn.execute(
+                "UPDATE jobs SET meta = ? WHERE id = ?",
+                (_json_dumps(meta), job_id),
+            )
+            conn.commit()
+        return True
+
     def _set_cancel_requested_sync(self, job_id: str) -> Optional[dict[str, Any]]:
         with self._lock:
             conn = self._connection()

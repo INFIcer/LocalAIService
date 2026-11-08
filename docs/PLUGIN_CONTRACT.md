@@ -571,3 +571,89 @@ POST /translate
 7. 错误映射：400/401/404/413/503/504/507；
 8. 配置：`baseUrl`、`token`、超时、总开关；
 9. 日志脱敏。
+
+---
+
+## 12. 让服务去下载 / 分析链接
+
+### 12.1 总原则
+
+插件**不要自己装 yt-dlp、不要自己抓页面、不要自己解析站点**。服务层已经提供
+`download` 能力（yt-dlp + 直链兜底 + SSRF 防护 + cookie 管理 + 限额）。
+插件只负责把用户给的**公开链接**递过去，然后展示进度与结果。
+
+- 一次只处理**用户明确给出的一个链接**；不要做站内爬取、批量遍历、自动翻页。
+- 下载/分析产物在服务端 `data/downloads/<日期>/`，插件不要假设长期存在，
+  需要长期保存就自己复制走。
+- 需要字幕时间轴/镜头边界时，优先用 `/media/analyze`，不要自己拆成
+  「先下载再分别调 ffmpeg」——服务端已经编排好字幕优先级与场景检测。
+
+### 12.2 选哪个接口
+
+| 场景 | 接口 | 说明 |
+| --- | --- | --- |
+| 用户明确要「下载这个视频/音频」 | `POST /media/download` | 入队，立刻返回 `job_id`；轮询进度 |
+| 小文件（≤ 200MB）想直接拿路径 | `POST /media/download/sync` | 同步返回；超限 413，改异步 |
+| 要「字幕时间轴 + 镜头边界」 | `POST /media/analyze` | 同步等结果；长视频建议用 `/jobs/analyze` |
+| 不希望阻塞 UI | `POST /jobs/analyze` + `GET /jobs/{id}` | 与下载任务同一条队列 |
+| 判断能不能下 | `GET /media/download/status` | yt-dlp 版本、限额、目录 |
+| 用户点「停止」 | `POST /jobs/{id}/cancel` | 运行中尽力取消；半成品会清理 |
+
+### 12.3 下载任务
+
+```json
+POST /media/download
+{"url": "https://www.bilibili.com/video/BV...", "quality": "720p",
+ "subtitles": true, "priority": 0}
+```
+
+响应 `{"ok":true,"job_id":"…","state":"queued"}`。轮询 `GET /jobs/{id}`：
+
+- `state`：`queued/running/done/failed/canceled`；
+- `meta.progress`：`{percent, downloaded_bytes, total_bytes, speed, eta}`；
+- 完成后的 `result`：`{path,title,duration,site,subtitles[],size_mb}`。
+
+轮询节奏 500ms~2s；下载可能几十分钟（`LOCALAI_DOWNLOAD_TIMEOUT` 默认 1800s），
+不要用 TTS 的 180s 超时。UI 上进度条用 `percent`，没有 `total_bytes` 时用
+`downloaded_bytes` 显示「已下载 xx MB」。
+
+### 12.4 链接分析
+
+```json
+POST /media/analyze
+{"url": "https://...", "engine": "whisper|sensevoice|auto", "max_frames": 0}
+```
+
+返回：
+
+```json
+{"ok":true,"title":"…","duration":123.4,"path":"…",
+ "subtitles_from":"site|asr",
+ "segments":[{"start":0.08,"end":0.68,"text":"…"}],
+ "scenes":[{"time":6.4,"score":1.0}],
+ "frames":[]}
+```
+
+- `segments` 已升序、无重叠，可直接做字幕轴/时间戳跳转；
+- `subtitles_from="site"` 表示站内字幕，`"asr"` 表示服务端识别；
+- `max_frames=0` 不抽帧；需要缩略图时给 1~200，返回 `frames[].path`；
+- `scenes` 是镜头切换点（`time` 秒 + `score`），可直接做章节/关键帧。
+
+### 12.5 错误映射
+
+| 返回 | 场景 | 插件行为 |
+| --- | --- | --- |
+| 400 | URL 非 http/https / 私有地址 / 参数非法 | 提示用户换链接，不要重试 |
+| 413 | 超过单文件或同步上限 | 提示「文件太大」，改用异步接口 |
+| 409 | 任务取消 / 正在取消 | 停止轮询 |
+| 502 | yt-dlp 站点错误、风控、需要登录 | 展示 `detail`；不要连续重试 |
+| 504 | 下载/分析超时 | 提示；可换更短链接或调大 `LOCALAI_DOWNLOAD_TIMEOUT` |
+
+### 12.6 Cookie 与隐私
+
+- B站链接**不需要插件传 cookie**：服务端按域名自动读取本机凭证，生成临时
+  cookie 文件、用完即删；
+- 其它需要登录的站点，插件可让用户选择 Netscape cookie 文件路径，通过
+  `cookies` 字段传给服务端；**不要**把 cookie 内容写进日志/界面；
+- 服务端不会把 cookie 值写日志，也不会提交进仓库；
+- 只下载用户明确给出的公开链接；失败一次就如实展示错误，不要反复重试到被封。

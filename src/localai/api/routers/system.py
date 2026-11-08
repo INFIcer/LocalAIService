@@ -71,6 +71,19 @@ async def health(request: Request) -> dict[str, Any]:
         "idle_unload_seconds": cfg.separate_idle_unload,
         "model": sep.get("loaded_model") or sep.get("model") or "htdemucs",
     }
+    download_health = registry.get("download").status()
+    download_health = {
+        "ready": bool(download_health.get("ready")),
+        "version": download_health.get("version"),
+        "path": download_health.get("path"),
+        "aria2c": bool((download_health.get("aria2c") or {}).get("available")),
+        "download_dir": str(cfg.downloads_dir),
+        "limits": {
+            "max_mb": cfg.download_max_mb,
+            "sync_max_mb": cfg.download_sync_max_mb,
+            "timeout_seconds": cfg.download_timeout,
+        },
+    }
 
     # 任务队列：只读数据库计数，不触发任何模型。
     scheduler = getattr(request.app.state, "scheduler", None)
@@ -101,6 +114,7 @@ async def health(request: Request) -> dict[str, Any]:
             "translate": translate_health,
             "speaker": speaker_health,
             "separate": separate_health,
+            "download": download_health,
             "vram": vram_health,
             "media": media.health(),
             "comfy": "disabled",
@@ -127,6 +141,7 @@ async def health(request: Request) -> dict[str, Any]:
         "translate": translate_health,
         "speaker": speaker_health,
         "separate": separate_health,
+        "download": download_health,
         "vram": vram_health,
         "media": media.health(),
         "jobs": jobs_health,
@@ -183,6 +198,24 @@ async def capabilities(request: Request) -> dict[str, Any]:
             },
         },
         "auth": {"required": bool(cfg.token), "scheme": "bearer"},
+        "download": {
+            "engine": "yt-dlp",
+            **registry.get("download").status(),
+            "limits": {
+                "max_mb": cfg.download_max_mb,
+                "sync_max_mb": cfg.download_sync_max_mb,
+                "timeout_seconds": cfg.download_timeout,
+            },
+            "endpoints": [
+                "/media/download",
+                "/media/download/sync",
+                "/media/download/status",
+                "/media/analyze",
+                "/jobs/analyze",
+            ],
+            "ssrf": "只允许 http/https；私有/回环/链路本地地址与 file:// 一律拒绝",
+            "cookies": "B站自动读取本机凭证；其它站点需显式传 Netscape cookie 文件",
+        },
         "translate": {
             "engine": "nllb",
             "model": "nllb-200-distilled-600M",

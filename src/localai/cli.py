@@ -403,6 +403,36 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"       {WARN} 找不到 ffprobe；抽帧/探测会受影响")
         warnings += 1
 
+    print(f"\n{INFO} 下载 / 链接分析")
+    try:
+        from .engines._native import import_engine_module
+
+        dl_status = import_engine_module("download_engine").status_info()
+        dl_version = (dl_status.get("yt_dlp") or {}).get("version")
+        if dl_version:
+            print(f"       {OK} yt-dlp {dl_version}  {(dl_status.get('yt_dlp') or {}).get('path')}")
+        else:
+            # 可选能力：缺失只提示，不算问题、不增加警告。
+            print(
+                f"       {INFO} yt-dlp 未安装（可选）："
+                "engine/.venv 里执行 python -m pip install -U yt-dlp"
+            )
+        aria = dl_status.get("aria2c") or {}
+        print(
+            f"       {OK if aria.get('available') else INFO} aria2c "
+            f"{aria.get('path') or '未安装（可选，用 yt-dlp 内置下载器）'}"
+        )
+        print(f"       {INFO} 下载目录 {dl_status.get('download_dir')}")
+        print(
+            f"       {INFO} 限额：单文件 {cfg.download_max_mb}MB，"
+            f"同步接口 {cfg.download_sync_max_mb}MB，超时 {cfg.download_timeout:.0f}s"
+        )
+        print(
+            f"       {INFO} SSRF：仅 http/https；私有/回环/链路本地地址与 file:// 拒绝"
+        )
+    except Exception as exc:  # noqa: BLE001 - 下载引擎状态不影响整体体检
+        print(f"       {INFO} 下载引擎状态读取失败：{type(exc).__name__}: {exc}")
+
     print(f"\n{INFO} 模型文件")
     for name, directory, ok, detail in _doctor_models(cfg):
         if ok:

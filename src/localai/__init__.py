@@ -24,7 +24,7 @@ from __future__ import annotations
 __all__ = ["__version__", "API_VERSION"]
 
 # 服务版本（/capabilities、/docs、localai version 都会展示）
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 
 # 对外 HTTP 契约版本：接口发生不兼容变化时才 +1。
 # 插件应当拿它做版本协商，见 docs/PLUGIN_CONTRACT.md。

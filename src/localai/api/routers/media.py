@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import time
@@ -26,7 +27,10 @@ from urllib.parse import quote
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 
-from ..deps import get_cfg, get_registry
+from ...jobs import prepare_payload
+from ..deps import get_cfg, get_registry, get_scheduler
+from ..job_helpers import client_ip, submit_and_wait
+from ..schemas import MediaAnalyzeRequest, MediaDownloadRequest
 from ..uploads import save_media_upload
 
 logger = logging.getLogger("localai.api.media")
@@ -266,3 +270,158 @@ async def media_scenes_endpoint(
         "json_path": result.get("json_path"),
         "elapsed_ms": elapsed_ms,
     }
+
+
+# ---------------------------------------------------------------------------
+# 下载 / 链接分析
+# ---------------------------------------------------------------------------
+
+
+def _download_http_error(module: Any, exc: BaseException) -> HTTPException:
+    """把下载引擎异常翻译成 HTTP 状态码。"""
+    text = str(exc)
+    if isinstance(exc, module.DownloadBlocked):
+        return HTTPException(status_code=400, detail=text)
+    if isinstance(exc, module.DownloadCancelled):
+        return HTTPException(status_code=409, detail=text)
+    if isinstance(exc, module.DownloadTimeout):
+        return HTTPException(status_code=504, detail=text)
+    if "上限" in text:
+        return HTTPException(status_code=413, detail=text)
+    return HTTPException(status_code=502, detail=text)
+
+
+@router.post("/media/download", summary="提交异步下载任务（yt-dlp + 直链兜底）")
+async def media_download_endpoint(
+    payload: MediaDownloadRequest, request: Request
+) -> dict[str, Any]:
+    """提交后立刻返回 ``{ok, job_id, state}``；进度看 ``GET /jobs/{id}``。"""
+    cfg = get_cfg(request)
+    scheduler = get_scheduler(request)
+    try:
+        action, normalized = prepare_payload(
+            "download", "download.fetch", payload.model_dump(), cfg
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    job_id = await scheduler.submit(
+        "download",
+        action,
+        normalized,
+        priority=payload.priority,
+        client_ip=client_ip(request),
+    )
+    return {"ok": True, "job_id": job_id, "id": job_id, "state": "queued"}
+
+
+@router.post("/media/download/sync", summary="同步下载小文件（≤ LOCALAI_DOWNLOAD_SYNC_MAX_MB）")
+async def media_download_sync_endpoint(
+    payload: MediaDownloadRequest, request: Request
+) -> dict[str, Any]:
+    """小文件直接下完再返回；超过同步上限要求改用 ``/media/download``。
+
+    这里不经过任务队列（调用方要的是「立刻拿到路径」），但仍在线程池里跑，
+    不会卡住事件循环。
+    """
+    cfg = get_cfg(request)
+    adapter = get_registry(request).get("download")
+    module = adapter.get_module()
+    out_dir = cfg.downloads_dir / datetime.now().strftime("%Y-%m-%d")
+    limit = int(cfg.download_sync_max_mb)
+    try:
+        result = await asyncio.to_thread(
+            module.download_any,
+            payload.url,
+            str(out_dir),
+            quality=payload.quality,
+            subtitles=payload.subtitles,
+            cookies=payload.cookies,
+            timeout=cfg.download_timeout,
+            max_mb=limit,
+        )
+    except Exception as exc:  # noqa: BLE001 - 统一翻译成 HTTP 错误
+        raise _download_http_error(module, exc) from exc
+    logger.info(
+        "同步下载完成：%s（%.2fMB，字幕 %d）",
+        result.get("path"),
+        result.get("size_mb") or 0,
+        len(result.get("subtitles") or []),
+    )
+    return {
+        "ok": True,
+        "path": result.get("path"),
+        "title": result.get("title"),
+        "duration": result.get("duration"),
+        "site": result.get("site"),
+        "subtitles": result.get("subtitles") or [],
+        "size_mb": result.get("size_mb"),
+        "quality": result.get("quality"),
+        "elapsed_seconds": result.get("elapsed_seconds"),
+        "sync_limit_mb": limit,
+    }
+
+
+@router.get("/media/download/status", summary="下载引擎状态与限额")
+async def media_download_status_endpoint(request: Request) -> dict[str, Any]:
+    cfg = get_cfg(request)
+    adapter = get_registry(request).get("download")
+    status = adapter.status()
+    counts = {"queued": 0, "running": 0}
+    scheduler = getattr(request.app.state, "scheduler", None)
+    store = getattr(request.app.state, "jobs_store", None)
+    if store is not None:
+        for state in ("queued", "running"):
+            _jobs, total = await store.list_jobs(state=state, kind="download", limit=1)
+            counts[state] = int(total)
+        _jobs, total = await store.list_jobs(state="running", kind="analyze", limit=1)
+        counts["analyze_running"] = int(total)
+    return {
+        "ok": True,
+        "yt_dlp": {
+            "installed": bool(status.get("ready")),
+            "version": status.get("version"),
+            "path": status.get("path"),
+            "python": status.get("python"),
+        },
+        "aria2c": status.get("aria2c"),
+        "download_dir": status.get("download_dir") or str(cfg.downloads_dir),
+        "today_dir": status.get("today_dir"),
+        "jobs": counts,
+        "limits": {
+            "max_mb": cfg.download_max_mb,
+            "sync_max_mb": cfg.download_sync_max_mb,
+            "timeout_seconds": cfg.download_timeout,
+            "qualities": status.get("limits", {}).get("qualities")
+            or ["720p", "best", "audio"],
+        },
+        "ffmpeg": status.get("ffmpeg"),
+        "cookies": status.get("cookies"),
+        "ssrf": status.get("ssrf"),
+        "scheduler": "running" if scheduler is not None else "not_started",
+    }
+
+
+@router.post("/media/analyze", summary="链接分析：下载 -> 字幕/ASR -> 场景边界")
+async def media_analyze_endpoint(
+    payload: MediaAnalyzeRequest, request: Request
+) -> dict[str, Any]:
+    """同步等待分析结果（内部走 analyze 任务队列，事件循环不被阻塞）。
+
+    返回 ``{ok,title,duration,path,subtitles_from,segments[],scenes[],frames[]}``。
+    站点有字幕时优先用站点字幕（``subtitles_from="site"``），否则跑 ASR。
+    """
+    cfg = get_cfg(request)
+    try:
+        action, normalized = prepare_payload(
+            "analyze", "analyze.url", payload.model_dump(), cfg
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    job = await submit_and_wait(
+        request,
+        "analyze",
+        action,
+        normalized,
+        priority=0,
+    )
+    return job.get("result") or {}

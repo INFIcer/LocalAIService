@@ -31,7 +31,7 @@ from ...constants import (
 from ...jobs import JOB_STATES, prepare_payload
 from ..deps import get_cfg, get_jobs_store, get_scheduler
 from ..job_helpers import cleanup_job_upload, client_ip
-from ..schemas import JobCreateRequest, JobTtsRequest
+from ..schemas import JobAnalyzeRequest, JobCreateRequest, JobTtsRequest
 from ..uploads import save_job_upload
 
 logger = logging.getLogger("localai.api.jobs")
@@ -93,6 +93,29 @@ async def create_tts_job(payload: JobTtsRequest, request: Request) -> dict[str, 
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     job_id = await scheduler.submit(
         "tts",
+        action,
+        normalized,
+        priority=payload.priority,
+        client_ip=client_ip(request),
+    )
+    return _queued_response(job_id)
+
+
+@router.post("/jobs/analyze", summary="提交链接分析任务（JSON），立刻返回任务 id")
+async def create_analyze_job(
+    payload: JobAnalyzeRequest, request: Request
+) -> dict[str, Any]:
+    """异步版 ``/media/analyze``：提交后轮询 ``/jobs/{id}`` 取结果。"""
+    cfg = get_cfg(request)
+    scheduler = get_scheduler(request)
+    try:
+        action, normalized = prepare_payload(
+            "analyze", "analyze.url", payload.model_dump(), cfg
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    job_id = await scheduler.submit(
+        "analyze",
         action,
         normalized,
         priority=payload.priority,

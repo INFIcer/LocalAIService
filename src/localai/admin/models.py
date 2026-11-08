@@ -60,6 +60,7 @@ CAPABILITY_TITLES = {
     "speaker": "声纹",
     "separate": "人声分离",
     "vad": "语音端点检测",
+    "download": "通用下载",
 }
 
 #: 下载时 capability 的别名。
@@ -320,6 +321,35 @@ def model_catalog(cfg: Config) -> list[dict[str, Any]]:
             size_mb=_dir_size_mb(cfg.asr_vad_dir),
             active=True,
             note="SenseVoice 分段转写用；whisper 不需要",
+        )
+    )
+    # ---- yt-dlp（不是权重，但同样在模型页展示版本与状态） --------------
+    try:
+        from ..engines._native import import_engine_module
+
+        dl_module = import_engine_module("download_engine")
+        dl_info = dl_module.status_info()
+        dl_version = (dl_info.get("yt_dlp") or {}).get("version")
+        dl_path = (dl_info.get("yt_dlp") or {}).get("path")
+    except Exception as exc:  # noqa: BLE001 - 状态读取失败不影响模型清单
+        dl_version = None
+        dl_path = str(exc)
+    items.append(
+        _item(
+            capability="download",
+            name="yt-dlp",
+            path=Path(dl_path) if dl_path and Path(dl_path).is_file() else cfg.downloads_dir,
+            expected=[],
+            present=bool(dl_version),
+            missing=[] if dl_version else ["yt-dlp"],
+            size_mb=0.0,
+            active=True,
+            note=(
+                f"版本 {dl_version}；下载目录 {cfg.downloads_dir}；"
+                f"单文件上限 {cfg.download_max_mb}MB"
+                if dl_version
+                else "未安装：engine/.venv 执行 python -m pip install -U yt-dlp"
+            ),
         )
     )
     return items

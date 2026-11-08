@@ -325,6 +325,23 @@ def system_info(
     except Exception:  # noqa: BLE001
         pass
 
+    # 下载引擎状态（yt-dlp 版本 / 限额）；读取失败不影响系统页。
+    try:
+        from ..engines._native import import_engine_module
+
+        dl_status = import_engine_module("download_engine").status_info()
+        download_block = {
+            "yt_dlp_version": (dl_status.get("yt_dlp") or {}).get("version"),
+            "yt_dlp_path": (dl_status.get("yt_dlp") or {}).get("path"),
+            "aria2c": (dl_status.get("aria2c") or {}).get("available"),
+            "download_dir": str(cfg.downloads_dir),
+            "max_mb": cfg.download_max_mb,
+            "sync_max_mb": cfg.download_sync_max_mb,
+            "timeout_seconds": cfg.download_timeout,
+        }
+    except Exception as exc:  # noqa: BLE001
+        download_block = {"yt_dlp_version": None, "error": f"{type(exc).__name__}: {exc}"}
+
     return {
         "ok": True,
         "service": {
@@ -351,6 +368,7 @@ def system_info(
         "gpu": _gpu_info(vram),
         "disk": disk,
         "models_loaded": loaded,
+        "download": download_block,
         "jobs": jobs_stats or {},
         "autostart": scheduled_task_status(),
         "paths": {

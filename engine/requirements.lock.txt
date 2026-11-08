@@ -182,3 +182,6 @@ nvidia-cublas-cu12==12.9.2.10 ; sys_platform == "win32"
 nvidia-cudnn-cu12==9.28.1.4 ; sys_platform == "win32"
 nvidia-cuda-runtime-cu12==12.9.79 ; sys_platform == "win32"
 nvidia-cuda-nvrtc-cu12==12.9.86 ; sys_platform == "win32"
+
+# --- 通用视频/音频下载（yt-dlp，2026-11 新增；下载能力需要）---
+yt-dlp==2026.10.26

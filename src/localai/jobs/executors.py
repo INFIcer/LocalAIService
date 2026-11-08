@@ -16,13 +16,12 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import soundfile as sf
 from fastapi import HTTPException
@@ -60,6 +59,8 @@ DEFAULT_ACTION = {
     "separate": "separate.split",
     "media": "media.probe",
     "translate": "translate.text",
+    "download": "download.fetch",
+    "analyze": "analyze.url",
 }
 
 #: 每种 kind 允许的 action。
@@ -70,6 +71,8 @@ KIND_ACTIONS = {
     "separate": {"separate.split"},
     "media": {"media.probe", "media.to_wav", "media.frames", "media.audio"},
     "translate": {"translate.text"},
+    "download": {"download.fetch"},
+    "analyze": {"analyze.url"},
 }
 
 _SPEAKER_OFF_VALUES = {"0", "false", "off", "no", "none", ""}
@@ -101,6 +104,24 @@ class JobContext:
     cfg: Config
     registry: Any
     client: Any = None
+    #: 进度上报（下载 / 分析任务用）；由调度器为每个任务注入，写进 jobs.meta。
+    progress: Optional[Callable[[dict[str, Any]], None]] = None
+    #: 取消查询；返回 True 时执行器应在下一个检查点退出。
+    is_canceled: Optional[Callable[[], bool]] = None
+
+    def report(self, payload: dict[str, Any]) -> None:
+        if self.progress is None:
+            return
+        try:
+            self.progress(payload)
+        except Exception:  # noqa: BLE001 - 进度失败不能影响任务
+            logger.debug("任务进度上报失败", exc_info=True)
+
+    def canceled(self) -> bool:
+        try:
+            return bool(self.is_canceled and self.is_canceled())
+        except Exception:  # noqa: BLE001
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +298,49 @@ def prepare_payload(
             if not name:
                 raise ValueError("声纹登记缺少 name")
             normalized["name"] = name
+        return act, normalized
+
+    if kind in ("download", "analyze"):
+        from ..engines._native import import_engine_module
+
+        engine_module = import_engine_module("download_engine")
+        url = _text(data.get("url") or data.get("link"))
+        if not url:
+            raise ValueError("payload.url 不能为空（要下载的 http/https 链接）")
+        try:
+            # 这里只做 scheme / 主机名预校验，不做 DNS：参数错误不入队。
+            engine_module.validate_url(url, resolve=False)
+        except engine_module.DownloadError as exc:
+            raise ValueError(str(exc)) from exc
+        quality = (_text(data.get("quality")) or "720p").lower()
+        if quality not in engine_module.QUALITY_CHOICES:
+            raise ValueError(
+                f"不支持的 quality={quality!r}；可选：{', '.join(engine_module.QUALITY_CHOICES)}"
+            )
+        cookies = _text(data.get("cookies")) or None
+        normalized = {
+            "url": url,
+            "quality": quality,
+            "subtitles": _flag(data.get("subtitles", True)),
+            "cookies": cookies,
+        }
+        if kind == "download":
+            return act, normalized
+
+        raw_engine = (_text(data.get("engine")) or "auto").lower()
+        if raw_engine in ("", "default"):
+            raw_engine = "auto"
+        if raw_engine not in ("auto", *ASR_ENGINE_CHOICES):
+            raise ValueError(
+                f"不支持的 engine={raw_engine!r}，可选：auto, {', '.join(ASR_ENGINE_CHOICES)}"
+            )
+        try:
+            max_frames = int(data.get("max_frames") or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"max_frames 必须是整数：{data.get('max_frames')!r}") from exc
+        if not 0 <= max_frames <= 200:
+            raise ValueError("max_frames 必须在 0~200 之间（0=不抽帧）")
+        normalized.update({"engine": raw_engine, "max_frames": max_frames})
         return act, normalized
 
     # media
@@ -587,6 +651,198 @@ async def _run_media(
     return {"ok": True, **result}
 
 
+# ---------------------------------------------------------------------------
+# 下载 / 链接分析
+# ---------------------------------------------------------------------------
+
+
+def _download_out_dir(cfg: Config) -> Path:
+    from datetime import datetime
+
+    return cfg.downloads_dir / datetime.now().strftime("%Y-%m-%d")
+
+
+def _frame_times(scenes: list[dict[str, Any]], duration: Optional[float], count: int) -> list[float]:
+    """均匀取点 + 场景吸附：每个点靠近镜头边界（2 秒内）时挪到边界之后。
+
+    这样抽出来的帧既能覆盖整段视频，又尽量落在「新镜头刚开始」的位置。
+    """
+    if count <= 0 or not duration or duration <= 0:
+        return []
+    step = float(duration) / count
+    points: list[float] = []
+    boundary = [
+        float(item.get("time") or 0.0)
+        for item in scenes
+        if item.get("time") is not None
+    ]
+    for index in range(count):
+        point = step * (index + 0.5)
+        nearest = min(boundary, key=lambda value: abs(value - point)) if boundary else None
+        if nearest is not None and abs(nearest - point) <= min(2.0, step / 2):
+            point = nearest + 0.05
+        points.append(round(min(max(0.0, point), max(0.0, duration - 0.05)), 3))
+    # 去重后仍保持升序；重复点只留一个。
+    return sorted(set(points))
+
+
+async def _run_download(payload: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
+    """下载任务：交给 download 适配器，进度实时写进任务的 ``meta.progress``。"""
+    adapter = ctx.registry.get("download")
+    started = time.perf_counter()
+    result = await adapter.call(
+        "download_any",
+        payload["url"],
+        str(_download_out_dir(ctx.cfg)),
+        quality=payload["quality"],
+        subtitles=bool(payload["subtitles"]),
+        cookies=payload.get("cookies"),
+        progress_cb=ctx.report,
+        timeout=ctx.cfg.download_timeout,
+        max_mb=ctx.cfg.download_max_mb,
+        should_cancel=ctx.is_canceled,
+    )
+    result["elapsed_seconds"] = round(time.perf_counter() - started, 1)
+    return result
+
+
+async def _transcribe_segments(
+    path: Path, engine: str, ctx: JobContext
+) -> dict[str, Any]:
+    """把下载到的媒体转 16k wav，再走带时间戳的分段识别。"""
+    from ..core.segments import normalize_segments
+    from ..core.asr_engines import normalize_engine
+
+    chosen = normalize_engine(engine, ctx.cfg, need_timestamps=True)
+    media = ctx.registry.get("media")
+    wav_path: Optional[Path] = None
+    try:
+        if path.suffix.lower() != ".wav":
+            converted = await media.call("to_wav16k", str(path))
+            wav_path = Path(converted["path"])
+        adapter = adapter_for(ctx.registry, chosen)
+        result = await adapter.infer_segments(str(wav_path or path), "auto")
+    finally:
+        if wav_path is not None:
+            try:
+                wav_path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("分析任务临时 wav 删除失败：%s", wav_path)
+    duration = result.get("duration")
+    segments = normalize_segments(result.get("segments"), duration=duration)
+    return {
+        "engine": result.get("engine") or chosen,
+        "language": result.get("language") or "auto",
+        "duration": duration,
+        "segments": segments,
+        "text": result.get("text") or "",
+        "timestamp_source": result.get("timestamp_source")
+        or ("native" if chosen == "whisper" else "vad"),
+    }
+
+
+def _site_segments(paths: list[str]) -> tuple[Optional[Path], list[dict[str, Any]]]:
+    """从站点字幕里挑一个并解析；没有可用字幕时返回 ``(None, [])``。"""
+    from ..core.subtitles import parse_subtitle_file, pick_subtitle
+
+    chosen = pick_subtitle(paths)
+    if chosen is None:
+        return None, []
+    return chosen, parse_subtitle_file(chosen)
+
+
+async def _run_analyze(payload: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
+    """链接分析编排：下载 -> （站点字幕 | ASR）-> 场景边界 -> 可选抽帧。"""
+    from datetime import datetime
+
+    started = time.perf_counter()
+    cfg = ctx.cfg
+    media = ctx.registry.get("media")
+
+    ctx.report({"stage": "download", "percent": 0, "status": "starting"})
+    downloaded = await _run_download(payload, ctx)
+    path = Path(downloaded["path"])
+    duration = downloaded.get("duration")
+    ctx.report({"stage": "probe", "percent": 5, "status": "running"})
+
+    subtitles_from = "asr"
+    subtitle_path: Optional[Path] = None
+    segments: list[dict[str, Any]] = []
+    if downloaded.get("subtitles"):
+        subtitle_path, segments = _site_segments(list(downloaded["subtitles"]))
+        if segments:
+            subtitles_from = "site"
+    asr_info: dict[str, Any] = {}
+    if not segments:
+        ctx.report({"stage": "asr", "percent": 15, "status": "running"})
+        asr_info = await _transcribe_segments(path, payload.get("engine") or "auto", ctx)
+        segments = asr_info["segments"]
+        if duration is None:
+            duration = asr_info.get("duration")
+
+    ctx.report({"stage": "scenes", "percent": 70, "status": "running"})
+    scene_result = await media.call(
+        "detect_scenes",
+        str(path),
+        save_dir=str(cfg.scenes_dir),
+    )
+    scenes = scene_result.get("scenes") or []
+    if duration is None:
+        duration = scene_result.get("duration")
+
+    frames: list[dict[str, Any]] = []
+    max_frames = int(payload.get("max_frames") or 0)
+    if max_frames > 0:
+        ctx.report({"stage": "frames", "percent": 85, "status": "running"})
+        times = _frame_times(scenes, duration, max_frames)
+        if times:
+            out_dir = cfg.frames_dir / (
+                f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+            )
+            frames = await media.call(
+                "extract_frames", str(path), str(out_dir), times=times
+            )
+
+    elapsed = round(time.perf_counter() - started, 1)
+    result = {
+        "ok": True,
+        "title": downloaded.get("title") or path.stem,
+        "duration": None if duration is None else round(float(duration), 3),
+        "path": str(path),
+        "site": downloaded.get("site"),
+        "subtitles_from": subtitles_from,
+        "subtitle_path": str(subtitle_path) if subtitle_path else None,
+        "segments": segments,
+        "scenes": scenes,
+        "frames": frames,
+        "scenes_json": scene_result.get("json_path"),
+        "asr": {
+            "engine": asr_info.get("engine"),
+            "language": asr_info.get("language"),
+            "timestamp_source": asr_info.get("timestamp_source"),
+        }
+        if asr_info
+        else None,
+        "download": {
+            "size_mb": downloaded.get("size_mb"),
+            "quality": downloaded.get("quality"),
+            "elapsed_seconds": downloaded.get("elapsed_seconds"),
+        },
+        "elapsed_seconds": elapsed,
+    }
+    ctx.report({"stage": "done", "percent": 100, "status": "done"})
+    logger.info(
+        "链接分析完成：%s 字幕来源=%s 段数=%d 场景=%d 帧=%d 耗时=%.1fs",
+        path,
+        subtitles_from,
+        len(segments),
+        len(scenes),
+        len(frames),
+        elapsed,
+    )
+    return result
+
+
 async def execute_job(job: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     """按 ``kind/action`` 分派到具体能力；返回 JSON 可序列化结果。"""
     kind = job["kind"]
@@ -604,4 +860,8 @@ async def execute_job(job: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         return await _run_speaker(action, payload, ctx)
     if kind == "media":
         return await _run_media(action, payload, ctx)
+    if kind == "download":
+        return await _run_download(payload, ctx)
+    if kind == "analyze":
+        return await _run_analyze(payload, ctx)
     raise ValueError(f"未知任务类型：{kind}")

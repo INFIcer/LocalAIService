@@ -33,8 +33,9 @@ def client_ip(request: Request) -> str:
         return ""
 
 
-def sync_wait_timeout(cfg: Config) -> float:
-    return float(cfg.jobs_timeout) + WAIT_MARGIN_SECONDS
+def sync_wait_timeout(cfg: Config, kind: str = "") -> float:
+    """同步接口等待上限：按任务类型取超时，再留一点余量。"""
+    return float(cfg.job_timeout_for(kind)) + WAIT_MARGIN_SECONDS
 
 
 async def submit_and_wait(
@@ -57,7 +58,7 @@ async def submit_and_wait(
         client_ip=client_ip(request),
         job_id=job_id,
     )
-    return await scheduler.wait(created_id, timeout=sync_wait_timeout(cfg))
+    return await scheduler.wait(created_id, timeout=sync_wait_timeout(cfg, kind))
 
 
 def cleanup_job_upload(cfg: Config, job_id: str) -> None:

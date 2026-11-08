@@ -17,6 +17,7 @@ from ..core.registry import EngineRegistry
 from .asr_fasterwhisper import WhisperAdapter
 from .asr_sensevoice import AsrAdapter
 from .base import BaseAdapter
+from .download_ytdlp import DownloadAdapter
 from .media_ffmpeg import MediaAdapter
 from .separate_demucs import SeparateAdapter
 from .speaker_campplus import SpeakerAdapter
@@ -31,6 +32,7 @@ __all__ = [
     "SpeakerAdapter",
     "SeparateAdapter",
     "MediaAdapter",
+    "DownloadAdapter",
     "TranslateAdapter",
     "build_registry",
 ]
@@ -48,4 +50,5 @@ def build_registry(cfg: Optional[Config] = None) -> EngineRegistry:
     registry.register(SpeakerAdapter(cfg))
     registry.register(SeparateAdapter(cfg))
     registry.register(MediaAdapter(cfg))
+    registry.register(DownloadAdapter(cfg))
     return registry

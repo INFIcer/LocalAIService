@@ -47,6 +47,14 @@
     LOCALAI_TRANSLATE_MAX_LEN  翻译默认单块 token 上限（默认 400，范围 32~1024）
     LOCALAI_TOKEN             可选的 Bearer 鉴权令牌（默认空=不鉴权）
 
+下载 / 链接分析（新增，见 ``docs/SERVICE_API.md``）::
+
+    LOCALAI_DOWNLOAD_MAX_MB      单个下载文件大小上限（默认 2048）
+    LOCALAI_DOWNLOAD_SYNC_MAX_MB 同步下载接口允许的大小上限（默认 200）
+    LOCALAI_DOWNLOAD_TIMEOUT     单次下载 / 分析任务超时秒数（默认 1800）
+    LOCALAI_BILI_COOKIE          B站 cookie JSON 路径（默认本机 bili-duty 凭证）
+    LOCALAI_DOWNLOAD_ALLOW_PRIVATE 1=允许私有地址（仅测试；生产不要设）
+
 任务队列（详见 ``localai.jobs``）::
 
     LOCALAI_JOBS_RECOVER       重启后遗留 running 的处理：requeue（默认）/ fail
@@ -288,6 +296,12 @@ class Config:
     translate_batch_size: int = 8
     #: 请求没有显式给 max_len 时使用的默认单块 token 上限。
     translate_max_len: int = 400
+    #: 下载能力：单文件上限 / 同步接口上限 / 单次超时（秒）。
+    download_max_mb: int = 2048
+    download_sync_max_mb: int = 200
+    download_timeout: float = 1800.0
+    #: 可选：显式指定 B站 cookie JSON；空=沿用引擎里的本机默认路径。
+    bili_cookie_file: str = ""
     speaker_model_dir: Path = field(default_factory=Path)
     comfy_model_dir: Path = field(default_factory=Path)
     comfy_base: str = "http://127.0.0.1:8188"
@@ -347,6 +361,11 @@ class Config:
     def jobs_db_path(self) -> Path:
         """SQLite 任务库路径：``<HOME>/data/jobs.db``。"""
         return self.data_dir / "jobs.db"
+
+    @property
+    def downloads_dir(self) -> Path:
+        """下载产物根目录：``<HOME>/data/downloads/<日期>/``（已被 .gitignore 排除）。"""
+        return self.data_dir / "downloads"
 
     @property
     def jobs_upload_dir(self) -> Path:
@@ -504,6 +523,12 @@ class Config:
             translate_max_len=max(
                 32, min(1024, _pick_int(400, "LOCALAI_TRANSLATE_MAX_LEN"))
             ),
+            download_max_mb=max(1, _pick_int(2048, "LOCALAI_DOWNLOAD_MAX_MB")),
+            download_sync_max_mb=max(
+                1, _pick_int(200, "LOCALAI_DOWNLOAD_SYNC_MAX_MB")
+            ),
+            download_timeout=max(1.0, _pick_float(1800.0, "LOCALAI_DOWNLOAD_TIMEOUT")),
+            bili_cookie_file=(_pick("LOCALAI_BILI_COOKIE") or "").strip(),
             speaker_model_dir=Path(
                 _pick(
                     "LOCALAI_CAMPPUS_DIR",
@@ -645,8 +670,13 @@ class Config:
             "INDEX_TTS_ASR_IDLE_UNLOAD": str(self.asr_idle_unload),
             "INDEX_TTS_SPEAKER_IDLE_UNLOAD": str(self.speaker_idle_unload),
             "INDEX_TTS_SEPARATE_IDLE_UNLOAD": str(self.separate_idle_unload),
+            "LOCALAI_DOWNLOAD_MAX_MB": str(self.download_max_mb),
+            "LOCALAI_DOWNLOAD_SYNC_MAX_MB": str(self.download_sync_max_mb),
+            "LOCALAI_DOWNLOAD_TIMEOUT": str(int(self.download_timeout)),
             "TORCH_HOME": str(self.torch_home),
         }
+        if self.bili_cookie_file:
+            mapping["LOCALAI_BILI_COOKIE"] = self.bili_cookie_file
         if self.ffmpeg is not None:
             mapping["INDEX_TTS_FFMPEG"] = str(self.ffmpeg)
         if self.ffprobe is not None:
@@ -685,6 +715,13 @@ class Config:
                 "num_beams": self.translate_num_beams,
                 "batch_size": self.translate_batch_size,
                 "max_len": self.translate_max_len,
+            },
+            "download": {
+                "dir": str(self.downloads_dir),
+                "max_mb": self.download_max_mb,
+                "sync_max_mb": self.download_sync_max_mb,
+                "timeout_seconds": self.download_timeout,
+                "bili_cookie_file": self.bili_cookie_file or None,
             },
             "speaker_model_dir": str(self.speaker_model_dir),
             "voices_dir": str(self.voices_dir),
@@ -736,10 +773,24 @@ class Config:
         """某类任务的配置并行上限（未单独配置的能力固定 1）。"""
         if kind == "asr":
             return self.asr_parallel_effective()
+        # 下载是纯网络 / IO，不占显存；同类并行默认 1，避免同站并发请求。
+        # 分析内部要跑 ASR，因此固定串行。
         return {
             "tts": self.jobs_parallel_tts,
             "separate": self.jobs_parallel_separate,
+            "download": 1,
+            "analyze": 1,
         }.get(kind, 1)
+
+    def job_timeout_for(self, kind: str) -> float:
+        """某类任务的执行超时（秒）。
+
+        下载 / 链接分析可能是几十分钟的长任务，用 ``LOCALAI_DOWNLOAD_TIMEOUT``；
+        其余能力沿用旧的 ``LOCALAI_JOB_TIMEOUT``，旧语义不变。
+        """
+        if kind in ("download", "analyze"):
+            return float(self.download_timeout)
+        return float(self.jobs_timeout)
 
     def jobs_parallel_map(self) -> dict[str, int]:
         """所有能力当前配置的并行上限（给 /jobs/stats、/capabilities）。"""
@@ -750,6 +801,8 @@ class Config:
             "speaker": 1,
             "media": 1,
             "translate": 1,
+            "download": 1,
+            "analyze": 1,
         }
 
     def jobs_global_cap(self) -> Optional[int]:
@@ -794,6 +847,7 @@ def ensure_directories(cfg: Optional[Config] = None) -> list[Path]:
         cfg.vram_estimates_path.parent,
         cfg.data_dir,
         cfg.jobs_upload_dir,
+        cfg.downloads_dir,
     ]
     created: list[Path] = []
     for path in wanted:

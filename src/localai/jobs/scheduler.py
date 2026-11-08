@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import logging
 import shutil
 import time
@@ -283,6 +284,8 @@ class JobScheduler:
             "speaker": self._parallel_limit("speaker"),
             "media": self._parallel_limit("media"),
             "translate": self._parallel_limit("translate"),
+            "download": self._parallel_limit("download"),
+            "analyze": self._parallel_limit("analyze"),
         }
 
     @property
@@ -317,6 +320,7 @@ class JobScheduler:
             "parallel_degraded": dict(self._degraded),
             "concurrency": self._concurrency_snapshot(),
             "timeout_seconds": self.cfg.jobs_timeout,
+            "download_timeout_seconds": self.cfg.download_timeout,
             "recover_mode": self.cfg.jobs_recover,
             "paused": False,
         }
@@ -547,6 +551,9 @@ class JobScheduler:
                 result, error = await self._execute_once(job)
                 if error is None:
                     break
+                # 取消请求导致的退出：不算失败，下面统一置 canceled。
+                if job_id in self._cancel_requested:
+                    break
                 # 并行推理撞 OOM：降级到 1、卸载其它模型、只重试这一条一次。
                 if is_cuda_oom(error) and parallel_before > 1 and attempt == 0:
                     attempt += 1
@@ -565,7 +572,13 @@ class JobScheduler:
             with contextlib.suppress(Exception):
                 await self.store.fail(job_id, f"{type(exc).__name__}: {exc}")
 
-        if error is not None:
+        if error is not None and job_id in self._cancel_requested:
+            # 取消是「用户意图」，优先于失败：写 canceled、不写 result。
+            await self.store.mark_canceled(
+                job_id, "已取消（运行中尽力取消，结果已丢弃）"
+            )
+            logger.info("任务取消完成：id=%s kind=%s（执行器已退出）", job_id, kind)
+        elif error is not None:
             self._remember_error(job_id, error)
             logger.error(
                 "任务失败：id=%s kind=%s action=%s 等待=%.0fms 耗时=%.0fms 显存=%s 错误=%s: %s",
@@ -609,17 +622,24 @@ class JobScheduler:
         """执行一次；返回 (结果, 异常)。超时在这里直接置 failed。"""
         job_id = job["id"]
         kind = job["kind"]
-        exec_task = asyncio.create_task(self.executor(job, self.ctx))
+        timeout = self.cfg.job_timeout_for(kind)
+        # 每个任务一份独立上下文：进度写 meta、取消查本任务的标记。
+        ctx = dataclasses.replace(
+            self.ctx,
+            progress=self._progress_reporter(job_id),
+            is_canceled=lambda jid=job_id: jid in self._cancel_requested,
+        )
+        exec_task = asyncio.create_task(self.executor(job, ctx))
         try:
-            done, _pending = await asyncio.wait({exec_task}, timeout=self.cfg.jobs_timeout)
+            done, _pending = await asyncio.wait({exec_task}, timeout=timeout)
             if not done:
-                message = f"任务超时（{self.cfg.jobs_timeout:.0f} 秒）"
+                message = f"任务超时（{timeout:.0f} 秒）"
                 await self.store.fail(job_id, message)
                 logger.error(
                     "任务超时：id=%s kind=%s 超过 %.0fs，已置 failed；等待底层调用退出",
                     job_id,
                     kind,
-                    self.cfg.jobs_timeout,
+                    timeout,
                 )
                 # GPU 调用无法强杀：等它真正退出，避免下一个任务和它抢显存。
                 with contextlib.suppress(BaseException):
@@ -678,6 +698,28 @@ class JobScheduler:
         self._errors.move_to_end(job_id)
         while len(self._errors) > _MAX_REMEMBERED_ERRORS:
             self._errors.popitem(last=False)
+
+    def _progress_reporter(self, job_id: str) -> Callable[[dict[str, Any]], None]:
+        """给执行器一个线程安全的进度上报函数（写进 ``jobs.meta.progress``）。
+
+        下载在 ``asyncio.to_thread`` 里跑，进度回调发生在工作线程；这里用
+        ``run_coroutine_threadsafe`` 把写库操作送回事件循环，绝不阻塞下载。
+        写库本身有 SQLite 锁，进度又已按秒节流，压力很小。
+        """
+        loop = asyncio.get_running_loop()
+
+        def report(payload: dict[str, Any]) -> None:
+            if self._stopping or not payload:
+                return
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self.store.update_meta(job_id, {"progress": payload}), loop
+                )
+            except RuntimeError:
+                # 事件循环已关闭（服务正在退出），忽略即可。
+                pass
+
+        return report
 
     def _notify_waiters(self, job_id: str) -> None:
         event = self._waiters.get(job_id)

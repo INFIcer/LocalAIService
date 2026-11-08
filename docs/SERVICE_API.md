@@ -980,7 +980,8 @@ failed / canceled）后默认删除，`LOCALAI_JOBS_KEEP_UPLOADS=1` 可保留。
 "jobs": {"enabled": true, "sync_endpoints_use_queue": true,
          "order": "kind_first > priority > created_at（无 aging）",
          "max_parallel": 1,
-         "per_kind_parallel": {"tts": 1, "asr": 1, "separate": 1, "speaker": 1, "media": 1},
+         "per_kind_parallel": {"tts": 1, "asr": 1, "separate": 1, "speaker": 1,
+                               "media": 1, "translate": 1, "download": 1, "analyze": 1},
          "parallel_extra_mb": 600,
          "timeout_seconds": 600.0, "recover": "requeue"}
 ```
@@ -989,7 +990,8 @@ failed / canceled）后默认删除，`LOCALAI_JOBS_KEEP_UPLOADS=1` 可保留。
 
 - 同步旧接口现在也要经过同一个队列，因此**会在队列里留下记录**；
   并发调用时它们按调度规则排队，不再只靠能力锁。
-- 同步接口等待上限 = `LOCALAI_JOB_TIMEOUT + 30` 秒。
+- 同步接口等待上限 = 对应任务类型超时 + 30 秒（下载 / 分析用
+  `LOCALAI_DOWNLOAD_TIMEOUT`，默认 1800 秒；其它能力仍是 600 秒）。
 - 参数错误（格式/语言/模型/stems）仍然在入队前返回 400，不会产生任务记录。
 - 声纹 `/speakers/*` 与媒体 `/media/*` 仍是直接调用、不入队（它们不是
   长任务，语义保持不变）。
@@ -1324,4 +1326,199 @@ curl http://127.0.0.1:7880/jobs/6f7e0bb4e249463da456e7252142fdbe/result
 - 不支持流式；长文本按块串行生成，首字延迟 = 整条耗时。
 - `source=auto` 依赖 `langdetect`，对超短文本/代码/符号串不可靠。
 - GPU 与 TTS 不能同时驻留（8GB 卡），切换时会有一次加载等待。
+
+---
+
+## 14. 下载与链接分析（yt-dlp + 直链兜底）
+
+新增的通用能力：给一个 **http/https** 链接，就能下载视频/音频，并进一步拿到
+**字幕时间轴 + 镜头边界**。不占显存、不加载模型，服务启动仍然是 0 模型。
+
+- 能力名：`download`（`/capabilities`、`/admin/models` 里可发现）
+- 引擎：`yt-dlp`（默认），普通直链自动兜底到 httpx 流式下载
+- 下载目录：`LOCALAI_HOME/data/downloads/<YYYY-MM-DD>/`（已被 `.gitignore` 排除）
+- 字幕：优先站点字幕（中文 > 英文），没有站内字幕时由 `analyze` 跑 ASR
+
+### 14.1 接口一览
+
+| 接口 | 用途 | 是否入任务队列 |
+| --- | --- | --- |
+| `POST /media/download` | 提交异步下载，立刻返回 job id | 是（`kind=download`） |
+| `POST /media/download/sync` | 小文件同步下载（≤ 同步上限） | 否（线程池直跑） |
+| `GET /media/download/status` | yt-dlp 版本 / aria2 / 目录 / 限额 / 当前任务数 | 否 |
+| `POST /media/analyze` | 下载 + 字幕/ASR + 场景边界（同步等结果） | 内部走 `kind=analyze` |
+| `POST /jobs/analyze` | 异步链接分析，立刻返回 job id | 是（`kind=analyze`） |
+| `POST /jobs/{id}/cancel` | 取消下载/分析（运行中尽力而为） | — |
+
+### 14.2 异步下载 `POST /media/download`
+
+```bash
+curl -X POST http://127.0.0.1:7880/media/download \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://www.bilibili.com/video/BV1UY4G6pEJg","quality":"720p","subtitles":true,"priority":0}'
+```
+
+```json
+{"ok": true, "job_id": "0f4c...", "id": "0f4c...", "state": "queued"}
+```
+
+参数：
+
+| 字段 | 默认 | 说明 |
+| --- | --- | --- |
+| `url` | 必填 | 只允许 http/https |
+| `quality` | `720p` | `720p` / `best` / `audio`；audio 转 m4a |
+| `subtitles` | `true` | 尝试站内字幕，下不到不报错 |
+| `cookies` | 空 | 可选 Netscape cookie 文件；B站不填时自动读取本机凭证 |
+| `priority` | `0` | 越大越先（同类型优先 > 优先级 > 提交时间） |
+
+执行中 `GET /jobs/{id}` 的 `meta.progress` 形如：
+
+```json
+{"status":"downloading","percent":42.3,"downloaded_bytes":3251200,
+ "total_bytes":7680000,"speed":980000.0,"eta":5,"elapsed_seconds":3.3}
+```
+
+完成后 `result`：
+
+```json
+{"ok":true,"path":"...\\data\\downloads\\2026-11-08\\xxx.mp4","title":"...",
+ "duration":431.268,"site":"BiliBili","subtitles":["...\\xxx.zh.srt"],
+ "size_mb":7.8,"quality":"720p","elapsed_seconds":2.5}
+```
+
+### 14.3 同步下载 `POST /media/download/sync`
+
+参数同上，但**没有 `priority`**。只允许不超过 `LOCALAI_DOWNLOAD_SYNC_MAX_MB`
+（默认 200MB）的文件；超限返回 **413**，`detail` 建议改用 `/media/download`。
+
+```json
+{"ok":true,"path":"...mp4","title":"Big_Buck_Bunny_720_10s_1MB",
+ "duration":10.0,"site":"Generic","subtitles":[],"size_mb":0.92,
+ "quality":"720p","sync_limit_mb":200}
+```
+
+### 14.4 状态 `GET /media/download/status`
+
+```json
+{
+  "ok": true,
+  "yt_dlp": {"installed": true, "version": "2026.10.26", "path": "...\\yt_dlp\\__init__.py"},
+  "aria2c": {"available": false, "path": null},
+  "download_dir": "E:\\LocalAIService\\data\\downloads",
+  "today_dir": "E:\\LocalAIService\\data\\downloads\\2026-11-08",
+  "jobs": {"queued": 0, "running": 0, "analyze_running": 0},
+  "limits": {"max_mb": 2048, "sync_max_mb": 200, "timeout_seconds": 1800.0,
+             "qualities": ["720p", "best", "audio"]},
+  "ssrf": {"schemes": ["http", "https"], "check_redirects": true}
+}
+```
+
+### 14.5 链接分析 `POST /media/analyze`
+
+```bash
+curl -X POST http://127.0.0.1:7880/media/analyze \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://www.bilibili.com/video/BV1UY4G6pEJg","engine":"auto","max_frames":3}'
+```
+
+编排：**下载 →（站点字幕 | ASR 分段）→ 场景边界 → 可选抽帧**。
+
+- `engine`：`whisper` / `sensevoice` / `auto`；只在站内没有可用字幕时使用；
+  `auto` 在需要时间戳时选 `whisper`。
+- `max_frames`：0（默认，不抽帧）~ 200。抽帧点均匀分布，并吸附到最近的镜头
+  边界（2 秒内）。
+- 返回结构：
+
+```json
+{
+  "ok": true,
+  "title": "TTS模型从夯到拉排行！9款热门语音模型，谁是真神？",
+  "duration": 431.268,
+  "path": "...\\data\\downloads\\2026-11-08\\xxx.mp4",
+  "site": "BiliBili",
+  "subtitles_from": "site",
+  "subtitle_path": "...\\xxx.zh.srt",
+  "segments": [{"start": 0.08, "end": 0.68, "text": "本期盘点"}],
+  "scenes": [{"time": 6.4, "score": 1.0}],
+  "frames": [{"path": "...\\outputs\\frames\\...\\frame_0001_71.878s.jpg", "time_sec": 71.878}],
+  "scenes_json": "...\\outputs\\scenes\\....json",
+  "asr": null,
+  "download": {"size_mb": 7.8, "quality": "720p", "elapsed_seconds": 1.5},
+  "elapsed_seconds": 6.7
+}
+```
+
+`subtitles_from` 取值：`site`（站点字幕）或 `asr`（识别结果）。
+`segments` 已保证升序、无重叠、`end > start`（与 `/asr/segments` 同一整理逻辑）。
+
+### 14.6 限额与环境变量
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `LOCALAI_DOWNLOAD_MAX_MB` | 2048 | 单文件大小上限；超限中止并删除半成品 |
+| `LOCALAI_DOWNLOAD_SYNC_MAX_MB` | 200 | 同步接口上限，超过要求走异步 |
+| `LOCALAI_DOWNLOAD_TIMEOUT` | 1800 | 下载/分析任务超时秒数（队列按 kind 使用） |
+| `LOCALAI_BILI_COOKIE` | 本机 bili-duty 凭证 | B站 cookie JSON 路径 |
+| `LOCALAI_DOWNLOAD_ALLOW_PRIVATE` | 空 | **仅测试**：1=允许私有地址；生产不要设 |
+
+### 14.7 SSRF 策略
+
+- 只允许 `http://` / `https://`；`file://`、`ftp://`、`data:` 等一律 400。
+- 解析域名后拒绝：`127.0.0.0/8`、`10/8`、`172.16/12`、`192.168/16`、
+  `169.254/16`、`::1`、`fc00::/7`、`fe80::/10`，以及其它非公网地址。
+- 直链下载**不自动跟随重定向**：逐跳校验 `Location`，最多 5 跳。
+- yt-dlp 下载前会复查探测到的最终页面地址；`webpage_url` 也按同一策略校验。
+- 测试本机临时 HTTP 服务器时临时设 `LOCALAI_DOWNLOAD_ALLOW_PRIVATE=1`。
+
+### 14.8 Cookie 说明
+
+- `cookies` 参数接受 Netscape 格式文件路径，仅本次下载使用。
+- 不传且 URL 属于 `bilibili.com` / `b23.tv` 时，服务读取本机
+  `C:\Users\Administrator\.dsh\bili-duty\bili_credential.json`（可用
+  `LOCALAI_BILI_COOKIE` 覆盖），生成**临时** Netscape 文件，用完立即删除。
+- 字段名大小写不敏感：`SESSDATA` / `bili_jct` / `buvid3` / `DedeUserID` 等。
+- **cookie 值不写日志、不进仓库**；`bili_credential.json` 已在 `.gitignore`。
+- 其它站点不会自动携带任何 cookie，需要登录的内容请显式传 `cookies`。
+
+### 14.9 队列、进度与取消
+
+- `kind=download` / `kind=analyze` 与其它任务共用 SQLite 队列；排序仍是
+  **同类型优先 > 优先级 > 提交时间**。
+- 下载 / 分析各自固定同类并行 1（同站请求克制，不并发抓取）。
+- 运行中的取消：进度钩子每个检查点查一次取消标记，命中就停；已下完的
+  文件保留，半成品 `.part/.ytdl` 删除。服务重启后 running 任务按
+  `LOCALAI_JOBS_RECOVER`（默认 requeue）重新排队。
+
+### 14.10 实测数据（2026-11-08，本机 8GB 卡）
+
+| 场景 | 结果 |
+| --- | --- |
+| B站 `BV1UY4G6pEJg`（720p） | yt-dlp **2026.10.26**；耗时 **2.5s**；**7.8MB**；时长 431.268s；站内中文字幕 `xxx.zh.srt`；路径 `data\downloads\2026-11-08\...mp4` |
+| 一般站 `test-videos.co.uk`（10s mp4） | 耗时 **2.7s**；**0.92MB**；时长 10.0s；`site=Generic` |
+| 直链（本机临时 HTTP 服务器，ffmpeg testsrc 5s） | 落盘成功；**0.07MB**；probe 时长 **5.0s**；`site=127.0.0.1` |
+| analyze 端到端（B站，max_frames=3） | 总耗时 **6.7s**；`subtitles_from=site`；**209** 段；**2** 个场景边界；**3** 张帧 |
+| SSRF `http://127.0.0.1:...` | 拒绝：`DownloadBlocked`（SSRF 防护） |
+| SSRF `file:///C:/x.mp4` | 拒绝：只允许 http/https |
+| 超限（2MB 文件，上限 1MB） | 中止并删除 `.part`，无残留 |
+
+B站字幕抽查（与音频内容一致）：
+
+| 时间 | 文本 |
+| --- | --- |
+| 0.08~0.68 | 本期盘点 |
+| 0.68~2.40 | 我自制的9款主流TTS |
+| 2.40~3.70 | 语音生成整合包 |
+
+### 14.11 已知限制
+
+- **B站风控**：无 cookie 或 cookie 过期时可能返回 403 / 需要验证码；不要反复
+  重试，更新 `bili_credential.json` 后再试。
+- **yt-dlp 需要常更新**：站点改版后旧版本会失效。升级：
+  `engine\.venv\Scripts\python -m pip install -U yt-dlp`；WebUI「系统」页可看版本。
+- 站点字幕是**站方提供**的，时间轴/断句质量由站方决定；没有字幕时才跑 ASR，
+  速度取决于所选识别引擎。
+- 直链兜底只针对 yt-dlp 明确报 `Unsupported URL` 的情况，避免把登录页/HTML
+  当视频保存。
+- 不做站内爬取 / 批量抓取，一次只下载用户明确给出的一个公开链接。
 

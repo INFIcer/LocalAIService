@@ -585,6 +585,8 @@ def test_stats_fields_and_sync_endpoints_use_queue(tmp_path: Path) -> None:
             "speaker",
             "media",
             "translate",
+            "download",
+            "analyze",
         }
         assert per_kind["asr"] == cfg.asr_parallel_effective()
         assert per_kind["translate"] == 1

@@ -1,4 +1,4 @@
-# 本地 AI 服务管理器（TTS + ASR + 声纹 + 媒体）
+# 本地 AI 服务管理器（TTS + ASR + 声纹 + 媒体 + 下载）
 
 > 项目原名 **IndexTTS**，因能力已扩展到 TTS / ASR / 声纹 / 视频抽帧，改名为
 > **LocalAIService（本地 AI 服务管理器）**。真实目录 `E:\LocalAIService`，
@@ -8,7 +8,9 @@
 把 IndexTTS-2.5 的推理从「ComfyUI 节点」改成**独立 Python 引擎**，再用原来的
 FastAPI 服务对外提供 HTTP 接口；同时接入 **SenseVoiceSmall** 做中文/多语种语音识别，
 用 **campplus** 做 192 维声纹识别（判断「是谁在说话」），
-并用 **ffmpeg** 提供媒体探测、抽帧、抽音轨、视频转写（`/media/*`）。
+并用 **ffmpeg** 提供媒体探测、抽帧、抽音轨、视频转写（`/media/*`），
+以及 **yt-dlp** 的通用视频/音频下载与「链接 -> 字幕时间轴 + 镜头边界」分析
+（`/media/download*`、`/media/analyze`，见文末第 18 章）。
 TTS / ASR / 声纹 / 人声分离 四者都采用「第一次请求才加载、空闲自动卸载」策略，
 各有一把推理锁、一个看门狗，互不干扰；四个能力加载前再统一经过
 `src\localai\core\vram.py` 做**按需腾显存（LRU + 安全余量）**，启动时仍然是 0 模型。
@@ -1689,3 +1691,41 @@ Windows 的 WDDM 会把一部分显存分页/复用，nvidia-smi 和 torch 的�
 现在这段代码和阈值已删除，`released_models` 字段保留，值来自
 `ensure_capacity()` 的 `released`。README 16.4 里“低于约 2800MB 会主动卸载”
 属于旧说明，**以本章为准**。
+
+---
+
+## 18. 通用下载与链接分析（v2.4 新增）
+
+给一个 http/https 链接，就能下载视频/音频，并拿到**字幕时间轴 + 镜头边界**：
+
+```bash
+# 异步下载（进度看 /jobs/{id}）
+curl -X POST http://127.0.0.1:7880/media/download \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://www.bilibili.com/video/BV1UY4G6pEJg","quality":"720p"}'
+
+# 小文件同步下载（≤200MB）
+curl -X POST http://127.0.0.1:7880/media/download/sync \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://example.com/a.mp4"}'
+
+# 链接分析：下载 -> 站点字幕/ASR -> 场景边界 -> 可选抽帧
+curl -X POST http://127.0.0.1:7880/media/analyze \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://www.bilibili.com/video/BV1UY4G6pEJg","max_frames":3}'
+
+curl http://127.0.0.1:7880/media/download/status
+```
+
+- 引擎：`yt-dlp`（装在 `engine/.venv`，未装时其余能力不受影响）+ 直链兜底；
+- 不占显存、不加载模型，服务仍 0 模型启动；
+- 产物在 `data/downloads/<日期>/`（`.gitignore` 已排除）；
+- 只允许 http/https，私有/回环/链路本地地址与 `file://` 一律拒绝（SSRF 防护）；
+- B站自动读取本机 `bili_credential.json` 生成**临时** cookie 文件，用完即删，
+  不写日志、不进仓库；其它站点需显式传 Netscape cookie 文件；
+- 单文件上限 `LOCALAI_DOWNLOAD_MAX_MB`（默认 2048），同步接口上限
+  `LOCALAI_DOWNLOAD_SYNC_MAX_MB`（默认 200），下载/分析超时
+  `LOCALAI_DOWNLOAD_TIMEOUT`（默认 1800 秒）。
+
+接口参数、SSRF 策略、实测数据与已知限制见
+[`docs/SERVICE_API.md`](docs/SERVICE_API.md) 第 14 章。

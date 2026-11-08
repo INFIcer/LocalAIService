@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "localai-service"
-version = "2.3.0"
+version = "2.4.0"
 description = "本地 AI 服务层：TTS / ASR / 翻译 / 声纹 / 人声分离 / 媒体工具，统一 HTTP 接口、懒加载与显存管理"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -31,6 +31,8 @@ dependencies = [
 dev = ["pytest>=8"]
 # 下载模型时用；装了 modelscope 就优先走 ModelScope
 models = ["modelscope>=1.15", "huggingface_hub>=0.23"]
+# 通用视频/音频下载（yt-dlp）；aria2c 是可选的外部可执行文件，不是 pip 包
+download = ["yt-dlp>=2024.1"]
 # GPU 引擎（仍建议按 docs/INSTALL.md 用 cu 索引安装 torch）
 engines = [
     "torch>=2.4",

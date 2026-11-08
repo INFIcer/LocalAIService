@@ -100,3 +100,31 @@ class JobTranslateRequest(TranslateBatchRequest):
     """POST /jobs/translate：超大批量进任务队列。"""
 
     priority: int = 0
+
+
+class MediaDownloadRequest(BaseModel):
+    """POST /media/download：提交一个异步下载任务。"""
+
+    url: str = Field(..., description="http/https 链接（B站 / 一般站点 / 直链）")
+    quality: str = Field("720p", description="720p / best / audio")
+    subtitles: bool = Field(True, description="是否尝试下载站点字幕（下不到不报错）")
+    cookies: Optional[str] = Field(
+        None, description="可选：Netscape cookie 文件路径；不填时 B站自动读取本机凭证"
+    )
+    priority: int = Field(0, description="优先级，越大越先")
+
+
+class MediaAnalyzeRequest(BaseModel):
+    """POST /media/analyze：下载 + 字幕/ASR + 场景边界。"""
+
+    url: str = Field(..., description="http/https 链接")
+    engine: str = Field("auto", description="whisper / sensevoice / auto（站点无字幕时用）")
+    max_frames: int = Field(0, ge=0, le=200, description="0=不抽帧；>0 均匀+场景吸附抽帧")
+    quality: str = Field("720p", description="720p / best / audio")
+    subtitles: bool = Field(True, description="优先使用站点字幕")
+
+
+class JobAnalyzeRequest(MediaAnalyzeRequest):
+    """POST /jobs/analyze：异步链接分析。"""
+
+    priority: int = 0
