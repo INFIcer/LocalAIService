@@ -31,6 +31,15 @@
     LOCALAI_SPEAKER_IDLE_UNLOAD
     LOCALAI_SEPARATE_IDLE_UNLOAD
     LOCALAI_TOKEN             可选的 Bearer 鉴权令牌（默认空=不鉴权）
+
+任务队列（详见 ``localai.jobs``）::
+
+    LOCALAI_JOBS_RECOVER       重启后遗留 running 的处理：requeue（默认）/ fail
+    LOCALAI_JOBS_AGING_SECONDS 等待超过多少秒提 1 级优先级（默认 60）
+    LOCALAI_JOBS_MAX_PARALLEL  预留的并发度（默认 1；当前实现单 worker）
+    LOCALAI_JOB_TIMEOUT        单个任务超时秒数（默认 600）
+    LOCALAI_JOBS_KEEP_UPLOADS  任务完成后是否保留上传文件（默认 0=删除）
+    LOCALAI_JOBS_POLL          调度器空转轮询间隔秒（默认 0.2）
 """
 
 from __future__ import annotations
@@ -63,6 +72,23 @@ def _pick_int(default: int, *names: str) -> int:
         return int(float(raw))
     except (TypeError, ValueError):
         return default
+
+
+def _pick_float(default: float, *names: str) -> float:
+    raw = _pick(*names)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _pick_bool(default: bool, *names: str) -> bool:
+    raw = _pick(*names)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on", "y")
 
 
 def _default_home() -> Path:
@@ -172,7 +198,30 @@ class Config:
     poll_interval: float = 0.4
     job_timeout: float = 180.0
 
+    # ---- 任务队列（新增，不影响旧配置） ---------------------------------
+    jobs_recover: str = "requeue"
+    jobs_aging_seconds: int = 60
+    jobs_max_parallel: int = 1
+    jobs_timeout: float = 600.0
+    jobs_keep_uploads: bool = False
+    jobs_poll_interval: float = 0.2
+
     # ---- 派生目录 -------------------------------------------------------
+    @property
+    def data_dir(self) -> Path:
+        """任务库与上传文件的根目录：``<HOME>/data``（已被 .gitignore 排除）。"""
+        return self.home / "data"
+
+    @property
+    def jobs_db_path(self) -> Path:
+        """SQLite 任务库路径：``<HOME>/data/jobs.db``。"""
+        return self.data_dir / "jobs.db"
+
+    @property
+    def jobs_upload_dir(self) -> Path:
+        """异步任务的上传落盘根目录：``<HOME>/data/uploads/<job_id>/``。"""
+        return self.data_dir / "uploads"
+
     @property
     def asr_tmp_dir(self) -> Path:
         return self.output_dir / "asr_tmp"
@@ -309,6 +358,23 @@ class Config:
             log_level=(_pick("LOCALAI_LOG_LEVEL", default="INFO") or "INFO").upper(),
             poll_interval=float(_pick("LOCALAI_POLL", "INDEX_TTS_POLL", default="0.4") or 0.4),
             job_timeout=float(_pick("LOCALAI_TIMEOUT", "INDEX_TTS_TIMEOUT", default="180") or 180),
+            jobs_recover=(
+                "fail"
+                if (_pick("LOCALAI_JOBS_RECOVER", default="requeue") or "requeue").strip().lower()
+                == "fail"
+                else "requeue"
+            ),
+            jobs_aging_seconds=max(
+                0, _pick_int(60, "LOCALAI_JOBS_AGING_SECONDS")
+            ),
+            jobs_max_parallel=max(1, _pick_int(1, "LOCALAI_JOBS_MAX_PARALLEL")),
+            jobs_timeout=max(
+                1.0, _pick_float(600.0, "LOCALAI_JOB_TIMEOUT")
+            ),
+            jobs_keep_uploads=_pick_bool(False, "LOCALAI_JOBS_KEEP_UPLOADS"),
+            jobs_poll_interval=max(
+                0.05, _pick_float(0.2, "LOCALAI_JOBS_POLL")
+            ),
         )
 
     # ---- 给原生引擎写回环境变量 -----------------------------------------
@@ -377,6 +443,15 @@ class Config:
                 "separate": self.separate_idle_unload,
             },
             "auth_required": bool(self.token),
+            "jobs": {
+                "db_path": str(self.jobs_db_path),
+                "upload_dir": str(self.jobs_upload_dir),
+                "recover": self.jobs_recover,
+                "aging_seconds": self.jobs_aging_seconds,
+                "max_parallel": self.jobs_max_parallel,
+                "timeout_seconds": self.jobs_timeout,
+                "keep_uploads": self.jobs_keep_uploads,
+            },
         }
 
 
@@ -406,6 +481,8 @@ def ensure_directories(cfg: Optional[Config] = None) -> list[Path]:
         cfg.separate_tmp_dir,
         cfg.separate_dir,
         cfg.vram_estimates_path.parent,
+        cfg.data_dir,
+        cfg.jobs_upload_dir,
     ]
     created: list[Path] = []
     for path in wanted:

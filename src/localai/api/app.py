@@ -27,6 +27,7 @@ from ..core.errors import (
     ComfyError,
     EngineBackendError,
     InsufficientVramError,
+    JobError,
     SeparateBackendError,
     SpeakerBackendError,
     VoiceNotFound,
@@ -34,7 +35,8 @@ from ..core.errors import (
 from ..core.idle import IdleWatchdog
 from ..core.vram import register_adapters
 from ..engines import build_registry
-from .routers import asr, media, separate, speakers, system, tts
+from ..jobs import JobScheduler, JobStore
+from .routers import asr, jobs, media, separate, speakers, system, tts
 
 logger = logging.getLogger("localai.api")
 
@@ -62,6 +64,14 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
         ensure_directories(cfg)
         app.state.client = _http_client(cfg)
         app.state.idle_tasks = []
+
+        # 任务库先于调度器初始化：启动时先把上次遗留的 running 恢复掉。
+        store = JobStore(cfg.jobs_db_path)
+        await store.init()
+        scheduler = JobScheduler(cfg, registry, store, client=app.state.client, vram=vram)
+        await scheduler.start()
+        app.state.jobs_store = store
+        app.state.scheduler = scheduler
 
         logger.info(
             "本地 AI 服务启动：backend=%s 音色目录=%s 输出目录=%s 监听=%s",
@@ -115,6 +125,19 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
         try:
             yield
         finally:
+            # 先停调度器（等正在跑的任务收尾），再关数据库与 HTTP 客户端。
+            scheduler = getattr(app.state, "scheduler", None)
+            if scheduler is not None:
+                try:
+                    await scheduler.stop()
+                except Exception:  # noqa: BLE001 - 关停失败不阻塞退出
+                    logger.exception("停止任务调度器时出错")
+            store = getattr(app.state, "jobs_store", None)
+            if store is not None:
+                try:
+                    await store.close()
+                except Exception:  # noqa: BLE001
+                    logger.exception("关闭任务库时出错")
             for task in getattr(app.state, "idle_tasks", []):
                 task.cancel()
             for task in getattr(app.state, "idle_tasks", []):
@@ -271,6 +294,19 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
             },
         )
 
+    @app.exception_handler(JobError)
+    async def _job_error_handler(request: Request, exc: JobError) -> JSONResponse:
+        """任务超时/取消/无原始异常：给调用方一个稳定的 JSON 形状。"""
+        logger.error("任务队列错误：%s | %s", exc.error_code, exc.message)
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "ok": False,
+                "error": exc.error_code,
+                "detail": exc.message,
+            },
+        )
+
     # ------------------------------------------------------------------
     # 可选鉴权（LOCALAI_TOKEN 非空时启用；默认关闭）
     # ------------------------------------------------------------------
@@ -300,6 +336,7 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
     # 路由
     # ------------------------------------------------------------------
     app.include_router(system.router)
+    app.include_router(jobs.router)
     app.include_router(tts.router)
     app.include_router(asr.router)
     app.include_router(speakers.router)

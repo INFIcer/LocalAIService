@@ -20,7 +20,9 @@ from ...constants import AUDIO_EXTENSIONS, AUDIO_MAX_BYTES
 from ...core.audio import audio_headers
 from ...core.errors import EngineBackendError, VoiceNotFound
 from ...core.voices import pick_voice_name, scan_voices
-from ..deps import get_cfg, get_client, get_registry
+from ...engines.tts_indextts import TtsResult
+from ..deps import get_cfg
+from ..job_helpers import submit_and_wait
 from ..schemas import CompatTaskRequest, SpeechRequest, TTSRequest
 
 logger = logging.getLogger("localai.api.tts")
@@ -36,11 +38,45 @@ def _audio_response(result: Any) -> Response:
     return Response(content=result.wav, media_type="audio/wav", headers=headers)
 
 
+async def _synthesize(
+    request: Request,
+    *,
+    text: str,
+    voice_name: str,
+    speed: float,
+    emotion: Any = None,
+    seed: Any = None,
+    language: Any = None,
+) -> TtsResult:
+    """提交 TTS 任务并等完成；结果从任务记录还原成旧的 ``TtsResult``。"""
+    job = await submit_and_wait(
+        request,
+        "tts",
+        "tts.synthesize",
+        {
+            "text": text,
+            "voice": voice_name,
+            "speed": speed,
+            "emotion": emotion,
+            "seed": seed,
+            "language": language,
+        },
+    )
+    data = job.get("result") or {}
+    path = Path(str(data["path"]))
+    return TtsResult(
+        wav=path.read_bytes(),
+        path=path,
+        seed=int(data.get("seed") or 0),
+        language=str(data.get("language") or ""),
+        comfy_filename=str(data.get("comfy_filename") or ""),
+    )
+
+
 @router.post("/tts", summary="语音合成，返回 WAV 二进制")
 async def tts(payload: TTSRequest, request: Request) -> Response:
-    adapter = get_registry(request).get("tts")
-    result = await adapter.infer(
-        client=get_client(request),
+    result = await _synthesize(
+        request,
         text=payload.text,
         voice_name=payload.voice,
         speed=payload.speed,
@@ -68,9 +104,8 @@ async def openai_speech(payload: SpeechRequest, request: Request) -> Response:
             },
         )
 
-    adapter = get_registry(request).get("tts")
-    result = await adapter.infer(
-        client=get_client(request),
+    result = await _synthesize(
+        request,
         text=payload.input,
         voice_name=payload.voice,
         speed=payload.speed,
@@ -95,10 +130,9 @@ async def api_v1_tts_tasks(payload: CompatTaskRequest, request: Request) -> Resp
         return JSONResponse(status_code=400, content={"detail": "text 不能为空"})
     voice_name = pick_voice_name(payload.prompt_audio)
     speed = payload.speed if payload.speed and 0.5 <= payload.speed <= 2.0 else 1.0
-    adapter = get_registry(request).get("tts")
     try:
-        result = await adapter.infer(
-            client=get_client(request),
+        result = await _synthesize(
+            request,
             text=text,
             voice_name=voice_name,
             speed=speed,

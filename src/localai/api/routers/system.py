@@ -49,6 +49,14 @@ async def health(request: Request) -> dict[str, Any]:
         "model": sep.get("loaded_model") or sep.get("model") or "htdemucs",
     }
 
+    # 任务队列：只读数据库计数，不触发任何模型。
+    scheduler = getattr(request.app.state, "scheduler", None)
+    jobs_health = (
+        await scheduler.health()
+        if scheduler is not None
+        else {"queued": 0, "running": 0, "current_kind": None}
+    )
+
     if cfg.tts_backend == "engine":
         tts = registry.get("tts")
         status = tts.status()
@@ -71,6 +79,7 @@ async def health(request: Request) -> dict[str, Any]:
             "vram": vram_health,
             "media": media.health(),
             "comfy": "disabled",
+            "jobs": jobs_health,
         }
 
     # TTS_BACKEND=comfy：health 的 ok 表示「ComfyUI 可达」。
@@ -93,6 +102,7 @@ async def health(request: Request) -> dict[str, Any]:
         "separate": separate_health,
         "vram": vram_health,
         "media": media.health(),
+        "jobs": jobs_health,
     }
 
 
@@ -148,6 +158,14 @@ async def capabilities(request: Request) -> dict[str, Any]:
             "models": models,
         },
         "capabilities": caps,
+        "jobs": {
+            "enabled": True,
+            "sync_endpoints_use_queue": True,
+            "max_parallel": cfg.jobs_max_parallel,
+            "aging_seconds": cfg.jobs_aging_seconds,
+            "timeout_seconds": cfg.jobs_timeout,
+            "recover": cfg.jobs_recover,
+        },
         "concurrency": {
             "upload_max_mb": 200,
             "audio_upload_max_mb": 50,

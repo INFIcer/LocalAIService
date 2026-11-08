@@ -75,3 +75,46 @@ def unlink_quiet(path: Path | None) -> None:
         path.unlink(missing_ok=True)
     except OSError:
         pass
+
+
+async def save_job_upload(
+    cfg: Config,
+    job_id: str,
+    file: UploadFile,
+    *,
+    default_name: str = "upload.bin",
+    max_bytes: int = MEDIA_MAX_BYTES,
+    too_large_status: int = 413,
+) -> Path:
+    """把异步任务的上传文件落到 ``<HOME>/data/uploads/<job_id>/``。
+
+    - 任务完成/取消后由调度器按 ``LOCALAI_JOBS_KEEP_UPLOADS`` 决定保留或删除；
+    - 分块写盘，不把 200MB 视频整段读进内存；
+    - 失败（超限/空文件）时立刻删掉半截文件，避免留下垃圾。
+    """
+    raw_name = Path(file.filename or default_name).name or default_name
+    suffix = Path(raw_name).suffix.lower() or ".bin"
+    target_dir = cfg.jobs_upload_dir / job_id
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"input{suffix}"
+    size = 0
+    try:
+        with target.open("wb") as handle:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > max_bytes:
+                    raise HTTPException(
+                        status_code=too_large_status,
+                        detail=f"文件太大（上限 {max_bytes // (1024 * 1024)}MB）",
+                    )
+                handle.write(chunk)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+    if size == 0:
+        target.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="上传内容为空")
+    return target

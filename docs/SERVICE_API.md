@@ -373,10 +373,12 @@ multipart：
 | 400 | `voice_not_found` / `invalid_*` | 参数/音色/格式不对 | 修正参数，不要重试 |
 | 401 | `unauthorized` | 服务端设了 `LOCALAI_TOKEN` | 带 `Authorization: Bearer` |
 | 404 | `voice_not_found` | 音色不存在 | 先 `/voices` |
+| 404 | `job_not_found` | 任务 id 不存在 | 检查 id |
+| 409 | `job_canceled` / `not_cancelable` | 任务已取消 / 已结束 | 不要重复取消 |
 | 413 | — | 文件超过 200MB | 先压缩/裁剪 |
 | 502 | `comfy_error` | ComfyUI 上游错误 | 检查 ComfyUI |
 | 503 | `engine_error` / `asr_error` / `speaker_error` / `separate_error` | 引擎加载/推理失败 | 看 `detail`，可重试 |
-| 504 | `comfy_error` | 等待上游超时 | 减少文本长度后重试 |
+| 504 | `comfy_error` / `job_timeout` | 等待上游超时 / 任务超时 | 缩短任务后重试 |
 | 507 | `insufficient_vram` | 腾完显存仍不够 | 用 `/vram/unload` 或关闭占卡程序 |
 
 **507 是正常保护，不是崩溃**：服务不会因为显存不足退出，卸载后仍可继续服务。
@@ -385,10 +387,13 @@ multipart：
 
 ## 10. 并发、超时与首次加载
 
-- 每个 GPU 能力一把推理锁：同一能力串行，不同能力可并行（但受显存管家约束）。
+- 所有 TTS / ASR / 人声分离任务都进同一个持久化队列，由**单 worker**
+  串行执行（同 kind 连续批处理）；声纹/媒体接口仍是直接调用。
+- 每个 GPU 能力仍保留一把推理锁；调度器已保证同一时刻只有一个任务在跑。
 - 加载前统一经过显存管家：按 LRU 卸载其它空闲模型，仍不够则 507。
 - 首次调用 TTS 约 10~60 秒；ASR/声纹/分离通常几秒~几十秒。
-- 客户端建议：TTS 超时 ≥ 180 秒；ASR/分离 ≥ 300 秒；连接超时 5 秒。
+- 客户端建议：同步 TTS 超时 ≥ 180 秒；ASR/分离 ≥ 300 秒；连接超时 5 秒。
+  任务队列接口另有 `LOCALAI_JOB_TIMEOUT`（默认 600 秒）兜底。
 - 长文本：TTS 单次上限 5000 字；更长的文本请调用方自行分段（见插件契约）。
 - 空闲卸载默认 900 秒；`/capabilities` 里有每个能力的实际值。
 
@@ -404,3 +409,198 @@ Authorization: Bearer <LOCALAI_TOKEN>
 ```
 
 也接受 `X-LocalAI-Token: <token>`。未设置时完全放行（默认）。
+
+---
+
+## 12. 任务队列（持久化 + 批处理调度）
+
+从 2.2.0 起，**所有 TTS / ASR / 人声分离请求都会先变成一条任务记录**，
+再交给单 worker 调度器执行：
+
+- 旧同步接口（`/tts`、`/v1/audio/speech`、`/api/v1/tts/tasks`、`/asr`、
+  `/api/v1/asr`、`/separate`、`/api/v1/separate`）**响应体、状态码、二进制
+  格式完全不变**，只是内部改成「提交任务 → 等完成」；
+- 新增的 `/jobs` 系列接口让调用方可以「提交后立刻返回、自己轮询」，
+  适合长文本、批量转写、分离这类耗时任务；
+- 任务记录落在 SQLite：`<LOCALAI_HOME>/data/jobs.db`，服务重启不丢。
+
+### 12.1 任务表结构
+
+表名 `jobs`（WAL 模式；索引 `(state, priority DESC, created_at)`）：
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `id` | TEXT PRIMARY KEY | uuid hex |
+| `kind` | TEXT | `tts` / `asr` / `speaker` / `separate` / `media` |
+| `action` | TEXT | `tts.synthesize` / `asr.transcribe` / `separate.split` / `speaker.enroll` / `media.frames` … |
+| `priority` | INTEGER | 默认 0，越大越先（负数=让路） |
+| `state` | TEXT | `queued` / `running` / `done` / `failed` / `canceled` |
+| `created_at` | TEXT | 提交时间（ISO8601 带时区） |
+| `started_at` | TEXT | 开始执行时间 |
+| `finished_at` | TEXT | 进入终态时间 |
+| `payload` | TEXT | JSON：文本 / 上传文件本地路径 / 参数 |
+| `result` | TEXT | JSON：输出路径、时长、seed、模型等 |
+| `error` | TEXT | 失败原因（成功时为空） |
+| `attempts` | INTEGER | 被调度器领取的次数（重启 requeue 会累加） |
+| `client_ip` | TEXT | 调用方 IP |
+| `meta` | TEXT | JSON 预留扩展；取消 running 任务时写 `cancel_requested` |
+
+### 12.2 调度规则
+
+1. **单 worker、单卡**：同一时刻只跑一个任务；`LOCALAI_JOBS_MAX_PARALLEL`
+   预留给以后（当前固定 1）。
+2. **同 kind 批处理**：当前 kind 还有排队任务时继续跑同一 kind，
+   例如队列里 TTS×5、分离×2，会先跑完 5 个 TTS 再切分离，
+   避免 TTS ↔ Demucs 反复加载/卸载。
+3. **优先级 + 老化**：
+   - 基础顺序 `priority DESC, created_at ASC`；
+   - 等待每满 `LOCALAI_JOBS_AGING_SECONDS`（默认 60 秒），有效优先级 +1；
+   - 当前 kind 还有任务时，只有**其它 kind 的有效优先级严格更高**才切换，
+     因此高优先级任务不会被批处理饿死。
+4. **已经 running 的任务不能被抢占**：优先级只影响还在 `queued` 的任务。
+5. **超时**：`LOCALAI_JOB_TIMEOUT`（默认 600 秒）到点置 `failed`，
+   并等底层 GPU 调用真正退出后才跑下一个（GPU 调用无法从线程里强杀）。
+6. **崩溃恢复**：启动时把上次遗留的 `running` 按
+   `LOCALAI_JOBS_RECOVER=requeue|fail`（默认 `requeue`）重新排队或判失败。
+
+可用环境变量：
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `LOCALAI_JOBS_RECOVER` | `requeue` | 重启时 running 的处理方式 |
+| `LOCALAI_JOBS_AGING_SECONDS` | `60` | 老化提权间隔；0=关闭 |
+| `LOCALAI_JOBS_MAX_PARALLEL` | `1` | 预留并发度 |
+| `LOCALAI_JOB_TIMEOUT` | `600` | 单任务超时（秒） |
+| `LOCALAI_JOBS_KEEP_UPLOADS` | `0` | 任务完成后是否保留上传文件 |
+| `LOCALAI_JOBS_POLL` | `0.2` | 调度器空转轮询间隔（秒） |
+
+### 12.3 `POST /jobs`（通用 JSON 提交）
+
+```json
+{"kind": "tts", "priority": 5, "payload": {"text": "你好", "voice": "default"}}
+```
+
+返回：
+
+```json
+{"ok": true, "id": "6f2d…", "state": "queued"}
+```
+
+`action` 可省略，按 kind 取默认值。`speaker` / `media` 也支持通过这里提交，
+`payload.file` 必须是**服务端本地路径**（高级用法；常规上传请用下面的 multipart 入口）。
+
+### 12.4 `POST /jobs/tts`（JSON）
+
+```http
+POST /jobs/tts
+Content-Type: application/json
+
+{"text":"你好","voice":"default","speed":1.0,"priority":0}
+```
+
+### 12.5 `POST /jobs/asr`、`POST /jobs/separate`（multipart）
+
+```bash
+curl -X POST http://127.0.0.1:7880/jobs/asr \
+  -F "file=@hello.wav" -F "language=auto" -F "speaker=1" -F "priority=0"
+
+curl -X POST http://127.0.0.1:7880/jobs/separate \
+  -F "file=@song.mp3" -F "model=htdemucs" -F "stems=vocals,drums,bass,other"
+```
+
+上传文件先落到 `<HOME>/data/uploads/<job_id>/input.<ext>`；任务结束（done /
+failed / canceled）后默认删除，`LOCALAI_JOBS_KEEP_UPLOADS=1` 可保留。
+
+### 12.6 查询 / 取消 / 取结果
+
+| 接口 | 说明 |
+| --- | --- |
+| `GET /jobs?state=&kind=&limit=&offset=` | 列表，创建时间倒序；`total` 为过滤后总数 |
+| `GET /jobs/{id}` | 详情（含 `result` / `error`） |
+| `POST /jobs/{id}/cancel` | queued 立即 `canceled`；running 标记 `cancel_requested`，跑完不写结果 |
+| `GET /jobs/{id}/result` | done 后取结果；TTS 这类音频直接返回文件，其它返回 JSON |
+| `GET /jobs/stats` | 队列统计 + 调度器状态 |
+
+列表响应：
+
+```json
+{"ok": true, "total": 2, "limit": 50, "offset": 0,
+ "jobs": [{"id": "…", "kind": "tts", "state": "done", "result": {"path": "…"}}]}
+```
+
+取消响应（running）：
+
+```json
+{"ok": true, "id": "…", "state": "running", "cancel_requested": true}
+```
+
+任务结束后的取消返回 409：
+
+```json
+{"ok": false, "id": "…", "state": "done", "error": "not_cancelable"}
+```
+
+### 12.7 `GET /jobs/stats`
+
+```json
+{
+  "ok": true,
+  "total": 6,
+  "queued": 1,
+  "running": 1,
+  "done": 4,
+  "failed": 0,
+  "canceled": 0,
+  "by_state": {"queued": 1, "running": 1, "done": 4, "failed": 0, "canceled": 0},
+  "by_kind": {"tts": 4, "separate": 2},
+  "queued_by_kind": {"separate": 1},
+  "running_by_kind": {"tts": 1},
+  "avg_wait_ms": 120.5,
+  "avg_run_ms": 830.2,
+  "oldest_queued_seconds": 12.3,
+  "scheduler": {
+    "current_kind": "tts",
+    "batch_streak": 4,
+    "loaded_model": "IndexTTS-2.5",
+    "running_job_id": "…",
+    "max_parallel": 1,
+    "aging_seconds": 60,
+    "timeout_seconds": 600.0,
+    "recover_mode": "requeue",
+    "paused": false
+  }
+}
+```
+
+- `by_kind` 是**全部历史任务**按 kind 计数（不是只统计排队中的）；
+  需要看排队/运行中的分布用 `queued_by_kind` / `running_by_kind`；
+- `avg_wait_ms` = 平均（started_at - created_at）；`avg_run_ms` = 平均
+  （finished_at - started_at）；没有样本时为 0。
+
+### 12.8 观测
+
+- 日志（`logs/service.*.log`）每个任务一行开始/结束：
+  `id / kind / action / model / 等待 ms / 执行 ms / 显存 free/total`；
+- 切换 kind 时记一行：`调度切换：tts→separate（批次 5/2）`；
+- `GET /health` 新增：
+
+```json
+"jobs": {"queued": 2, "running": 1, "current_kind": "tts"}
+```
+
+- `GET /capabilities` 新增：
+
+```json
+"jobs": {"enabled": true, "sync_endpoints_use_queue": true, "max_parallel": 1,
+         "aging_seconds": 60, "timeout_seconds": 600.0, "recover": "requeue"}
+```
+
+### 12.9 注意
+
+- 同步旧接口现在也要经过同一个队列，因此**会在队列里留下记录**；
+  并发调用时它们按调度规则排队，不再只靠能力锁。
+- 同步接口等待上限 = `LOCALAI_JOB_TIMEOUT + 30` 秒。
+- 参数错误（格式/语言/模型/stems）仍然在入队前返回 400，不会产生任务记录。
+- 声纹 `/speakers/*` 与媒体 `/media/*` 仍是直接调用、不入队（它们不是
+  长任务，语义保持不变）。
+

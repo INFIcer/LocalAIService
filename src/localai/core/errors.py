@@ -12,6 +12,9 @@ AsrBackendError         503     ASR 引擎加载/识别失败
 SpeakerBackendError     503     声纹引擎加载/计算失败（参数错误为 400）
 SeparateBackendError    503     人声分离引擎加载/推理失败
 ComfyError              502/504 ComfyUI 上游错误 / 等待超时
+JobFailedError          500     任务失败且没有可复用的原始异常
+JobTimeoutError         504     任务执行超时
+JobCanceledError        409     任务被取消
 ======================  ======  ==========================================
 """
 
@@ -104,6 +107,38 @@ class SeparateBackendError(LocalAIError):
 
     status_code = 503
     error_code = "separate_error"
+
+
+# ---------------------------------------------------------------------------
+# 任务队列（localai.jobs）
+# ---------------------------------------------------------------------------
+
+class JobError(LocalAIError):
+    """任务队列相关错误的基类。"""
+
+    status_code = 500
+    error_code = "job_error"
+
+
+class JobFailedError(JobError):
+    """任务失败，且原始异常已无法恢复（例如服务重启后读取历史记录）。"""
+
+    status_code = 500
+    error_code = "job_failed"
+
+
+class JobTimeoutError(JobError):
+    """任务执行超过 ``LOCALAI_JOB_TIMEOUT``。"""
+
+    status_code = 504
+    error_code = "job_timeout"
+
+
+class JobCanceledError(JobError):
+    """同步接口等待的任务被取消。"""
+
+    status_code = 409
+    error_code = "job_canceled"
 
 
 def is_cuda_oom(exc: BaseException) -> bool:

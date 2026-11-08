@@ -7,9 +7,7 @@
 from __future__ import annotations
 
 import logging
-import time
 import uuid
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -17,9 +15,10 @@ from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 from ...constants import SEPARATE_MODELS, SEPARATE_STEMS
-from ...core.errors import InsufficientVramError, SeparateBackendError
-from ..deps import get_cfg, get_registry
-from ..uploads import save_media_upload
+from ...jobs import prepare_payload
+from ..deps import get_cfg
+from ..job_helpers import cleanup_job_upload, submit_and_wait
+from ..uploads import save_job_upload
 
 logger = logging.getLogger("localai.api.separate")
 
@@ -51,9 +50,8 @@ async def _handle_separate_request(
     model: str,
     stems: str,
 ) -> JSONResponse:
+    """旧同步入口：校验 -> 落盘 -> 提交队列 -> 等完成 -> 原样返回结果。"""
     cfg = get_cfg(request)
-    registry = get_registry(request)
-    started = time.perf_counter()
     model_name = (model or "htdemucs").strip().lower() or "htdemucs"
     if model_name not in SEPARATE_MODELS:
         raise HTTPException(
@@ -80,64 +78,27 @@ async def _handle_separate_request(
             ),
         )
 
-    tmp_path = await save_media_upload(cfg, file, "separate")
-    converted_path = cfg.separate_tmp_dir / f"separate_{uuid.uuid4().hex}.wav"
-    out_dir = cfg.separate_dir / (
-        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-    )
-    media = registry.get("media")
+    raw_name = Path(file.filename or "upload.bin").name
+    job_id = uuid.uuid4().hex
+    tmp_path = await save_job_upload(cfg, job_id, file)
     try:
-        # 先统一成 Demucs 训练时的 44.1kHz 立体声，避免容器/采样率差异。
-        converted = await media.call("to_wav44k", str(tmp_path), str(converted_path))
-        outcome = await registry.get("separate").infer(
-            input_wav=str(converted_path),
-            out_dir=str(out_dir),
-            model_name=model_name,
-            stems=stem_names,
+        action, payload = prepare_payload(
+            "separate",
+            "separate.split",
+            {
+                "file": str(tmp_path),
+                "model": model_name,
+                "stems": stem_names,
+                "original_name": raw_name,
+            },
+            cfg,
         )
-        result = outcome["result"]
-        released_models = outcome["released_models"]
-    except (InsufficientVramError, SeparateBackendError):
-        raise
-    except HTTPException:
-        raise
-    except Exception as exc:  # noqa: BLE001 - 统一成 503 JSON
-        raise SeparateBackendError(
-            f"Demucs 分离失败：{type(exc).__name__}: {exc}",
-            detail=str(exc),
-        ) from exc
-    finally:
-        for temp_file in (tmp_path, converted_path):
-            try:
-                temp_file.unlink(missing_ok=True)
-            except OSError:
-                logger.warning("人声分离临时文件删除失败：%s", temp_file)
+    except ValueError as exc:
+        cleanup_job_upload(cfg, job_id)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    elapsed = round(time.perf_counter() - started, 2)
-    logger.info(
-        "人声分离完成：%s model=%s stems=%s 时长=%ss 耗时=%.2fs 输出=%s released=%s",
-        Path(file.filename or "").name,
-        result.get("model"),
-        ",".join(stem_names),
-        result.get("duration"),
-        elapsed,
-        result.get("dir"),
-        ",".join(released_models) or "-",
-    )
-    return JSONResponse(
-        content={
-            "ok": True,
-            "model": result.get("model", model_name),
-            "sample_rate": result.get("sample_rate", 44100),
-            "duration": result.get("duration", converted.get("duration")),
-            "elapsed": elapsed,
-            "separation_elapsed": result.get("elapsed"),
-            "stems": result.get("stems") or {},
-            "dir": result.get("dir") or str(out_dir),
-            "loaded": registry.get("separate").loaded(),
-            "released_models": released_models,
-        }
-    )
+    job = await submit_and_wait(request, "separate", action, payload, job_id=job_id)
+    return JSONResponse(content=job.get("result") or {})
 
 
 @router.post("/separate", summary="人声分离（返回 stem 路径）")

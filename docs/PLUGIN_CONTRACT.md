@@ -247,7 +247,131 @@ file=@my_voice.wav
 
 ---
 
-## 5. 版本协商
+## 5. 异步任务接口（推荐插件用）
+
+长任务（长文本 TTS、长录音转写、整首歌分离）推荐用任务队列接口：
+**提交后立刻拿到 `id`，再轮询或取结果**。好处是插件不必一直占着一条
+HTTP 长连接，服务重启后任务记录也还在。
+
+> 短请求（一句话朗读、几秒语音条）继续用 `/tts`、`/asr` 即可；
+> 它们内部也走同一个队列，只是会等任务完成再返回。
+
+### 5.1 提交
+
+TTS（JSON）：
+
+```http
+POST /jobs/tts
+Content-Type: application/json
+
+{"text":"要朗读的整段文本","voice":"default","speed":1.0,"priority":0}
+```
+
+ASR（multipart）：
+
+```http
+POST /jobs/asr
+Content-Type: multipart/form-data
+
+file=<音频/视频>
+language=auto
+speaker=1
+priority=0
+```
+
+人声分离（multipart）：
+
+```http
+POST /jobs/separate
+
+file=<音频/视频>
+model=htdemucs
+stems=vocals,drums,bass,other
+priority=0
+```
+
+通用入口（高级）：`POST /jobs`，body
+`{"kind":"tts","action":"tts.synthesize","priority":0,"payload":{...}}`。
+
+统一响应：
+
+```json
+{"ok": true, "id": "6f2d…", "state": "queued"}
+```
+
+- `priority`：默认 0，越大越先；负数表示「不着急」。
+- 服务端会按 kind 批处理（同类任务连续跑），所以提交顺序不等于完成顺序。
+- 上传文件落在服务端 `data/uploads/<job_id>/`，任务结束后默认删除；
+  插件**不要**依赖这些路径长期存在。
+
+### 5.2 轮询 / 取详情
+
+```http
+GET /jobs/{id}
+```
+
+```json
+{"ok": true, "id": "…", "kind": "tts", "state": "done",
+ "result": {"path": "…", "seed": 12345, "language": "zh",
+            "duration_seconds": 4.2, "model": "IndexTTS-2.5"},
+ "error": null}
+```
+
+- `state`：`queued` / `running` / `done` / `failed` / `canceled`；
+- 推荐节奏：首次 300~500ms，之后逐步退避到 2~5 秒；
+  不要 50ms 一次地打，也不要无限轮询（超过 `LOCALAI_JOB_TIMEOUT` 会失败）。
+- 只想看最近任务：`GET /jobs?state=queued&kind=tts&limit=20`；
+- 队列压力：`GET /jobs/stats`（`queued`、`running`、`by_kind`、
+  `oldest_queued_seconds`、`scheduler.current_kind`）。
+
+### 5.3 取结果
+
+```http
+GET /jobs/{id}/result
+```
+
+- TTS：直接返回 `audio/wav` 文件（与 `/tts` 的音频内容同源）；
+- ASR / 分离：返回 JSON（`result.text` / `result.stems` / `result.dir` …）；
+- 任务未完成时返回 **409** `{"ok":false,"error":"job_not_done",...}`。
+
+### 5.4 取消
+
+```http
+POST /jobs/{id}/cancel
+```
+
+- `queued`：立即变成 `canceled`，不会再执行；
+- `running`：返回 `{"state":"running","cancel_requested":true}`，
+  服务端会在 GPU 调用退出后置 `canceled`，**不会写 result**；
+- 已经结束的任务返回 **409** `not_cancelable`。
+
+插件在用户点「停止」、关闭面板、退出程序时，应取消自己提交的 queued 任务，
+避免服务端积压。
+
+### 5.5 失败与重试
+
+| 情况 | 表现 | 插件行为 |
+| --- | --- | --- |
+| 参数错误 | 提交时 400 | 修正参数，不重试 |
+| 显存不足 | 任务 `failed`，`error` 含「显存不足」 | 提示用户，不循环重试 |
+| 引擎失败 | 任务 `failed`，`error` 含异常类型 | 可重试 1 次（新提交一个任务） |
+| 超时 | 任务 `failed`，`error` 含「任务超时」 | 提示；长文本先分段再提交 |
+| 服务重启 | requeue 模式下自动重跑；fail 模式变 `failed` | 以 `GET /jobs/{id}` 为准 |
+
+**不要**拿同一个 `id` 重复提交；重试要新建任务。任务 `id` 可以短期持久化
+（比如存进插件自己的缓存），但不要假设服务端永久保留记录。
+
+### 5.6 同步接口还要不要用？
+
+要。两者共用同一条执行链路：
+
+- 一句话朗读、几秒语音条：`/tts`、`/asr` 更简单；
+- 长文本 / 批量 / 需要进度与取消：`/jobs/*`；
+- 不要为了「异步」而把短请求也拆成轮询，会增加延迟和无谓请求。
+
+---
+
+## 6. 版本协商
 
 - 服务端在 `/capabilities` 返回 `api_version`（当前 `"1"`）和 `service.version`（如 `"2.2.0"`）。
 - 插件只依赖 `api_version` 的主版本；`service.version` 仅用于展示/日志。
@@ -259,7 +383,7 @@ file=@my_voice.wav
 
 ---
 
-## 6. 错误处理约定
+## 7. 错误处理约定
 
 | 场景 | 服务端 | 插件行为 |
 | --- | --- | --- |
@@ -280,7 +404,7 @@ file=@my_voice.wav
 
 ---
 
-## 7. 鉴权预留
+## 8. 鉴权预留
 
 服务端通过环境变量 `LOCALAI_TOKEN` 开启（默认关闭）：
 
@@ -294,7 +418,7 @@ Authorization: Bearer <token>
 
 ---
 
-## 8. 插件不该做的事
+## 9. 插件不该做的事
 
 - ❌ 自己加载/卸载模型、自己管理显存；
 - ❌ 直接读 `models/`、`speakers/`、`outputs/` 目录；
@@ -305,7 +429,7 @@ Authorization: Bearer <token>
 
 ---
 
-## 9. 最小实现清单（未来插件）
+## 10. 最小实现清单（未来插件）
 
 1. `GET /capabilities` → 校验 `api_version`、缓存能力；
 2. 自动朗读：`POST /tts`，分段、串行、180s 超时、失败静默跳过；

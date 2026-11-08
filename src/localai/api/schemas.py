@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
@@ -47,3 +47,19 @@ class VramUnloadRequest(BaseModel):
 
     models: list[str] = Field(default_factory=list)
     all: bool = False
+
+
+class JobCreateRequest(BaseModel):
+    """POST /jobs 的通用请求体。"""
+
+    kind: str = Field(..., description="tts / asr / speaker / separate / media")
+    action: Optional[str] = Field(None, description="不填则用该 kind 的默认 action")
+    priority: int = Field(0, description="越大越先；等待久了会自动提权")
+    payload: dict[str, Any] = Field(default_factory=dict, description="能力参数")
+    meta: Optional[dict[str, Any]] = Field(None, description="预留扩展字段")
+
+
+class JobTtsRequest(TTSRequest):
+    """POST /jobs/tts：TTS 参数 + 优先级。"""
+
+    priority: int = 0
