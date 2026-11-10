@@ -404,6 +404,31 @@ def system_info(
 # ---------------------------------------------------------------------------
 # 日志
 # ---------------------------------------------------------------------------
+def _looks_like_utf16(data: bytes, zero_side: int, sample: int = 4096) -> bool:
+    """无 BOM 时判断字节流是否像 UTF-16（``zero_side`` 为 0 的字节位置）。
+
+    UTF-16 的 ASCII / 中文文本在 ``zero_side`` 那一侧有大量 0 字节；日志空洞里
+    的 NUL 是整片连续的，两侧都会是 0，所以这里要求「一侧几乎全 0、另一侧几乎
+    不 0」，普通 UTF-8 文本和空洞都不满足。
+    """
+    chunk = data[:sample]
+    if len(chunk) < 8:
+        return False
+    side_total = side_zeros = other_total = other_zeros = 0
+    for index, byte in enumerate(chunk):
+        if index % 2 == zero_side:
+            side_total += 1
+            if byte == 0:
+                side_zeros += 1
+        else:
+            other_total += 1
+            if byte == 0:
+                other_zeros += 1
+    if side_total == 0 or other_total == 0:
+        return False
+    return side_zeros >= side_total * 0.6 and other_zeros <= other_total * 0.2
+
+
 def _decode_log(data: bytes) -> tuple[str, str]:
     """自动探测日志编码，返回 (文本, 编码名)。
 
@@ -416,16 +441,31 @@ def _decode_log(data: bytes) -> tuple[str, str]:
         return data.decode("utf-16-le", errors="replace"), "utf-16-le"
     if data.startswith(b"\xfe\xff"):
         return data.decode("utf-16-be", errors="replace"), "utf-16-be"
-    # 无 BOM 的 UTF-16：ASCII 区大量 \x00。
-    if data and data.count(b"\x00") > len(data) // 4:
-        try:
+    # 无 BOM 的 UTF-16 判定不能只看 \x00 占比：日志被截断或稀疏写会留下
+    # 成片的 NUL 空洞（尾部窗口正好落进空洞里时整段都会被误判成 UTF-16，
+    # 解出来全是 \x00 乱码）。真正的 UTF-16 ASCII 文本里 0 字节是隔字节出现的，
+    # 所以先看「每两个字节里固定一侧为 0」这个结构，再决定是否按 UTF-16 解。
+    if data and data.count(b"\x00") * 4 > len(data):
+        # 偶数位是 0 → Big-Endian；奇数位是 0 → Little-Endian（ASCII 区特征）。
+        if _looks_like_utf16(data, 0):
+            return data.decode("utf-16-be", errors="replace"), "utf-16-be"
+        if _looks_like_utf16(data, 1):
             return data.decode("utf-16-le", errors="replace"), "utf-16-le"
-        except UnicodeDecodeError:
-            pass
     try:
-        return data.decode("utf-8"), "utf-8"
+        text = data.decode("utf-8")
     except UnicodeDecodeError:
-        pass
+        # 尾部窗口可能刚好切在一个多字节字符中间，丢掉开头 1~3 个字节再试。
+        for skip in range(1, 4):
+            if len(data) <= skip:
+                break
+            try:
+                text = data[skip:].decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            return text.replace("\x00", ""), "utf-8"
+    else:
+        # 空洞留在文本里会让前端显示成一串空白/方块，直接丢掉 NUL。
+        return text.replace("\x00", ""), "utf-8"
     try:
         return data.decode("gbk"), "gbk"
     except UnicodeDecodeError:

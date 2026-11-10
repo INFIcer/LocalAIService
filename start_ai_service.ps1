@@ -40,6 +40,30 @@ param(
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 
+# 同一个服务只允许一个启动脚本跑起来。两次重启挨得太近时，两个 python 会同时
+# 往 logs\service.out.log 追加，文件里会留下成片的 NUL 空洞，WebUI 读日志就成乱码。
+$启动锁 = New-Object System.Threading.Mutex($false, 'Global\LocalAIService-Launch')
+$已持锁 = $false
+try {
+    $已持锁 = $启动锁.WaitOne(60000)
+    if (-not $已持锁) {
+        Write-Host '另一个启动脚本还在运行（服务可能已启动），本次跳过。' -ForegroundColor Yellow
+        exit 0
+    }
+    $探测 = New-Object System.Net.Sockets.TcpClient
+    try {
+        $探测.Connect('127.0.0.1', 7880)
+        $已在运行 = $探测.Connected
+    } catch {
+        $已在运行 = $false
+    } finally {
+        $探测.Dispose()
+    }
+    if ($已在运行) {
+        Write-Host '服务已经在 127.0.0.1:7880 运行，本次跳过。' -ForegroundColor Yellow
+        exit 0
+    }
+
 # 数据根目录与源码目录：换机器/换盘只需改这里，或从外部设置 LOCALAI_HOME。
 $env:LOCALAI_HOME = $root
 $env:PYTHONPATH = Join-Path $root 'src'
@@ -71,7 +95,11 @@ $errLog = Join-Path $logDir 'service.err.log'
 
 $python = Join-Path $root 'engine\.venv\Scripts\python.exe'
 
-# 用 Start-Process 起子进程并重定向输出：这样 python 往 stderr 写日志也不会被
-# PowerShell 当成 NativeCommandError 把脚本打断（之前踩过这个坑）。
-$proc = Start-Process -FilePath $python -ArgumentList @('-m', 'localai', 'serve') -WorkingDirectory $root -RedirectStandardOutput $outLog -RedirectStandardError $errLog -NoNewWindow -PassThru -Wait
-exit $proc.ExitCode
+    # 用 Start-Process 起子进程并重定向输出：这样 python 往 stderr 写日志也不会被
+    # PowerShell 当成 NativeCommandError 把脚本打断（之前踩过这个坑）。
+    $proc = Start-Process -FilePath $python -ArgumentList @('-m', 'localai', 'serve') -WorkingDirectory $root -RedirectStandardOutput $outLog -RedirectStandardError $errLog -NoNewWindow -PassThru -Wait
+    exit $proc.ExitCode
+} finally {
+    if ($已持锁) { [void]$启动锁.ReleaseMutex() }
+    $启动锁.Dispose()
+}

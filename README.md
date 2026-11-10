@@ -72,6 +72,4 @@
 
 ---
 
-> 本项目早期名为 IndexTTS，旧的启动脚本与快捷方式仍然可用。
-
 技术文档：[接口说明](docs/SERVICE_API.md) · [安装与移植](docs/INSTALL.md) · [管理界面](docs/WEBUI.md) · [插件接口](docs/PLUGIN_CONTRACT.md)
