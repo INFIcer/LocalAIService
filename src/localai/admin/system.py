@@ -127,8 +127,32 @@ _STATUS_PS = (
 )
 
 
-def scheduled_task_status() -> dict[str, Any]:
-    """读取 ``LocalAIService-Service`` 的状态；Windows 之外返回 supported=false。"""
+_SCHED_CACHE: dict[str, Any] = {"at": 0.0, "info": None}
+_SCHED_CACHE_SECONDS = 30.0
+
+
+def scheduled_task_status(*, force: bool = False) -> dict[str, Any]:
+    """读取 ``LocalAIService-Service`` 的状态；Windows 之外返回 supported=false。
+
+    PowerShell 查询一次要 1 秒多，系统页每刷一次都查太慢，所以结果缓存 30 秒；
+    启用 / 禁用后调用方传 ``force=True`` 立即重查。
+    """
+    now = time.monotonic()
+    cached = _SCHED_CACHE.get("info")
+    if (
+        not force
+        and isinstance(cached, dict)
+        and now - float(_SCHED_CACHE.get("at") or 0.0) < _SCHED_CACHE_SECONDS
+    ):
+        return dict(cached)
+    info = _scheduled_task_status_uncached()
+    _SCHED_CACHE["at"] = now
+    _SCHED_CACHE["info"] = dict(info)
+    return info
+
+
+def _scheduled_task_status_uncached() -> dict[str, Any]:
+    """真正去问 Windows 计划任务；结果由 ``scheduled_task_status`` 缓存。"""
     if os.name != "nt":
         return {
             "supported": False,
@@ -228,7 +252,7 @@ def set_autostart(cfg: Config, enabled: bool) -> dict[str, Any]:
             + (err or out or f"PowerShell 退出码 {code}")
             + "。如果提示权限不足，请用管理员 PowerShell 手动执行，或检查任务名是否被组策略锁定。"
         )
-    status = scheduled_task_status()
+    status = scheduled_task_status(force=True)
     status["ok"] = True
     status["requested_enabled"] = bool(enabled)
     return status
@@ -237,7 +261,25 @@ def set_autostart(cfg: Config, enabled: bool) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # 系统信息
 # ---------------------------------------------------------------------------
+_GPU_CACHE: dict[str, Any] = {"at": 0.0, "info": None}
+_GPU_CACHE_SECONDS = 3.0
+
+
 def _gpu_info(vram: Any) -> dict[str, Any]:
+    # nvidia-smi 在这台机器上要 1.5 秒左右，状态页和插件的指标胶囊都在轮询，
+    # 不加缓存会把接口拖慢到插件超时（显示显存 0）。GPU 信息 3 秒缓存足够新。
+    now = time.monotonic()
+    cached = _GPU_CACHE.get("info")
+    if cached is not None and now - float(_GPU_CACHE.get("at") or 0.0) < _GPU_CACHE_SECONDS:
+        return dict(cached)
+
+    info = _read_gpu_info(vram)
+    _GPU_CACHE["at"] = now
+    _GPU_CACHE["info"] = dict(info)
+    return info
+
+
+def _read_gpu_info(vram: Any) -> dict[str, Any]:
     info: dict[str, Any] = {
         "name": None,
         "driver": None,
