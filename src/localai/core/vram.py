@@ -738,6 +738,13 @@ async def ensure_model_loaded(adapter: Any, loader: Optional[Callable[[], Any]] 
 
     调用方必须已经持有该能力的推理锁，并调用 ``VRAM.begin_use(name)``，
     这样 ensure_capacity 不会卸掉正在请求的能力。
+
+    单飞：``_LOAD_LOCK`` 内会二次检查 ``adapter.loaded()``，并发请求只会真正
+    加载一次，后来者在锁上排队、拿到锁后直接返回。锁顺序固定为
+    「能力的 infer_lock -> ``_LOAD_LOCK``」：``_LOAD_LOCK`` 内只会卸载
+    ``ensure_capacity`` 判定为没在推理（active==0）的能力，所以不会反过来
+    等一个正持有自己的 infer_lock 又在等 ``_LOAD_LOCK`` 的请求（vision 例外，
+    但它已加载时请求在预检就返回，不会持闸等待）。
     """
     vram = get_vram()
     name = adapter.name

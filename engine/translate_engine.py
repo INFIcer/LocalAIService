@@ -118,7 +118,7 @@ USE_FP16 = (os.environ.get("LOCALAI_TRANSLATE_FP16", "1") or "1").strip().lower(
     "off",
 )
 
-#: 翻译结果最多生成多少个新 token（相对输入块长度的倍数，夹在 64~1024）。
+#: 翻译结果最多生成多少个新 token（相对本批输入 token 的倍数，另加 32 余量，夹在 64~1024）。
 MAX_NEW_TOKENS_FACTOR = 2.0
 
 logger = logging.getLogger("nllb-translate")
@@ -1231,10 +1231,10 @@ def _translate_chunks(
             f"可用：{', '.join(supported_codes())}"
         )
 
-    max_new_tokens = int(max(64, min(1024, max_len * MAX_NEW_TOKENS_FACTOR)))
     batch_size = max(1, min(64, int(batch_size)))
     num_beams = max(1, min(8, int(num_beams)))
     results: list[str] = []
+    use_cuda = device.startswith("cuda")
 
     for start in range(0, len(chunks), batch_size):
         batch = list(chunks[start : start + batch_size])
@@ -1244,6 +1244,13 @@ def _translate_chunks(
             padding=True,
             truncation=True,
             max_length=max_len,
+        )
+        # 生成长度按本批真实输入长度算，而不是固定 800：固定值会让短句也按最长
+        # 序列预留 KV cache、多跑解码步，冷启动和显存都吃亏。2 倍 + 32 余量，
+        # 夹在 64~1024，英文输出 token 数通常与中文输入同量级，质量不受影响。
+        in_tokens = int(encoded["input_ids"].shape[1])
+        max_new_tokens = int(
+            max(64, min(1024, int(in_tokens * MAX_NEW_TOKENS_FACTOR) + 32))
         )
         encoded = {key: value.to(device) for key, value in encoded.items()}
         with torch.inference_mode():
@@ -1256,6 +1263,14 @@ def _translate_chunks(
             )
         decoded = tokenizer.batch_decode(generated, skip_special_tokens=True)
         results.extend(str(text).strip() for text in decoded)
+        # Windows/WDDM 下 torch 的 reserved 不会主动归还，批与批之间不回收就会
+        # 随形状变化一路滚大（曾到过 16868MB）。每批结束释放中间张量并清缓存。
+        del encoded, generated
+        if use_cuda:
+            try:
+                torch.cuda.empty_cache()
+            except Exception:  # noqa: BLE001 - 回收失败不该让翻译失败
+                pass
 
     if len(results) != len(chunks):
         raise TranslateError(
@@ -1282,7 +1297,7 @@ def translate(
     tgt_lang: str = "eng_Latn",
     max_len: int = 400,
     batch_size: int = 8,
-    num_beams: int = 4,
+    num_beams: int = 2,
 ) -> list[str]:
     """批量翻译，返回与 ``texts`` 等长的译文列表。
 
@@ -1335,7 +1350,7 @@ def translate_documents(
     tgt_lang: str = "eng_Latn",
     max_len: int = 400,
     batch_size: int = 8,
-    num_beams: int = 4,
+    num_beams: int = 2,
 ) -> list[dict[str, Any]]:
     """同 :func:`translate`，但返回 ``[{"text": 译文, "chunks": 块数}]``。"""
     source, target = _resolve_languages(texts, src_lang, tgt_lang)
@@ -1396,7 +1411,7 @@ def _main() -> int:
     parser.add_argument("--target", default="en", help="en / eng_Latn / ja ...")
     parser.add_argument("--max-len", type=int, default=400)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--beams", type=int, default=4)
+    parser.add_argument("--beams", type=int, default=2)
     parser.add_argument("--download-only", action="store_true", help="只准备权重，不加载")
     parser.add_argument("--unload", action="store_true", help="翻译后立即卸载")
     args = parser.parse_args()

@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -185,6 +187,85 @@ def test_translate_batch_order_and_count(engine, fake_model) -> None:
     assert fake_model["tgt"] == "eng_Latn"
     assert fake_model["batch_size"] == 4
     assert fake_model["num_beams"] == 2
+
+
+def _install_fake_nllb(engine, monkeypatch, *, input_tokens: int) -> dict[str, list[int]]:
+    """装假 model/tokenizer/torch，返回生成长度与显存回收的调用记录。"""
+
+    counters: dict[str, list[int]] = {"max_new": [], "empty_cache": []}
+
+    class _FakeTensor:
+        def __init__(self, rows: int, cols: int) -> None:
+            self.shape = (rows, cols)
+            self._rows = rows
+
+        def to(self, device: str) -> "_FakeTensor":
+            return self
+
+        def __len__(self) -> int:
+            return self._rows
+
+    class _FakeTokenizer:
+        src_lang = ""
+
+        def __call__(self, batch, **_: object) -> dict[str, _FakeTensor]:
+            return {
+                "input_ids": _FakeTensor(len(batch), input_tokens),
+                "attention_mask": _FakeTensor(len(batch), input_tokens),
+            }
+
+        def convert_tokens_to_ids(self, code: str) -> int:
+            return 7
+
+        def batch_decode(self, generated, skip_special_tokens: bool = True) -> list[str]:
+            return ["<x>"] * len(generated)
+
+    class _FakeModel:
+        def generate(self, **kwargs: object) -> _FakeTensor:
+            counters["max_new"].append(int(kwargs["max_new_tokens"]))  # type: ignore[arg-type]
+            input_ids = kwargs["input_ids"]
+            return _FakeTensor(int(input_ids.shape[0]), 3)  # type: ignore[union-attr]
+
+    class _FakeCuda:
+        @staticmethod
+        def empty_cache() -> None:
+            counters["empty_cache"].append(1)
+
+    fake_torch = SimpleNamespace(
+        inference_mode=contextlib.nullcontext,
+        cuda=_FakeCuda(),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(engine, "ensure_loaded", lambda: (_FakeModel(), _FakeTokenizer()))
+    monkeypatch.setattr(engine, "_loaded_device", "cuda")
+    return counters
+
+
+@pytest.mark.parametrize(
+    ("input_tokens", "expected"), [(10, 64), (100, 232), (1000, 1024)]
+)
+def test_translate_chunks_max_new_tokens_scales_with_input(
+    engine, monkeypatch, input_tokens: int, expected: int
+) -> None:
+    """生成长度按本批输入 token 数动态算：2 倍 + 32，夹在 64~1024。"""
+    counters = _install_fake_nllb(engine, monkeypatch, input_tokens=input_tokens)
+    result = engine._translate_chunks(
+        ["甲"], "zho_Hans", "eng_Latn", batch_size=8, num_beams=2, max_len=400
+    )
+    assert result == ["<x>"]
+    assert counters["max_new"] == [expected]
+
+
+def test_translate_chunks_releases_cache_after_every_batch(engine, monkeypatch) -> None:
+    """每批 generate 结束都要释放缓存（Windows/WDDM 下 reserved 不回收会滚大）。"""
+    counters = _install_fake_nllb(engine, monkeypatch, input_tokens=100)
+    chunks = [f"第{i}块" for i in range(10)]
+    result = engine._translate_chunks(
+        chunks, "zho_Hans", "eng_Latn", batch_size=4, num_beams=2, max_len=400
+    )
+    assert result == ["<x>"] * 10
+    assert counters["max_new"] == [232, 232, 232]
+    assert len(counters["empty_cache"]) == 3, "每批结束都要 empty_cache"
 
 
 def test_translate_documents_reports_chunks(engine, fake_model) -> None:

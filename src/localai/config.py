@@ -42,7 +42,7 @@
     LOCALAI_TRANSLATE_DIR     翻译权重根目录（默认 <HOME>/models/nllb）
     LOCALAI_TRANSLATE_IDLE_UNLOAD 翻译空闲卸载秒数（默认 900，0=关闭）
     LOCALAI_TRANSLATE_FP16    GPU 上是否用 fp16（默认 1；设 0 用 fp32）
-    LOCALAI_TRANSLATE_NUM_BEAMS 翻译 beam 数（默认 4，范围 1~8）
+    LOCALAI_TRANSLATE_NUM_BEAMS 翻译 beam 数（默认 2，范围 1~8）
     LOCALAI_TRANSLATE_BATCH_SIZE 翻译默认批大小（默认 8，范围 1~32）
     LOCALAI_TRANSLATE_MAX_LEN  翻译默认单块 token 上限（默认 400，范围 32~1024）
     LOCALAI_TOKEN             可选的 Bearer 鉴权令牌（默认空=不鉴权）
@@ -440,7 +440,7 @@ class Config:
     translate_model_dir: Optional[Path] = None
     translate_idle_unload: int = 900
     translate_fp16: bool = True
-    translate_num_beams: int = 4
+    translate_num_beams: int = 2
     translate_batch_size: int = 8
     #: 请求没有显式给 max_len 时使用的默认单块 token 上限。
     translate_max_len: int = 400
@@ -716,7 +716,7 @@ class Config:
             translate_idle_unload=_pick_int(900, "LOCALAI_TRANSLATE_IDLE_UNLOAD"),
             translate_fp16=_pick_bool(True, "LOCALAI_TRANSLATE_FP16"),
             translate_num_beams=max(
-                1, min(8, _pick_int(4, "LOCALAI_TRANSLATE_NUM_BEAMS"))
+                1, min(8, _pick_int(2, "LOCALAI_TRANSLATE_NUM_BEAMS"))
             ),
             translate_batch_size=max(
                 1, min(32, _pick_int(8, "LOCALAI_TRANSLATE_BATCH_SIZE"))
