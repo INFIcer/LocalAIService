@@ -1096,6 +1096,55 @@ def _resolve_device() -> str:
         return "cpu"
 
 
+def _keep_encoder_mask_in_generation(model: Any) -> None:
+    """让解码每一步都带上编码侧的 padding mask（transformers 4.49 回归的兜底）。
+
+    NLLB 就是 M2M100；transformers 4.49 的 ``GenerationMixin.prepare_inputs_for_generation``
+    在 encoder-decoder 模型上把 ``attention_mask`` 换成了 ``decoder_attention_mask``
+    （默认 None），生成时根本不会把编码侧的 mask 传给 ``model.forward``。于是解码器的
+    cross-attention 拿到 ``encoder_attention_mask=None``，会去 attend 补齐用的 pad 位置。
+
+    后果不是报错，而是译文悄悄变差：短句和长句同批时，短句要补齐很多 pad，模型会在
+    末尾疯狂重复 filler token（实测出现成片的 U+2022/U+1162），单独翻译同一句却是好的。
+    批越短、pad 越多越容易触发。
+
+    这里包一层 ``prepare_inputs_for_generation``：保留原来的行为，再把编码侧 mask 补回去。
+    幂等，重复调用不会叠加包装。
+    """
+    import types  # noqa: PLC0415
+
+    if getattr(model, "_localai_encoder_mask_patched", False):
+        return
+    original = model.prepare_inputs_for_generation.__func__
+
+    def prepare_inputs_for_generation(  # type: ignore[no-untyped-def]
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        cache_position=None,
+        **kwargs,
+    ):
+        encoder_attention_mask = attention_mask
+        model_inputs = original(
+            self,
+            input_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            cache_position=cache_position,
+            **kwargs,
+        )
+        if encoder_attention_mask is not None:
+            model_inputs["attention_mask"] = encoder_attention_mask
+        return model_inputs
+
+    model.prepare_inputs_for_generation = types.MethodType(
+        prepare_inputs_for_generation, model
+    )
+    model._localai_encoder_mask_patched = True
+
+
 def ensure_loaded() -> tuple[Any, Any]:
     """加载并返回 ``(model, tokenizer)``；已加载时直接复用。"""
     global _model, _tokenizer, _loaded_device, _loaded_dtype
@@ -1141,6 +1190,7 @@ def ensure_loaded() -> tuple[Any, Any]:
             )
             model.to(device)
             model.eval()
+            _keep_encoder_mask_in_generation(model)
         except Exception as exc:  # noqa: BLE001 - 统一包成 TranslateError
             _load_error = f"{type(exc).__name__}: {exc}"
             _model = None

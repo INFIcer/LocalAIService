@@ -268,6 +268,48 @@ def test_translate_chunks_releases_cache_after_every_batch(engine, monkeypatch) 
     assert len(counters["empty_cache"]) == 3, "每批结束都要 empty_cache"
 
 
+def test_generation_keeps_encoder_attention_mask(engine) -> None:
+    """transformers 4.49 会把编码侧 mask 丢掉，解码时 cross-attention 因此 attend 到 pad。"""
+    class _Config:
+        is_encoder_decoder = True
+
+    class _Model:
+        config = _Config()
+
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def prepare_inputs_for_generation(
+            self,
+            input_ids,
+            past_key_values=None,
+            attention_mask=None,
+            inputs_embeds=None,
+            cache_position=None,
+            **kwargs,
+        ):
+            # 模拟 transformers 4.49：返回里没有编码侧 attention_mask
+            self.calls.append({"kwargs": kwargs})
+            return {"decoder_input_ids": input_ids}
+
+    model = _Model()
+    engine._keep_encoder_mask_in_generation(model)
+    mask = [[1, 1, 0]]
+    assert model.prepare_inputs_for_generation(object(), attention_mask=mask)[
+        "attention_mask"
+    ] is mask
+
+    # 幂等：重复包装不应该套娃
+    engine._keep_encoder_mask_in_generation(model)
+    assert model.prepare_inputs_for_generation(object(), attention_mask=mask)[
+        "attention_mask"
+    ] is mask
+    assert len(model.calls) == 2
+
+    # 没有编码侧 mask 时保持原样
+    assert "attention_mask" not in model.prepare_inputs_for_generation(object())
+
+
 def test_translate_documents_reports_chunks(engine, fake_model) -> None:
     texts = ["短句。", "这是一个很长的句子" * 10]
     docs = engine.translate_documents(texts, src_lang="zh", tgt_lang="en")
