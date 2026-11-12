@@ -69,7 +69,7 @@ AUDIO_MAX_BYTES = 50 * 1024 * 1024
 
 ASR_LANGUAGES = ("auto", "zh", "en", "ja", "ko", "yue", "nospeech")
 
-#: 识别引擎：SenseVoice（默认，带声纹）与 faster-whisper（原生时间戳）。
+#: 识别引擎：SenseVoice（默认）与 faster-whisper（原生时间戳）。
 ASR_ENGINES = ("sensevoice", "whisper")
 #: 请求里可用的 engine 取值；``auto`` 表示按「是否要时间戳 / 配置默认」决定。
 ASR_ENGINE_CHOICES = ("sensevoice", "whisper", "auto")

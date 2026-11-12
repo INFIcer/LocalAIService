@@ -124,7 +124,6 @@ class FakeExecutor:
                 "duration": 0.05,
                 "elapsed_ms": 3,
                 "loaded": False,
-                "speaker": None,
                 "source_format": ".wav",
                 "converted": False,
                 "model": "SenseVoiceSmall",
@@ -277,7 +276,7 @@ def _asr_payload(tmp_path: Path, name: str = "asr_input.wav") -> dict[str, Any]:
     path = tmp_path / name
     if not path.exists():
         sf.write(str(path), [0.0] * 800, 16000, subtype="PCM_16")
-    return {"file": str(path), "language": "auto", "speaker": False}
+    return {"file": str(path), "language": "auto"}
 
 
 def _separate_payload(tmp_path: Path) -> dict[str, Any]:
@@ -527,7 +526,7 @@ def test_stats_fields_and_sync_endpoints_use_queue(tmp_path: Path) -> None:
         asr = client.post(
             "/asr",
             files={"file": ("input.wav", wav_bytes, "audio/wav")},
-            data={"language": "auto", "speaker": "0"},
+            data={"language": "auto"},
         )
         assert asr.status_code == 200, asr.text
         body = asr.json()
@@ -582,7 +581,6 @@ def test_stats_fields_and_sync_endpoints_use_queue(tmp_path: Path) -> None:
             "tts",
             "asr",
             "separate",
-            "speaker",
             "media",
             "translate",
             "download",

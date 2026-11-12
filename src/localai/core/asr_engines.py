@@ -1,7 +1,7 @@
 """识别引擎选择：把请求里的 ``engine`` 参数解析成具体适配器。
 
 两个引擎的服务层名字：
-- ``sensevoice`` -> 注册表里的 ``asr``（SenseVoiceSmall，默认，带声纹）
+- ``sensevoice`` -> 注册表里的 ``asr``（SenseVoiceSmall，默认）
 - ``whisper``    -> 注册表里的 ``whisper``（faster-whisper，原生时间戳）
 
 约定

@@ -311,7 +311,6 @@ async def capabilities(request: Request) -> dict[str, Any]:
         "files": {
             "voices_dir": str(cfg.voices_dir),
             "output_dir": str(cfg.output_dir),
-            "speakers_dir": str(cfg.speakers_dir),
             "logs_dir": str(cfg.logs_dir),
         },
         "links": {"docs": "/docs", "openapi": "/openapi.json"},

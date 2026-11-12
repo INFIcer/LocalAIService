@@ -1,7 +1,7 @@
 """ASR 路由：``/asr``、``/api/v1/asr``、``/asr/status``、``/asr/segments``。
 
 契约：multipart ``file=<音频/视频>``、``language=auto|zh|en|ja|ko|yue``、
-``?speaker=0`` 关闭声纹、``engine=sensevoice|whisper|auto`` 选择识别引擎。
+``engine=sensevoice|whisper|auto`` 选择识别引擎；声纹不在这里，见 ``/speakers/embed``。
 非 WAV 一律先由 ffmpeg 归一到 16k 单声道 WAV。
 
 ``/asr/segments`` 是**新增**的带时间戳分段接口：
@@ -38,14 +38,6 @@ from ..uploads import save_job_upload, save_media_upload, unlink_quiet
 logger = logging.getLogger("localai.api.asr")
 
 router = APIRouter(tags=["asr"])
-
-_SPEAKER_OFF_VALUES = {"0", "false", "off", "no", "none", ""}
-
-
-def speaker_enabled(value: str) -> bool:
-    """把 ``?speaker=`` 的值转成 bool（默认开启）。"""
-    return str(value or "").strip().lower() not in _SPEAKER_OFF_VALUES
-
 
 def _true_flag(value: Any) -> bool:
     """把 ``timestamps=1`` 这类开关转成 bool（默认关闭）。"""
@@ -135,7 +127,6 @@ async def _handle_asr_request(
     request: Request,
     file: UploadFile,
     language: str,
-    use_speaker: bool = True,
     engine: str = "",
     timestamps: bool = False,
 ) -> JSONResponse:
@@ -169,7 +160,6 @@ async def _handle_asr_request(
             {
                 "file": str(tmp_path),
                 "language": lang,
-                "speaker": use_speaker,
                 "engine": engine,
                 "timestamps": "1" if timestamps else "0",
                 "original_name": raw_name,
@@ -184,12 +174,11 @@ async def _handle_asr_request(
     return JSONResponse(content=job.get("result") or {})
 
 
-@router.post("/asr", summary="语音识别（可选声纹 / 可选引擎）")
+@router.post("/asr", summary="语音识别（可选引擎）")
 async def asr(
     request: Request,
     file: UploadFile = File(..., description="要识别的音频文件"),
     language: str = Form("auto", description="auto/zh/en/ja/ko/yue..."),
-    speaker: str = "1",
     engine: str = Form("", description="sensevoice / whisper / auto；空=按配置默认"),
     timestamps: str = Form("0", description="1=需要时间戳（engine=auto 时选 whisper）"),
 ) -> JSONResponse:
@@ -197,7 +186,6 @@ async def asr(
         request,
         file,
         language,
-        speaker_enabled(speaker),
         engine=engine,
         timestamps=_true_flag(timestamps),
     )
@@ -208,7 +196,6 @@ async def api_v1_asr(
     request: Request,
     file: UploadFile = File(..., description="要识别的音频文件"),
     language: str = Form("auto", description="auto/zh/en/ja/ko/yue..."),
-    speaker: str = "1",
     engine: str = Form("", description="sensevoice / whisper / auto；空=按配置默认"),
     timestamps: str = Form("0", description="1=需要时间戳（engine=auto 时选 whisper）"),
 ) -> JSONResponse:
@@ -216,7 +203,6 @@ async def api_v1_asr(
         request,
         file,
         language,
-        speaker_enabled(speaker),
         engine=engine,
         timestamps=_true_flag(timestamps),
     )

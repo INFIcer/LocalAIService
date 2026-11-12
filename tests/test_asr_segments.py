@@ -222,7 +222,6 @@ def test_asr_engine_selection(
         "payload": {
             "file": str(wav_path),
             "language": "zh",
-            "speaker": False,
             "engine": requested,
             "timestamps": False,
             "source_format": ".wav",

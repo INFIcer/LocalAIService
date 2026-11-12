@@ -16,7 +16,7 @@
 | ffmpeg | 需要 `ffmpeg.exe` + `ffprobe.exe` |
 | 网络 | 首次装依赖/下模型需要；运行时可离线 |
 
-仓库里**不含**：模型权重、音色、声纹库、输出、日志、虚拟环境。
+仓库里**不含**：模型权重、音色、输出、日志、虚拟环境。
 这些都在 `LOCALAI_HOME` 下，按本文重建/拷贝即可。
 
 ---
@@ -34,7 +34,7 @@ LocalAIService\
   svc\service.py        ← 旧入口兼容壳
   start_ai_service.ps1  ← 正式启动脚本（UTF-8 BOM）
   docs\ tests\ integrations\
-  models\ voices\ outputs\ logs\ speakers\   ← 数据，不进 git
+  models\ voices\ outputs\ logs\   ← 数据，不进 git
 ```
 
 > 数据目录可以不在代码目录里：设置 `LOCALAI_HOME` 指向数据根即可。
@@ -144,8 +144,7 @@ engine\.venv\Scripts\localai.exe models download demucs
 
 - **htdemucs_ft** 是 4 个模型的 bag，本项目默认不下载；缺失是正常的，
   `models list` / `doctor` 会明确标注「可选未下载」。
-- 从旧机器迁移：直接拷贝 `models\`、`voices\`、`speakers\` 三个目录即可，
-  不需要重新下载。声纹只含向量，不含原始音频，拷贝是安全的。
+- 从旧机器迁移：直接拷贝 `models\`、`voices\` 两个目录即可，不需要重新下载。
 - 模型目录不在默认位置时，用 `LOCALAI_MODEL_DIR` / `LOCALAI_ASR_MODEL_DIR` /
   `LOCALAI_CAMPPUS_DIR` / `LOCALAI_DEMUCS_REPO` 覆盖。
 
@@ -250,7 +249,7 @@ engine\.venv\Scripts\python.exe -m pytest -q
 
 ```powershell
 curl.exe -s -X POST http://127.0.0.1:7880/tts -H "Content-Type: application/json" -d "{\"text\":\"测试\",\"voice\":\"default\"}" -o test.wav
-curl.exe -s -X POST "http://127.0.0.1:7880/asr?speaker=0" -F "file=@test.wav"
+curl.exe -s -X POST "http://127.0.0.1:7880/asr" -F "file=@test.wav"
 curl.exe -s -X POST http://127.0.0.1:7880/media/probe -F "file=@test.wav"
 ```
 
@@ -262,7 +261,7 @@ curl.exe -s -X POST http://127.0.0.1:7880/media/probe -F "file=@test.wav"
 
 | 变量 | 默认 | 作用 |
 | --- | --- | --- |
-| `LOCALAI_HOME` | 项目根 | 数据根目录；音色/输出/日志/声纹/模型都从它推导 |
+| `LOCALAI_HOME` | 项目根 | 数据根目录；音色/输出/日志/模型都从它推导 |
 | `LOCALAI_HOST` / `LOCALAI_PORT` | `127.0.0.1` / `7880` | 监听地址 |
 | `LOCALAI_ENGINE_DIR` | `<HOME>\engine` | 原生引擎目录 |
 | `LOCALAI_TTS_BACKEND` | `engine` | `engine` 或 `comfy` |
@@ -272,7 +271,6 @@ curl.exe -s -X POST http://127.0.0.1:7880/media/probe -F "file=@test.wav"
 | `LOCALAI_VOICES_DIR` | `<HOME>\voices` | 音色目录 |
 | `LOCALAI_OUTPUT_DIR` | `<HOME>\outputs` | 输出/临时/抽帧 |
 | `LOCALAI_LOGS_DIR` | `<HOME>\logs` | 日志与显存估算 |
-| `LOCALAI_SPEAKERS_DIR` | `<HOME>\speakers` | 声纹库 |
 | `LOCALAI_TORCH_HOME` | `<HOME>\models\torch` | Demucs/torch 缓存 |
 | `LOCALAI_DEMUCS_REPO` | `<TORCH_HOME>\hub\checkpoints` | Demucs 权重 |
 | `LOCALAI_VRAM_ESTIMATES` | `<HOME>\logs\vram_estimates.json` | 显存估算校准 |
@@ -292,7 +290,7 @@ curl.exe -s -X POST http://127.0.0.1:7880/media/probe -F "file=@test.wav"
 ## 10. 从旧机器迁移清单
 
 1. 拷贝整个代码目录（不含 `.venv` 也行，重装更快）；
-2. 拷贝 `models\`、`voices\`、`speakers\`；
+2. 拷贝 `models\`、`voices\`；
 3. 新机器装 Python + venv + 依赖（第 2~4 节）；
 4. 设置 `LOCALAI_HOME`（如果数据不在代码目录）；
 5. `localai doctor` → 全绿；

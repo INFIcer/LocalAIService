@@ -281,7 +281,6 @@ class JobScheduler:
             "tts": self._parallel_limit("tts"),
             "asr": self._parallel_limit("asr"),
             "separate": self._parallel_limit("separate"),
-            "speaker": self._parallel_limit("speaker"),
             "media": self._parallel_limit("media"),
             "translate": self._parallel_limit("translate"),
             "download": self._parallel_limit("download"),

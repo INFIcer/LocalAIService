@@ -1495,7 +1495,6 @@ function renderSystem(data) {
     ["输出", disk.outputs_mb],
     ["日志", disk.logs_mb],
     ["数据", disk.data_mb],
-    ["声纹", disk.speakers_mb],
   ].map(([label, value]) => `<div class="disk-row"><span class="muted">${escapeHtml(label)}</span><span>${escapeHtml(fmtMb(value))}</span></div>`).join("");
 
   box.innerHTML = `

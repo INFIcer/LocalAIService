@@ -151,7 +151,7 @@ POST /api/v1/tts/tasks
 ### 3.1 接口
 
 ```http
-POST /asr?speaker=0
+POST /asr
 Content-Type: multipart/form-data
 
 file=<音频/视频>
@@ -171,17 +171,15 @@ language=auto
 
 ### 3.3 声纹字段
 
-- `?speaker=1`（默认）：返回 `speaker: {name, score, known}`；
-  首次会额外加载 campplus（约 0.3GB 增量），可能多等几秒。
-- `?speaker=0`：不加载 campplus，响应里 `speaker=null`。
-- 用户没登记声纹时 `speaker` 可能是 `未知-N` 或 `null`；插件不要把 `known=false` 当错误。
-- 声纹失败只影响 `speaker`/`speaker_error`，**文字照常返回**。
+`/asr` **只返回转写文本**，不再判断说话人是谁，也没有 `speaker` 字段。
+需要声纹向量时单独调 `POST /speakers/embed`（multipart `file` → 192 维向量）；
+认人、阈值与样本存储都属于记忆层，不在本服务契约内。
 
 ### 3.4 响应与展示
 
 ```json
 {"ok":true,"text":"...","language":"zh","duration":12.3,"elapsed_ms":850,
- "speaker":{"name":"主人","score":0.81,"known":true},"converted":true}
+ "converted":true}
 ```
 
 - 以 `text` 为准；`language` 可用于展示；
@@ -198,7 +196,7 @@ language=auto
 ### 3.6 选引擎与要时间戳（新增）
 
 服务现在有两个识别引擎，**普通语音条转文字不需要改任何代码**（默认仍是 sensevoice，
-中文最快、带声纹）。只有下面几种情况才需要显式选择：
+中文最快）。只有下面几种情况才需要显式选择：
 
 | 需求 | 用哪个接口 / 参数 |
 | --- | --- |
@@ -271,21 +269,16 @@ file=@my_voice.wav
 
 也可以让用户把文件放进 `<HOME>/voices/`；插件调 `/voices` 刷新即可。
 
-### 4.3 声纹（可选功能）
+### 4.3 声纹向量
 
 | 操作 | 接口 |
 | --- | --- |
-| 列出已登记 | `GET /speakers` |
-| 登记 | `POST /speakers/enroll`（multipart `file` + `name`） |
-| 识别 | `POST /speakers/identify`（multipart `file`） |
-| 未知聚类 | `GET /speakers/unknown` |
-| 删除 | `DELETE /speakers/{name}` |
+| 引擎状态 | `GET /speakers/status` |
+| 算向量 | `POST /speakers/embed`（multipart `file`） |
 
-注意：
-
-- 声纹只存 192 维向量与名字，不存原音频；插件不要把原音频再传回服务端长期保存；
-- `name` 会被用作文件名，服务端会做安全化；插件仍应限制长度与非法字符；
-- 登记建议 3~10 秒清晰单人语音；同名重复登记会累加样本。
+服务端只输出 L2 归一化的 192 维向量，不保存名字和样本，也不做身份判断；
+登记、比对、删除样本都在记忆层完成，插件不要调用不存在的身份接口。
+上传音频只落临时目录，算完立即删除。
 
 ### 4.4 默认音色
 
@@ -322,7 +315,6 @@ Content-Type: multipart/form-data
 
 file=<音频/视频>
 language=auto
-speaker=1
 priority=0
 ```
 
@@ -428,7 +420,7 @@ POST /jobs/{id}/cancel
 - 插件只依赖 `api_version` 的主版本；`service.version` 仅用于展示/日志。
 - 新增字段是兼容变更，插件必须忽略未知字段。
 - 若 `api_version` 不认识：
-  - 不要调用写接口（TTS/上传/声纹登记）；
+  - 不要调用写接口（TTS/上传）；
   - 可继续调用 `/health` 做状态展示；
   - 提示用户升级插件或服务。
 
@@ -553,7 +545,7 @@ POST /translate
 ## 10. 插件不该做的事
 
 - ❌ 自己加载/卸载模型、自己管理显存；
-- ❌ 直接读 `models/`、`speakers/`、`outputs/` 目录；
+- ❌ 直接读 `models/`、`outputs/` 目录；
 - ❌ 假设服务一定在 `127.0.0.1:7880`（应可配置）；
 - ❌ 在服务不可用时阻塞 UI 或反复重试；
 - ❌ 把服务端返回的绝对路径当作长期文件引用；
@@ -565,7 +557,7 @@ POST /translate
 
 1. `GET /capabilities` → 校验 `api_version`、缓存能力；
 2. 自动朗读：`POST /tts`，分段、串行、180s 超时、失败静默跳过；
-3. 语音转写：`POST /asr`（大文件分片、`?speaker=0` 可选）；
+3. 语音转写：`POST /asr`（大文件分片）；
 4. 翻译：`POST /translate` / `POST /translate/batch`（`source=auto` 失败就要求手选，
    单条 ≤ 5000 字、批 ≤ 500 条；超大批量走 `/jobs/translate`）；
 5. 音色管理：`GET /voices`、`POST /api/v1/upload`；

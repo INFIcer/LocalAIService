@@ -355,7 +355,6 @@ def system_info(
         "outputs_mb": _dir_size_mb(cfg.output_dir),
         "logs_mb": _dir_size_mb(cfg.logs_dir),
         "data_mb": _dir_size_mb(cfg.data_dir),
-        "speakers_mb": _dir_size_mb(cfg.speakers_dir),
     }
     disk["total_mb"] = round(sum(disk.values()), 1)
 

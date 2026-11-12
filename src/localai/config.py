@@ -21,7 +21,6 @@
     LOCALAI_CAMPPUS_DIR       campplus 目录
     LOCALAI_VOICES_DIR        音色目录
     LOCALAI_OUTPUT_DIR        输出目录
-    LOCALAI_SPEAKERS_DIR      声纹库目录
     LOCALAI_LOGS_DIR          日志目录
     LOCALAI_TORCH_HOME        Demucs/torch 缓存目录
     LOCALAI_FFMPEG            ffmpeg.exe 完整路径
@@ -470,7 +469,6 @@ class Config:
     voices_dir: Path = field(default_factory=Path)
     output_dir: Path = field(default_factory=Path)
     logs_dir: Path = field(default_factory=Path)
-    speakers_dir: Path = field(default_factory=Path)
     torch_home: Path = field(default_factory=Path)
     demucs_repo: Path = field(default_factory=Path)
 
@@ -783,9 +781,6 @@ class Config:
             logs_dir=Path(
                 _pick("LOCALAI_LOGS_DIR", "INDEX_TTS_LOGS", default=str(root / "logs"))
             ).expanduser(),
-            speakers_dir=Path(
-                _pick("LOCALAI_SPEAKERS_DIR", "INDEX_TTS_SPEAKERS_DIR", default=str(root / "speakers"))
-            ).expanduser(),
             torch_home=torch_home,
             demucs_repo=demucs_repo,
             vram_estimates_path=Path(
@@ -902,7 +897,6 @@ class Config:
             "LOCALAI_TRANSLATE_BATCH_SIZE": str(self.translate_batch_size),
             "LOCALAI_TRANSLATE_MAX_LEN": str(self.translate_max_len),
             "INDEX_TTS_CAMPPUS_DIR": str(self.speaker_model_dir),
-            "INDEX_TTS_SPEAKERS_DIR": str(self.speakers_dir),
             "INDEX_TTS_TORCH_HOME": str(self.torch_home),
             "INDEX_TTS_DEMUCS_REPO": str(self.demucs_repo),
             "INDEX_TTS_VOICES": str(self.voices_dir),
@@ -1021,7 +1015,6 @@ class Config:
             "voices_dir": str(self.voices_dir),
             "output_dir": str(self.output_dir),
             "logs_dir": str(self.logs_dir),
-            "speakers_dir": str(self.speakers_dir),
             "torch_home": str(self.torch_home),
             "demucs_repo": str(self.demucs_repo),
             "ffmpeg": str(self.ffmpeg) if self.ffmpeg else None,
@@ -1097,7 +1090,6 @@ class Config:
             "tts": self.jobs_parallel_tts,
             "asr": self.asr_parallel_effective(),
             "separate": self.jobs_parallel_separate,
-            "speaker": 1,
             "media": 1,
             "translate": 1,
             "download": 1,
@@ -1133,7 +1125,6 @@ def ensure_directories(cfg: Optional[Config] = None) -> list[Path]:
         cfg.voices_dir,
         cfg.output_dir,
         cfg.logs_dir,
-        cfg.speakers_dir,
         cfg.asr_tmp_dir,
         cfg.media_tmp_dir,
         cfg.frames_dir,

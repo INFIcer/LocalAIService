@@ -1,4 +1,4 @@
-"""声纹适配器：campplus 192 维向量（登记 / 识别 / 未知聚类）。"""
+"""声纹适配器：campplus 192 维向量（只算向量，不认人）。"""
 
 from __future__ import annotations
 
@@ -14,27 +14,21 @@ from .base import BaseAdapter
 logger = logging.getLogger("localai.engines.speaker")
 
 
-
-
 class SpeakerAdapter(BaseAdapter):
     MAX_ESTIMATE_MB: float = 300
     name = "speaker"
-    title = "声纹识别（campplus）"
+    title = "声纹向量（campplus）"
     model_name = "campplus"
     requires_gpu = True
     DEFAULT_ESTIMATE_MB = 300
     ENDPOINTS = (
-        "/speakers",
         "/speakers/status",
-        "/speakers/unknown",
-        "/speakers/enroll",
-        "/speakers/identify",
-        "/speakers/{name}",
+        "/speakers/embed",
     )
 
     @property
     def loader_hint(self) -> str:
-        return "campplus（声纹，在已有 CUDA context 上增量很小）"
+        return "campplus（声纹向量，在已有 CUDA context 上增量很小）"
 
     def get_module(self) -> Any:
         if self._module is not None:
@@ -44,18 +38,10 @@ class SpeakerAdapter(BaseAdapter):
                 self._module = import_engine_module("speaker_engine")
         return self._module
 
-    def _threshold(self) -> float:
-        try:
-            return float(getattr(self.get_module(), "KNOWN_THRESHOLD", 0.65))
-        except Exception:  # noqa: BLE001
-            return 0.65
-
     def status(self) -> dict[str, Any]:
-        threshold = 0.65
         try:
             module = self.get_module()
             status = module.model_status()
-            threshold = float(getattr(module, "KNOWN_THRESHOLD", threshold))
         except Exception as exc:  # noqa: BLE001
             return {
                 "ready": False,
@@ -63,9 +49,9 @@ class SpeakerAdapter(BaseAdapter):
                 "missing": [],
                 "loaded": False,
                 "load_seconds": None,
+                "model": self.model_name,
+                "dim": 192,
                 "model_dir": str(self.cfg.speaker_model_dir),
-                "speakers_dir": str(self.cfg.speakers_dir),
-                "threshold": threshold,
             }
 
         missing = status.get("missing") or []
@@ -82,9 +68,9 @@ class SpeakerAdapter(BaseAdapter):
             "loaded": bool(status.get("loaded")),
             "load_seconds": status.get("load_seconds"),
             "load_error": status.get("load_error"),
+            "model": status.get("model") or self.model_name,
+            "dim": int(status.get("dim") or 192),
             "model_dir": status.get("model_dir", str(self.cfg.speaker_model_dir)),
-            "speakers_dir": str(self.cfg.speakers_dir),
-            "threshold": threshold,
         }
 
     async def call(self, func_name: str, *args: Any) -> Any:
@@ -105,7 +91,7 @@ class SpeakerAdapter(BaseAdapter):
                     vram.end_use(self.name)
         except (InsufficientVramError, SpeakerBackendError):
             raise
-        except ValueError as exc:  # 名字/参数不合法：算客户端错误
+        except ValueError as exc:  # 参数不合法：算客户端错误
             raise SpeakerBackendError(
                 f"声纹参数不合法：{exc}",
                 status_code=400,
@@ -118,11 +104,8 @@ class SpeakerAdapter(BaseAdapter):
             ) from exc
         return result
 
-    async def identify_for(self, audio_path: str) -> dict[str, Any]:
-        """算声纹并归到「已知某人」或「未知-N」；供 /asr 使用。"""
-        result = await self.call("speaker_for", str(audio_path))
-        return {
-            "name": result.get("name"),
-            "score": round(float(result.get("score") or 0.0), 4),
-            "known": bool(result.get("known")),
-        }
+    async def embed_for(self, audio_path: str) -> dict[str, Any]:
+        """算 192 维声纹向量；/asr 与 /speakers/embed 共用。"""
+        vec = await self.call("embedding", str(audio_path))
+        values = [round(float(x), 6) for x in vec]
+        return {"embedding": values, "dim": len(values), "model": self.model_name}

@@ -37,12 +37,8 @@ REQUIRED_PATHS = {
     "/api/v1/asr",
     "/asr/status",
     "/asr/segments",
-    "/speakers",
     "/speakers/status",
-    "/speakers/unknown",
-    "/speakers/enroll",
-    "/speakers/identify",
-    "/speakers/{name}",
+    "/speakers/embed",
     "/separate",
     "/api/v1/separate",
     "/separate/status",
@@ -192,7 +188,7 @@ def test_asr_rejects_unsupported_extension(client: TestClient) -> None:
 
 def test_speaker_upload_rejects_bad_extension(client: TestClient) -> None:
     response = client.post(
-        "/speakers/identify",
+        "/speakers/embed",
         files={"file": ("x.txt", b"hello", "text/plain")},
     )
     assert response.status_code == 400

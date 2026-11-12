@@ -54,7 +54,7 @@ class VramUnloadRequest(BaseModel):
 class JobCreateRequest(BaseModel):
     """POST /jobs 的通用请求体。"""
 
-    kind: str = Field(..., description="tts / asr / speaker / separate / media")
+    kind: str = Field(..., description="tts / asr / separate / media")
     action: Optional[str] = Field(None, description="不填则用该 kind 的默认 action")
     priority: int = Field(0, description="越大越先；等待久了会自动提权")
     payload: dict[str, Any] = Field(default_factory=dict, description="能力参数")

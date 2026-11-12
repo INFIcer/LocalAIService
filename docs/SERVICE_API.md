@@ -26,7 +26,7 @@ curl -X POST http://127.0.0.1:7880/tts \
   -d '{"text":"你好，我是本地 AI 服务。","voice":"default","speed":1.0}' \
   --output hello.wav
 
-curl -X POST "http://127.0.0.1:7880/asr?speaker=0" \
+curl -X POST "http://127.0.0.1:7880/asr" \
   -F "file=@hello.wav" -F "language=auto"
 ```
 
@@ -230,7 +230,7 @@ curl -X POST http://127.0.0.1:7880/tts \
 
 | 引擎 | 注册能力 | 模型 | 时间戳 | 说明 |
 | --- | --- | --- | --- | --- |
-| `sensevoice`（默认） | `asr` | SenseVoiceSmall | 无原生时间戳；`/asr/segments` 用 fsmn-vad 切句（`timestamp_source=vad`） | 中文短音频最快，带情感/事件标签与声纹 |
+| `sensevoice`（默认） | `asr` | SenseVoiceSmall | 无原生时间戳；`/asr/segments` 用 fsmn-vad 切句（`timestamp_source=vad`） | 中文短音频最快，带情感/事件标签 |
 | `whisper` | `whisper` | faster-whisper（`tiny/base/small/medium/large-v3`） | 原生 segment 时间戳（`timestamp_source=native`） | 需要精确时间戳、多语种；默认档 `small` |
 
 ### `POST /asr`，别名 `POST /api/v1/asr`
@@ -241,12 +241,11 @@ multipart：
 | --- | --- |
 | `file` | 音频或视频（wav/mp3/m4a/ogg/flac/mp4/mkv/webm…，≤200MB） |
 | `language` | `auto`/`zh`/`en`/`ja`/`ko`/`yue`/`nospeech` |
-| `speaker` | `1`（默认，识别声纹）/ `0`（跳过，连 campplus 都不加载） |
 | `engine` | `sensevoice` / `whisper` / `auto`；**空 = 按配置默认**（`LOCALAI_ASR_ENGINE`） |
 | `timestamps` | `0`（默认）/ `1`；只影响 `engine=auto` 的选择：要时间戳时选 whisper |
 
 `engine=auto` 规则：`timestamps=1` 走 whisper，否则走配置默认。
-旧的默认行为完全不变（不带 `engine` → sensevoice + 声纹）。
+不带 `engine` 时仍用配置默认引擎（`sensevoice`）。
 
 非 WAV 会先用 ffmpeg 归一成 **16kHz 单声道 WAV** 再识别；采样率不用自己处理。
 音频容器转码失败会回退直接识别；视频转码失败直接报错。
@@ -264,17 +263,16 @@ multipart：
   "duration": 3.2,
   "elapsed_ms": 850,
   "loaded": true,
-  "speaker": {"name": "主人", "score": 0.8123, "known": true},
   "source_format": ".wav",
   "converted": false
 }
 ```
 
-`engine` 是本次真正用到的引擎（`sensevoice` / `whisper`）。声纹失败不会影响转写，
-会多一个 `speaker_error` 字段。
+`engine` 是本次真正用到的引擎（`sensevoice` / `whisper`）。`/asr` 只负责转写，
+不判断说话人是谁；需要声纹向量请调 `POST /speakers/embed`。
 
 ```bash
-curl -X POST "http://127.0.0.1:7880/asr?speaker=0" \
+curl -X POST "http://127.0.0.1:7880/asr" \
   -F "file=@meeting.mp4" -F "language=auto"
 
 # 指定 whisper（原生时间戳，但 /asr 只返回文本；要分段用 /asr/segments）
@@ -416,24 +414,29 @@ CUDA context）：
 
 ---
 
-## 5. 声纹（campplus）
+## 5. 声纹向量（campplus）
+
+服务端只做纯声纹分析：**音频 → 192 维向量**。谁是谁、阈值多少、样本存在哪里，
+都属于调用方的记忆层，本服务不保存名字和样本，也不做身份判断。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/speakers` | 已登记列表 |
-| GET | `/speakers/status` | 引擎状态 + 阈值 |
-| GET | `/speakers/unknown` | 未知声纹聚类 |
-| POST | `/speakers/enroll` | multipart `file` + `name`，同名累加样本 |
-| POST | `/speakers/identify` | multipart `file`，返回 matches/best/known |
-| DELETE | `/speakers/{name}` | 删除，不存在时 `deleted=false` |
+| GET | `/speakers/status` | 引擎状态（ready/loaded/model/dim/model_dir/idle_seconds） |
+| POST | `/speakers/embed` | multipart `file`，返回 192 维向量 |
 
-隐私：`<HOME>/speakers/*.json` 只存 192 维向量和名字，**不存原始音频**；
-上传音频只落临时目录，算完立即删除。
+响应：
+
+```json
+{"ok": true, "embedding": [-0.0134, 0.0217, "..."], "dim": 192,
+ "model": "campplus", "elapsed_ms": 210}
+```
+
+- 向量已做 L2 归一化，两个向量点积就是余弦相似度；
+- 建议比对阈值 0.65，由调用方（记忆层）决定，服务端不内置；
+- 上传音频只落临时目录，算完立即删除，服务端不落任何身份数据。
 
 ```bash
-curl -X POST http://127.0.0.1:7880/speakers/enroll \
-  -F "file=@voice.wav" -F "name=主人"
-curl -X POST http://127.0.0.1:7880/speakers/identify -F "file=@test.wav"
+curl -X POST http://127.0.0.1:7880/speakers/embed -F "file=@voice.wav"
 ```
 
 ---
@@ -742,8 +745,8 @@ Authorization: Bearer <LOCALAI_TOKEN>
 | 字段 | 类型 | 含义 |
 | --- | --- | --- |
 | `id` | TEXT PRIMARY KEY | uuid hex |
-| `kind` | TEXT | `tts` / `asr` / `speaker` / `separate` / `media` |
-| `action` | TEXT | `tts.synthesize` / `asr.transcribe` / `separate.split` / `speaker.enroll` / `media.frames` … |
+| `kind` | TEXT | `tts` / `asr` / `separate` / `media` |
+| `action` | TEXT | `tts.synthesize` / `asr.transcribe` / `separate.split` / `media.frames` … |
 | `priority` | INTEGER | 默认 0，越大越先（负数=让路） |
 | `state` | TEXT | `queued` / `running` / `done` / `failed` / `canceled` |
 | `created_at` | TEXT | 提交时间（ISO8601 带时区） |
@@ -950,7 +953,7 @@ TTS / 人声分离的旧实测数据保留如下（它们仍固定为 1）：
 {"ok": true, "id": "6f2d…", "state": "queued"}
 ```
 
-`action` 可省略，按 kind 取默认值。`speaker` / `media` 也支持通过这里提交，
+`action` 可省略，按 kind 取默认值。`media` 也支持通过这里提交，
 `payload.file` 必须是**服务端本地路径**（高级用法；常规上传请用下面的 multipart 入口）。
 
 ### 12.4 `POST /jobs/tts`（JSON）
@@ -966,7 +969,7 @@ Content-Type: application/json
 
 ```bash
 curl -X POST http://127.0.0.1:7880/jobs/asr \
-  -F "file=@hello.wav" -F "language=auto" -F "speaker=1" -F "priority=0"
+  -F "file=@hello.wav" -F "language=auto" -F "priority=0"
 
 # 任务级指定引擎 / 要时间戳（engine=auto 时选 whisper）
 curl -X POST http://127.0.0.1:7880/jobs/asr \
@@ -1048,7 +1051,7 @@ failed / canceled）后默认删除，`LOCALAI_JOBS_KEEP_UPLOADS=1` 可保留。
     "running_job_ids": ["…"],
     "running": 1,
     "max_parallel": 1,
-    "per_kind_parallel": {"tts": 1, "asr": 1, "separate": 1, "speaker": 1, "media": 1},
+    "per_kind_parallel": {"tts": 1, "asr": 1, "separate": 1, "media": 1},
     "asr_parallel": 1,
     "asr_engine": "sensevoice",
     "asr_engines": {
@@ -1097,7 +1100,7 @@ failed / canceled）后默认删除，`LOCALAI_JOBS_KEEP_UPLOADS=1` 可保留。
 "jobs": {"enabled": true, "sync_endpoints_use_queue": true,
          "order": "kind_first > priority > created_at（无 aging）",
          "max_parallel": 1,
-         "per_kind_parallel": {"tts": 1, "asr": 1, "separate": 1, "speaker": 1,
+         "per_kind_parallel": {"tts": 1, "asr": 1, "separate": 1,
                                "media": 1, "translate": 1, "download": 1, "analyze": 1},
          "parallel_extra_mb": 600,
          "timeout_seconds": 600.0, "recover": "requeue"}
@@ -1110,7 +1113,7 @@ failed / canceled）后默认删除，`LOCALAI_JOBS_KEEP_UPLOADS=1` 可保留。
 - 同步接口等待上限 = 对应任务类型超时 + 30 秒（下载 / 分析用
   `LOCALAI_DOWNLOAD_TIMEOUT`，默认 1800 秒；其它能力仍是 600 秒）。
 - 参数错误（格式/语言/模型/stems）仍然在入队前返回 400，不会产生任务记录。
-- 声纹 `/speakers/*` 与媒体 `/media/*` 仍是直接调用、不入队（它们不是
+- 声纹向量 `/speakers/embed` 与媒体 `/media/*` 仍是直接调用、不入队（它们不是
   长任务，语义保持不变）。
 - **饿死风险**：同类型持续涌入时，其它类型会一直排队（没有 aging 提权）。
   这是主人明确要求的取舍；调用方如果在意延迟，应自己控制提交节奏，

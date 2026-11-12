@@ -474,7 +474,6 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     for label, path in (
         ("音色", cfg.voices_dir),
         ("输出", cfg.output_dir),
-        ("声纹库", cfg.speakers_dir),
         ("日志", cfg.logs_dir),
         ("显存估算", cfg.vram_estimates_path.parent),
     ):

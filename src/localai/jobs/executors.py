@@ -55,7 +55,6 @@ logger = logging.getLogger("localai.jobs.executors")
 DEFAULT_ACTION = {
     "tts": "tts.synthesize",
     "asr": "asr.transcribe",
-    "speaker": "speaker.identify",
     "separate": "separate.split",
     "media": "media.probe",
     "translate": "translate.text",
@@ -68,7 +67,6 @@ DEFAULT_ACTION = {
 KIND_ACTIONS = {
     "tts": {"tts.synthesize"},
     "asr": {"asr.transcribe"},
-    "speaker": {"speaker.enroll", "speaker.identify", "speaker_for"},
     "separate": {"separate.split"},
     "media": {"media.probe", "media.to_wav", "media.frames", "media.audio"},
     "translate": {"translate.text"},
@@ -76,16 +74,6 @@ KIND_ACTIONS = {
     "analyze": {"analyze.url"},
     "vision": {"vision.frames"},
 }
-
-_SPEAKER_OFF_VALUES = {"0", "false", "off", "no", "none", ""}
-
-
-def speaker_enabled(value: Any) -> bool:
-    """``?speaker=`` / payload.speaker 转 bool（默认开启）。"""
-    if isinstance(value, bool):
-        return value
-    return str(value if value is not None else "").strip().lower() not in _SPEAKER_OFF_VALUES
-
 
 _TRUE_VALUES = {"1", "true", "yes", "on", "y"}
 
@@ -221,7 +209,6 @@ def prepare_payload(
         return act, {
             "file": str(file_path),
             "language": language,
-            "speaker": speaker_enabled(data.get("speaker", True)),
             # 空字符串 = 用配置默认（LOCALAI_ASR_ENGINE）；auto 由执行器按需解析。
             "engine": engine,
             "timestamps": _flag(data.get("timestamps", False)),
@@ -290,19 +277,6 @@ def prepare_payload(
             "stems": stems,
             "original_name": _text(data.get("original_name")) or file_path.name,
         }
-
-    if kind == "speaker":
-        file_path = _require_file(data, cfg)
-        normalized: dict[str, Any] = {
-            "file": str(file_path),
-            "original_name": _text(data.get("original_name")) or file_path.name,
-        }
-        if act == "speaker.enroll":
-            name = _text(data.get("name"))
-            if not name:
-                raise ValueError("声纹登记缺少 name")
-            normalized["name"] = name
-        return act, normalized
 
     if kind in ("download", "analyze"):
         from ..engines._native import import_engine_module
@@ -496,7 +470,7 @@ async def _run_tts(payload: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
 
 
 async def _run_asr(payload: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
-    """与旧 ``/asr`` 相同的处理链路：转 16k -> 识别 ->（可选）声纹。
+    """与旧 ``/asr`` 相同的处理链路：转 16k -> 识别。
 
     ``payload.engine`` 为空 = 用配置默认（``LOCALAI_ASR_ENGINE``）；``auto`` 时
     需要时间戳就选 whisper，否则用配置默认。响应固定带 ``engine`` 字段。
@@ -506,7 +480,6 @@ async def _run_asr(payload: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     tmp_path = Path(payload["file"])
     suffix = payload["source_format"]
     lang = payload["language"]
-    use_speaker = bool(payload["speaker"])
     engine = normalize_engine(
         payload.get("engine"),
         cfg,
@@ -515,8 +488,6 @@ async def _run_asr(payload: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     wav_path: Optional[Path] = None
     converted = False
     started = time.perf_counter()
-    speaker_info: Optional[dict[str, Any]] = None
-    speaker_error: Optional[str] = None
     media = registry.get("media")
     asr = adapter_for(registry, engine)
     try:
@@ -534,13 +505,6 @@ async def _run_asr(payload: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
                 logger.warning("ffmpeg 转换失败，回退直接识别原始文件：%s", payload["original_name"])
         input_path = wav_path or tmp_path
         result = await asr.infer(str(input_path), lang)
-
-        if use_speaker:
-            try:
-                speaker_info = await registry.get("speaker").identify_for(input_path)
-            except Exception as exc:  # noqa: BLE001 - 降级：文本照常返回
-                speaker_error = f"{type(exc).__name__}: {exc}"
-                logger.warning("声纹识别失败（不影响转写）：%s", speaker_error)
     except (InsufficientVramError, AsrBackendError):
         raise
     except HTTPException:
@@ -568,12 +532,9 @@ async def _run_asr(payload: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         "duration": result.get("duration"),
         "elapsed_ms": elapsed_ms,
         "loaded": asr.loaded(),
-        "speaker": speaker_info,
         "source_format": suffix,
         "converted": converted,
     }
-    if speaker_error:
-        data["speaker_error"] = speaker_error
     return data
 
 
@@ -662,37 +623,6 @@ async def _run_translate(payload: dict[str, Any], ctx: JobContext) -> dict[str, 
         "elapsed_ms": outcome.get("elapsed_ms"),
         "loaded": bool(outcome.get("loaded")),
     }
-
-
-async def _run_speaker(
-    action: str, payload: dict[str, Any], ctx: JobContext
-) -> dict[str, Any]:
-    adapter = ctx.registry.get("speaker")
-    if action == "speaker.enroll":
-        result = await adapter.call("enroll", payload["name"], payload["file"])
-        return {
-            "ok": True,
-            "name": result.get("name"),
-            "samples": result.get("samples"),
-            "created_at": result.get("created_at"),
-        }
-    if action == "speaker_for":
-        result = await adapter.identify_for(payload["file"])
-        return {"ok": True, **result}
-    result = await adapter.call("identify", payload["file"])
-    matches = [
-        {"name": item.get("name"), "score": float(item.get("score") or 0.0)}
-        for item in (result.get("matches") or [])
-    ]
-    return {
-        "ok": True,
-        "matches": matches,
-        "best": result.get("best"),
-        "score": float(result.get("score") or 0.0),
-        "threshold": float(result.get("threshold") or 0.0),
-        "known": bool(result.get("known")),
-    }
-
 
 async def _run_media(
     action: str, payload: dict[str, Any], ctx: JobContext
@@ -1058,8 +988,6 @@ async def execute_job(job: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         return await _run_separate(payload, ctx)
     if kind == "translate":
         return await _run_translate(payload, ctx)
-    if kind == "speaker":
-        return await _run_speaker(action, payload, ctx)
     if kind == "media":
         return await _run_media(action, payload, ctx)
     if kind == "download":

@@ -10,7 +10,7 @@
 
 可选环境变量：
     LOCALAI_BASE          服务地址，默认 http://127.0.0.1:7880
-    LOCALAI_ASR_SPEAKER   1=同时做声纹（默认 1），0=不做
+    LOCALAI_ASR_SPEAKER   1=同时算声纹向量（默认 1），0=不算
 """
 
 from __future__ import annotations
@@ -80,9 +80,7 @@ def main() -> int:
         inbox = Path(os.environ.get("LOCALAI_VOICE_INBOX", r"E:\LocalAIService\outputs\voice_inbox"))
         inbox.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        speaker = data.get("speaker") or {}
-        who = (speaker.get("name") or "unknown").replace("未知-", "unknown-")
-        target = inbox / f"{stamp}_{src.suffix.lstrip('.')}_{who}{src.suffix}"
+        target = inbox / f"{stamp}_{src.suffix.lstrip('.')}{src.suffix}"
         shutil.copy2(src, target)
         # 只留最近 50 条
         old = sorted(inbox.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)[50:]
@@ -97,11 +95,14 @@ def main() -> int:
     if not text:
         print("（语音里没识别出内容）")
         return 0
-    # 默认只输出文字本身（桥会把它当消息内容）；声纹结果放 stderr，不污染正文
+    # 默认只输出文字本身（桥会把它当消息内容）；向量信息放 stderr，不污染正文。
+    # 谁是谁由鱼讯的记忆层判断，这里只报「算出了多大的向量」。
     speaker = data.get("speaker") or {}
-    if speaker.get("name"):
-        who = speaker["name"] + ("" if speaker.get("known") else "（未登记）")
-        print(f"[声纹] {who} score={speaker.get('score')}", file=sys.stderr)
+    if speaker.get("embedding"):
+        print(
+            f"[声纹向量] dim={speaker.get('dim')} model={speaker.get('model')}",
+            file=sys.stderr,
+        )
     print(text)
     return 0
 
