@@ -342,7 +342,7 @@ SETTINGS: tuple[Setting, ...] = (
         type="path",
         default=None,
         env=("LOCALAI_FFMPEG", "INDEX_TTS_FFMPEG"),
-        description="ffmpeg.exe 的完整路径；留空表示按「本机默认路径 → PATH」自动探测。",
+        description="ffmpeg.exe 的完整路径；留空表示按「config.json 里的同名字段 → PATH」自动探测。",
         allow_empty=True,
     ),
     # ---- 模型发现 -----------------------------------------------------

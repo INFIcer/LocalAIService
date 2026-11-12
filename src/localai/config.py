@@ -23,8 +23,9 @@
     LOCALAI_OUTPUT_DIR        输出目录
     LOCALAI_LOGS_DIR          日志目录
     LOCALAI_TORCH_HOME        Demucs/torch 缓存目录
-    LOCALAI_FFMPEG            ffmpeg.exe 完整路径
+    LOCALAI_FFMPEG            ffmpeg.exe 完整路径（默认读 config.json，再退回 PATH）
     LOCALAI_FFPROBE           ffprobe.exe 完整路径
+    LOCALAI_MEDIA_OUTPUT_MAX_MB 转码产物返回上限（默认 512）
     LOCALAI_VRAM_MARGIN_MB    显存安全余量（默认 512）
     LOCALAI_IDLE_UNLOAD       TTS 空闲卸载秒数（默认 900，0=关闭）
     LOCALAI_ASR_IDLE_UNLOAD
@@ -55,11 +56,11 @@
     LOCALAI_VISION_DIR        视觉模型目录（默认 <HOME>/models/vision）
     LOCALAI_VISION_PORT       本地 llama-server 端口（默认 7891，只监听 127.0.0.1）
     LOCALAI_VISION_IDLE_UNLOAD 视觉模型空闲卸载秒数（默认 900，0=关闭）
-    LOCALAI_VISION_CTX        llama-server 上下文长度（默认 8192）
+    LOCALAI_VISION_CTX        llama-server 上下文长度（默认 4096）
     LOCALAI_VISION_GPU_LAYERS 卸载到 GPU 的层数（默认 99=全部）
     LOCALAI_VISION_TIMEOUT    单次视觉推理超时秒数（默认 120）
     LOCALAI_VISION_MODEL      GGUF 文件名（默认 Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf）
-    LOCALAI_VISION_MMPROJ     视觉投影文件名（默认 mmproj-F16.gguf）
+    LOCALAI_VISION_MMPROJ     视觉投影文件名（默认 mmproj-Q8_0.gguf）
     LOCALAI_VISION_SERVER     llama-server.exe 文件名（默认 llama-server.exe）
     LOCALAI_VISION_PLANNER    关键帧默认 planner：hybrid（默认）/ agent
     LOCALAI_VISION_PHASH_DISTANCE 感知哈希去重汉明距离阈值（默认 6）
@@ -69,7 +70,7 @@
     LOCALAI_DOWNLOAD_MAX_MB      单个下载文件大小上限（默认 2048）
     LOCALAI_DOWNLOAD_SYNC_MAX_MB 同步下载接口允许的大小上限（默认 200）
     LOCALAI_DOWNLOAD_TIMEOUT     单次下载 / 分析任务超时秒数（默认 1800）
-    LOCALAI_BILI_COOKIE          B站 cookie JSON 路径（默认本机 bili-duty 凭证）
+    LOCALAI_BILI_COOKIE          B站 cookie JSON 路径（默认空=沿用引擎里的本机默认路径）
     LOCALAI_DOWNLOAD_ALLOW_PRIVATE 1=允许私有地址（仅测试；生产不要设）
 
 任务队列（详见 ``localai.jobs``）::
@@ -82,6 +83,9 @@
     LOCALAI_JOBS_PARALLEL_EXTRA_MB 每个新增并行任务需预留的显存（默认 600）
     LOCALAI_JOB_TIMEOUT        单个任务超时秒数（默认 600）
     LOCALAI_JOBS_KEEP_UPLOADS  任务完成后是否保留上传文件（默认 0=删除）
+    LOCALAI_JOBS_RETENTION_DAYS 终态任务保留天数（默认 30，0=不清理）
+    LOCALAI_OUTPUT_RETENTION_DAYS outputs/ 产物保留天数（默认 30，0=不清理）
+    LOCALAI_TMP_RETENTION_HOURS 临时目录残留保留小时数（默认 24，0=不清理）
     LOCALAI_JOBS_POLL          调度器空转轮询间隔秒（默认 0.2）
 """
 
@@ -103,9 +107,8 @@ logger = logging.getLogger("localai.config")
 #: 管理界面写入的配置文件（相对 ``LOCALAI_HOME``）。
 CONFIG_FILE_NAME = "config.json"
 
-# 本机现有的 ffmpeg 常见位置；换机器探测不到就走 PATH。
-DEFAULT_FFMPEG = r"C:\Users\Administrator\Documents\videoTrans\ffmpeg\bin\ffmpeg.exe"
-DEFAULT_FFPROBE = r"C:\Users\Administrator\Documents\videoTrans\ffmpeg\bin\ffprobe.exe"
+# 本机专用路径（ffmpeg、ComfyUI 权重目录）不写死在代码里：优先环境变量，
+# 其次 git 忽略的 ``config.json``（管理界面也写这个文件），最后退回 PATH。
 
 
 def _pick(*names: str, default: Optional[str] = None) -> Optional[str]:
@@ -235,24 +238,42 @@ def _default_home() -> Path:
     return cwd
 
 
-def _resolve_ffmpeg() -> tuple[Optional[Path], str]:
-    """按「LOCALAI_FFMPEG → 本机默认路径 → PATH」找 ffmpeg。"""
+def _config_text(data: dict[str, Any], key: str) -> Optional[str]:
+    """取 config.json 里的非空字符串值；缺失或空白返回 None。"""
+    raw = str(data.get(key) or "").strip().strip('"')
+    return raw or None
+
+
+def _machine_default(data: dict[str, Any], key: str) -> Optional[Path]:
+    """取 config.json 里的本机可执行文件路径（只有真实文件才算数）。"""
+    raw = _config_text(data, key)
+    if not raw:
+        return None
+    try:
+        path = Path(raw).expanduser()
+        return path if path.is_file() else None
+    except OSError:
+        return None
+
+
+def _resolve_ffmpeg(config_data: dict[str, Any]) -> tuple[Optional[Path], str]:
+    """按「LOCALAI_FFMPEG → config.json → PATH」找 ffmpeg。"""
     configured = _pick("LOCALAI_FFMPEG", "INDEX_TTS_FFMPEG")
     if configured:
         return Path(configured), "env"
-    default = Path(DEFAULT_FFMPEG)
-    try:
-        if default.is_file():
-            return default, "default"
-    except OSError:
-        pass
+    default = _machine_default(config_data, "ffmpeg")
+    if default is not None:
+        return default, "file"
     found = shutil.which("ffmpeg")
     if found:
         return Path(found), "path"
     return None, "missing"
 
 
-def _resolve_ffprobe(ffmpeg: Optional[Path]) -> tuple[Optional[Path], str]:
+def _resolve_ffprobe(
+    ffmpeg: Optional[Path], config_data: dict[str, Any]
+) -> tuple[Optional[Path], str]:
+    """按「LOCALAI_FFPROBE → ffmpeg 同目录 → config.json → PATH」找 ffprobe。"""
     configured = _pick("LOCALAI_FFPROBE", "INDEX_TTS_FFPROBE")
     if configured:
         return Path(configured), "env"
@@ -263,12 +284,9 @@ def _resolve_ffprobe(ffmpeg: Optional[Path]) -> tuple[Optional[Path], str]:
                 return sibling, "sibling"
         except OSError:
             pass
-    default = Path(DEFAULT_FFPROBE)
-    try:
-        if default.is_file():
-            return default, "default"
-    except OSError:
-        pass
+    default = _machine_default(config_data, "ffprobe")
+    if default is not None:
+        return default, "file"
     found = shutil.which("ffprobe")
     if found:
         return Path(found), "path"
@@ -349,6 +367,7 @@ def _apply_config_file(
 #: 「配置指向」写入的路径键 -> 对应的环境变量（环境变量优先）。
 PATH_CONFIG_ENV: dict[str, tuple[str, ...]] = {
     "tts_model_dir": ("LOCALAI_MODEL_DIR", "INDEX_TTS_MODEL_DIR"),
+    "comfy_model_dir": ("LOCALAI_COMFY_MODEL_DIR", "INDEX_TTS_COMFY_MODEL_DIR"),
     "asr_model_dir": ("LOCALAI_ASR_MODEL_DIR", "INDEX_TTS_ASR_MODEL_DIR"),
     "translate_model_dir": ("LOCALAI_TRANSLATE_MODEL_DIR",),
     "speaker_model_dir": ("LOCALAI_CAMPPUS_DIR", "INDEX_TTS_CAMPPUS_DIR"),
@@ -387,6 +406,10 @@ def _apply_path_overrides(cfg: "Config", home: Path) -> None:
         raw = str(data["speaker_model_dir"] or "").strip()
         if raw:
             cfg.speaker_model_dir = Path(raw).expanduser()
+    if "comfy_model_dir" in data and allowed("comfy_model_dir"):
+        raw = str(data["comfy_model_dir"] or "").strip()
+        if raw:
+            cfg.comfy_model_dir = Path(raw).expanduser()
     if "demucs_repo" in data and allowed("demucs_repo"):
         raw = str(data["demucs_repo"] or "").strip()
         if raw:
@@ -484,6 +507,8 @@ class Config:
     ffprobe: Optional[Path] = None
     ffmpeg_source: str = "missing"
     ffprobe_source: str = "missing"
+    #: 转码产物（/media/to_wav、/media/audio）单次返回上限（MB，0=不限制）。
+    media_output_max_mb: int = 512
 
     token: str = ""
     #: 已有模型扫描目录；默认空，程序不预置任何本机路径。
@@ -506,8 +531,12 @@ class Config:
     jobs_timeout: float = 600.0
     jobs_keep_uploads: bool = False
     jobs_poll_interval: float = 0.2
+    #: 运行产物保留期（0=不清理）：终态任务行 / outputs 产物 / 临时目录残留。
+    jobs_retention_days: int = 30
+    output_retention_days: int = 30
+    tmp_retention_hours: int = 24
 
-    #: 识别引擎（SenseVoice）真实并发容量：1（默认）= 完全串行，范围 1~4。
+    #: 识别引擎（SenseVoice）真实并发容量：默认 2，1 = 完全串行，范围 1~4。
     #: 这是原生引擎 ``LOCALAI_ASR_PARALLEL`` 的服务层投影；调度器与适配器
     #: 都从它对齐，避免「调度开 2、引擎仍串行」的两套配置打架。
     asr_parallel: int = 2
@@ -607,8 +636,10 @@ class Config:
             _pick("LOCALAI_ENGINE_DIR", "INDEX_TTS_ENGINE_DIR", default=str(root / "engine"))
         ).expanduser()
 
-        ffmpeg, ffmpeg_source = _resolve_ffmpeg()
-        ffprobe, ffprobe_source = _resolve_ffprobe(ffmpeg)
+        # 本机专用路径只放 git 忽略的 config.json：代码里不预置任何机器路径。
+        config_data = load_config_file(root)
+        ffmpeg, ffmpeg_source = _resolve_ffmpeg(config_data)
+        ffprobe, ffprobe_source = _resolve_ffprobe(ffmpeg, config_data)
 
         backend = (_pick("LOCALAI_TTS_BACKEND", "TTS_BACKEND", default="engine") or "engine").lower()
         if backend not in ("engine", "comfy"):
@@ -768,7 +799,10 @@ class Config:
                 _pick(
                     "LOCALAI_COMFY_MODEL_DIR",
                     "INDEX_TTS_COMFY_MODEL_DIR",
-                    default=r"D:\Comfy-Desktop\视频\ComfyUI\models\TTS\IndexTTS-2.5",
+                    default=(
+                        _config_text(config_data, "comfy_model_dir")
+                        or str(root / "models" / "TTS" / "IndexTTS-2.5")
+                    ),
                 )
             ).expanduser(),
             comfy_base=(_pick("LOCALAI_COMFY_BASE", "COMFY_BASE", default="http://127.0.0.1:8188") or "").rstrip("/"),
@@ -812,8 +846,8 @@ class Config:
             token=(_pick("LOCALAI_TOKEN") or ""),
             model_search_paths=_pick_paths("LOCALAI_MODEL_SEARCH_PATHS"),
             log_level=(_pick("LOCALAI_LOG_LEVEL", default="INFO") or "INFO").upper(),
-            poll_interval=float(_pick("LOCALAI_POLL", "INDEX_TTS_POLL", default="0.4") or 0.4),
-            job_timeout=float(_pick("LOCALAI_TIMEOUT", "INDEX_TTS_TIMEOUT", default="180") or 180),
+            poll_interval=max(0.05, _pick_float(0.4, "LOCALAI_POLL", "INDEX_TTS_POLL")),
+            job_timeout=max(1.0, _pick_float(180.0, "LOCALAI_TIMEOUT", "INDEX_TTS_TIMEOUT")),
             jobs_recover=(
                 "fail"
                 if (_pick("LOCALAI_JOBS_RECOVER", default="requeue") or "requeue").strip().lower()
@@ -836,6 +870,16 @@ class Config:
             jobs_keep_uploads=_pick_bool(False, "LOCALAI_JOBS_KEEP_UPLOADS"),
             jobs_poll_interval=max(
                 0.05, _pick_float(0.2, "LOCALAI_JOBS_POLL")
+            ),
+            media_output_max_mb=max(
+                0, _pick_int(512, "LOCALAI_MEDIA_OUTPUT_MAX_MB")
+            ),
+            jobs_retention_days=max(0, _pick_int(30, "LOCALAI_JOBS_RETENTION_DAYS")),
+            output_retention_days=max(
+                0, _pick_int(30, "LOCALAI_OUTPUT_RETENTION_DAYS")
+            ),
+            tmp_retention_hours=max(
+                0, _pick_int(24, "LOCALAI_TMP_RETENTION_HOURS")
             ),
         )
 
@@ -1023,15 +1067,7 @@ class Config:
             "ffprobe_source": self.ffprobe_source,
             "vram_margin_mb": self.vram_margin_mb,
             "asr_parallel": self.asr_parallel_effective(),
-            "idle_unload": {
-                "tts": self.idle_unload,
-                "asr": self.asr_idle_unload,
-                "whisper": self.whisper_idle_unload,
-                "speaker": self.speaker_idle_unload,
-                "separate": self.separate_idle_unload,
-                "translate": self.translate_idle_unload,
-                "vision": self.vision_idle_unload,
-            },
+            "idle_unload": self.idle_unload_map(),
             "auth_required": bool(self.token),
             "jobs": {
                 "db_path": str(self.jobs_db_path),
@@ -1043,6 +1079,22 @@ class Config:
                 "timeout_seconds": self.jobs_timeout,
                 "keep_uploads": self.jobs_keep_uploads,
             },
+        }
+
+    # ---- 空闲卸载 -------------------------------------------------------
+    def idle_unload_map(self) -> dict[str, int]:
+        """各能力的空闲卸载阈值（秒，0=关闭）。
+
+        适配器、/capabilities 与配置摘要都从这里取，新增能力只改这一处。
+        """
+        return {
+            "tts": self.idle_unload,
+            "asr": self.asr_idle_unload,
+            "whisper": self.whisper_idle_unload,
+            "speaker": self.speaker_idle_unload,
+            "separate": self.separate_idle_unload,
+            "translate": self.translate_idle_unload,
+            "vision": self.vision_idle_unload,
         }
 
     # ---- 任务队列并发度 -------------------------------------------------

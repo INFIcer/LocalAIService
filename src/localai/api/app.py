@@ -39,6 +39,7 @@ from ..core.errors import (
     VoiceNotFound,
 )
 from ..core.idle import IdleWatchdog
+from ..core.retention import retention_loop
 from ..core.vram import register_adapters
 from ..engines import build_registry
 from ..jobs import JobScheduler, JobStore
@@ -100,6 +101,10 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
         await scheduler.start()
         app.state.jobs_store = store
         app.state.scheduler = scheduler
+        # 启动时清理一次过期产物，之后每小时一次；关停时在关库之前取消。
+        app.state.retention_task = asyncio.create_task(
+            retention_loop(cfg, store), name="localai-retention"
+        )
 
         logger.info(
             "本地 AI 服务启动：backend=%s 音色目录=%s 输出目录=%s 监听=%s",
@@ -146,9 +151,8 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
             logger.info("媒体工具就绪：ffmpeg=%s", media_health.get("path"))
         else:
             logger.warning(
-                "媒体工具不可用：ffmpeg 未找到（期望 %s）。/media/* 与视频转写会失败；"
-                "可设置环境变量 LOCALAI_FFMPEG 指向 ffmpeg.exe。",
-                media_health.get("expected"),
+                "媒体工具不可用：ffmpeg 未找到。/media/* 与视频转写会失败；%s。",
+                media_health.get("hint", "可设置环境变量 LOCALAI_FFMPEG 指向 ffmpeg.exe"),
             )
 
         logger.info("声纹模型状态：%s", registry.get("speaker").status()["detail"])
@@ -191,6 +195,13 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
                     await scheduler.stop()
                 except Exception:  # noqa: BLE001 - 关停失败不阻塞退出
                     logger.exception("停止任务调度器时出错")
+            retention_task = getattr(app.state, "retention_task", None)
+            if retention_task is not None:
+                retention_task.cancel()
+                try:
+                    await retention_task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
             store = getattr(app.state, "jobs_store", None)
             if store is not None:
                 try:

@@ -4,6 +4,7 @@
 
 - ``POST /media/probe``  -> ``{ok, duration, format, audio, video, ...}``（multipart）
 - ``POST /media/to_wav`` -> audio/wav 二进制（16k 单声道 PCM16，multipart）
+  产物以文件流返回，超过 ``media_output_max_mb`` 时 413；响应发完即删临时产物。
 - ``POST /media/frames`` -> ``{ok, count, dir, frames[], preview_b64}``（multipart）
 - ``POST /media/audio``  -> audio/wav 或 audio/mpeg 二进制（multipart）
 - ``POST /media/scenes`` -> ``{ok, count, scenes[{time,score}], mode, windows, warnings}``
@@ -28,7 +29,8 @@ from typing import Any, Optional
 from urllib.parse import quote
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import Response
+from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 
 from ...jobs import prepare_payload
 from ..deps import get_cfg, get_registry, get_scheduler
@@ -39,6 +41,52 @@ from ..uploads import save_media_upload
 logger = logging.getLogger("localai.api.media")
 
 router = APIRouter(tags=["media"])
+
+
+def _output_limit_bytes(cfg: Any) -> int:
+    """转码产物单次返回上限（字节）；0 表示不限制。"""
+    max_mb = int(getattr(cfg, "media_output_max_mb", 0) or 0)
+    return max_mb * 1024 * 1024 if max_mb > 0 else 0
+
+
+def _ensure_output_size(path: Path, limit: int, label: str) -> int:
+    """产物超过上限时抛 413，错误信息给出可操作建议；返回字节数。"""
+    size = path.stat().st_size
+    if limit and size > limit:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"{label} {size / 1048576:.1f}MB 超过单次返回上限 "
+                f"{limit / 1048576:.0f}MB；请缩短输入，或调大 "
+                "LOCALAI_MEDIA_OUTPUT_MAX_MB（0=不限制）"
+            ),
+        )
+    return size
+
+
+def _serve_file(
+    path: Path,
+    *,
+    media_type: str,
+    headers: dict[str, str],
+    cleanup_parent: Optional[Path] = None,
+) -> FileResponse:
+    """流式返回产物，响应发完后删除文件（及可选的空目录）。"""
+
+    def _cleanup() -> None:
+        path.unlink(missing_ok=True)
+        if cleanup_parent is not None:
+            try:
+                cleanup_parent.rmdir()
+            except OSError:
+                pass
+
+    return FileResponse(
+        path,
+        media_type=media_type,
+        headers=headers,
+        background=BackgroundTask(_cleanup),
+    )
 
 
 @router.post("/media/probe", summary="读取媒体信息")
@@ -67,18 +115,24 @@ async def media_probe_endpoint(
 async def media_to_wav_endpoint(
     request: Request,
     file: UploadFile = File(..., description="任意音频或视频文件"),
-) -> Response:
+) -> FileResponse:
     cfg = get_cfg(request)
     media = get_registry(request).get("media")
     tmp_path = await save_media_upload(cfg, file, "to_wav")
-    converted: Optional[dict[str, Any]] = None
     try:
         converted = await media.call("to_wav16k", str(tmp_path))
-        wav_bytes = Path(converted["path"]).read_bytes()
-    finally:
+    except BaseException:
         tmp_path.unlink(missing_ok=True)
-        if converted is not None:
-            Path(converted["path"]).unlink(missing_ok=True)
+        raise
+    tmp_path.unlink(missing_ok=True)
+    out_path = Path(converted["path"])
+    try:
+        size = _ensure_output_size(
+            out_path, _output_limit_bytes(cfg), "转码产物"
+        )
+    except BaseException:
+        out_path.unlink(missing_ok=True)
+        raise
 
     stem = Path(file.filename or "audio").stem or "audio"
     download_name = f"{stem}_16k.wav"
@@ -95,10 +149,10 @@ async def media_to_wav_endpoint(
     logger.info(
         "媒体转 wav：%s -> %s 字节，时长=%ss",
         Path(file.filename or "").name,
-        len(wav_bytes),
+        size,
         converted["duration"],
     )
-    return Response(content=wav_bytes, media_type="audio/wav", headers=headers)
+    return _serve_file(out_path, media_type="audio/wav", headers=headers)
 
 
 @router.post("/media/frames", summary="按数量/时间点/fps 抽帧")
@@ -180,7 +234,7 @@ async def media_audio_endpoint(
     request: Request,
     file: UploadFile = File(..., description="要抽音轨的音频或视频文件"),
     format: str = Form("wav", description="wav（保留原采样率）或 mp3"),
-) -> Response:
+) -> FileResponse:
     cfg = get_cfg(request)
     media = get_registry(request).get("media")
     audio_format = (format or "wav").strip().lower()
@@ -188,19 +242,32 @@ async def media_audio_endpoint(
         raise HTTPException(status_code=400, detail="format 只支持 wav 或 mp3")
 
     tmp_path = await save_media_upload(cfg, file, "audio")
-    result: Optional[dict[str, Any]] = None
     out_dir = cfg.media_tmp_dir / f"extract_{uuid.uuid4().hex}"
-    try:
-        result = await media.call("extract_audio", str(tmp_path), str(out_dir), fmt=audio_format)
-        audio_bytes = Path(result["path"]).read_bytes()
-    finally:
-        tmp_path.unlink(missing_ok=True)
-        if result is not None:
-            Path(result["path"]).unlink(missing_ok=True)
+
+    def _cleanup_work() -> None:
         try:
             out_dir.rmdir()
         except OSError:
             pass
+
+    try:
+        result = await media.call(
+            "extract_audio", str(tmp_path), str(out_dir), fmt=audio_format
+        )
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        _cleanup_work()
+        raise
+    tmp_path.unlink(missing_ok=True)
+    out_path = Path(result["path"])
+    try:
+        size = _ensure_output_size(
+            out_path, _output_limit_bytes(cfg), "抽取的音轨"
+        )
+    except BaseException:
+        out_path.unlink(missing_ok=True)
+        _cleanup_work()
+        raise
 
     media_type = "audio/wav" if audio_format == "wav" else "audio/mpeg"
     stem = Path(file.filename or "audio").stem or "audio"
@@ -218,11 +285,16 @@ async def media_audio_endpoint(
         "抽音轨：%s -> %s（%s 字节，%sHz/%s 声道）",
         Path(file.filename or "").name,
         audio_format,
-        len(audio_bytes),
+        size,
         result.get("sample_rate"),
         result.get("channels"),
     )
-    return Response(content=audio_bytes, media_type=media_type, headers=headers)
+    return _serve_file(
+        out_path,
+        media_type=media_type,
+        headers=headers,
+        cleanup_parent=out_dir,
+    )
 
 
 @router.post("/media/scenes", summary="场景/镜头边界检测（ffmpeg scene 分数）")

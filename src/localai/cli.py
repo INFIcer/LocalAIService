@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import API_VERSION, __version__
-from .config import DEFAULT_FFMPEG, Config, get_config
+from .config import Config, get_config
 from .constants import MODEL_SPECS, REQUIRED_AUX_FILES, REQUIRED_MODEL_FILES
 
 # Demucs 官方权重（不在 ModelScope 上，单独按 URL 下载）。
@@ -413,7 +413,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if cfg.ffmpeg and Path(cfg.ffmpeg).is_file():
         print(f"       {OK} ffmpeg  {cfg.ffmpeg}（来源：{cfg.ffmpeg_source}）")
     else:
-        print(f"       {FAIL} 找不到 ffmpeg；期望 {DEFAULT_FFMPEG}，或设置 LOCALAI_FFMPEG")
+        print(
+            f"       {FAIL} 找不到 ffmpeg；把 ffmpeg.exe 路径写进 config.json 的 ffmpeg 字段，"
+            "或设置环境变量 LOCALAI_FFMPEG，或把 ffmpeg 加入 PATH"
+        )
         problems += 1
     if cfg.ffprobe and Path(cfg.ffprobe).is_file():
         print(f"       {OK} ffprobe {cfg.ffprobe}（来源：{cfg.ffprobe_source}）")

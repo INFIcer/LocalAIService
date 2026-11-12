@@ -29,7 +29,7 @@ import logging
 import sqlite3
 import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -470,39 +470,56 @@ class JobStore:
         return await asyncio.to_thread(self._stats_sync)
 
     def _stats_sync(self) -> dict[str, Any]:
+        """任务统计：全部用 SQL 聚合，历史再长也不把整张表读进内存。"""
         with self._lock:
-            rows = self._connection().execute("SELECT * FROM jobs").fetchall()
-        by_state = {state: 0 for state in JOB_STATES}
-        by_kind: dict[str, int] = {}
-        queued_by_kind: dict[str, int] = {}
-        running_by_kind: dict[str, int] = {}
-        waits_ms: list[float] = []
-        runs_ms: list[float] = []
-        oldest_queued: Optional[datetime] = None
-        now = datetime.now().astimezone()
+            conn = self._connection()
+            by_state = {state: 0 for state in JOB_STATES}
+            for row in conn.execute(
+                "SELECT state, COUNT(*) AS n FROM jobs GROUP BY state"
+            ):
+                by_state[str(row["state"])] = int(row["n"])
+            by_kind = {
+                str(row["kind"]): int(row["n"])
+                for row in conn.execute(
+                    "SELECT kind, COUNT(*) AS n FROM jobs GROUP BY kind"
+                )
+            }
+            queued_by_kind = {
+                str(row["kind"]): int(row["n"])
+                for row in conn.execute(
+                    "SELECT kind, COUNT(*) AS n FROM jobs"
+                    " WHERE state = 'queued' GROUP BY kind"
+                )
+            }
+            running_by_kind = {
+                str(row["kind"]): int(row["n"])
+                for row in conn.execute(
+                    "SELECT kind, COUNT(*) AS n FROM jobs"
+                    " WHERE state = 'running' GROUP BY kind"
+                )
+            }
+            wait_row = conn.execute(
+                "SELECT AVG((julianday(started_at) - julianday(created_at))"
+                " * 86400000.0) AS avg_wait FROM jobs"
+                " WHERE started_at IS NOT NULL AND created_at IS NOT NULL"
+            ).fetchone()
+            run_row = conn.execute(
+                "SELECT AVG((julianday(finished_at) - julianday(started_at))"
+                " * 86400000.0) AS avg_run FROM jobs"
+                " WHERE finished_at IS NOT NULL AND started_at IS NOT NULL"
+            ).fetchone()
+            oldest_row = conn.execute(
+                "SELECT (julianday('now') - julianday(MIN(created_at)))"
+                " * 86400.0 AS age FROM jobs WHERE state = 'queued'"
+            ).fetchone()
 
-        for row in rows:
-            state = str(row["state"])
-            kind = str(row["kind"])
-            by_state[state] = by_state.get(state, 0) + 1
-            by_kind[kind] = by_kind.get(kind, 0) + 1
-            if state == "queued":
-                queued_by_kind[kind] = queued_by_kind.get(kind, 0) + 1
-                created = _parse_iso(row["created_at"])
-                if created is not None and (oldest_queued is None or created < oldest_queued):
-                    oldest_queued = created
-            if state == "running":
-                running_by_kind[kind] = running_by_kind.get(kind, 0) + 1
-            created = _parse_iso(row["created_at"])
-            started = _parse_iso(row["started_at"])
-            finished = _parse_iso(row["finished_at"])
-            if created is not None and started is not None:
-                waits_ms.append(max(0.0, (started - created).total_seconds() * 1000))
-            if started is not None and finished is not None:
-                runs_ms.append(max(0.0, (finished - started).total_seconds() * 1000))
+        avg_wait = float(wait_row["avg_wait"] or 0.0) if wait_row else 0.0
+        avg_run = float(run_row["avg_run"] or 0.0) if run_row else 0.0
+        oldest_age = float(oldest_row["age"] or 0.0) if oldest_row else 0.0
+        total = sum(by_state.values())
 
         return {
-            "total": len(rows),
+            "total": total,
             "queued": by_state.get("queued", 0),
             "running": by_state.get("running", 0),
             "done": by_state.get("done", 0),
@@ -512,14 +529,42 @@ class JobStore:
             "by_kind": by_kind,
             "queued_by_kind": queued_by_kind,
             "running_by_kind": running_by_kind,
-            "avg_wait_ms": round(sum(waits_ms) / len(waits_ms), 1) if waits_ms else 0.0,
-            "avg_run_ms": round(sum(runs_ms) / len(runs_ms), 1) if runs_ms else 0.0,
-            "oldest_queued_seconds": (
-                round(max(0.0, (now - oldest_queued).total_seconds()), 1)
-                if oldest_queued is not None
-                else 0.0
-            ),
+            "avg_wait_ms": round(max(0.0, avg_wait), 1),
+            "avg_run_ms": round(max(0.0, avg_run), 1),
+            "oldest_queued_seconds": round(max(0.0, oldest_age), 1),
         }
+
+    # ------------------------------------------------------------------
+    # 历史清理
+    # ------------------------------------------------------------------
+    async def prune(self, older_than_days: int) -> int:
+        """删除超过保留期的终态任务；返回删除行数（0=不清理）。
+
+        只删 done/failed/canceled：排队中或执行中的任务永远不会被清掉。
+        """
+        return await asyncio.to_thread(self._prune_sync, older_than_days)
+
+    def _prune_sync(self, older_than_days: int) -> int:
+        if older_than_days <= 0:
+            return 0
+        cutoff = (
+            datetime.now().astimezone() - timedelta(days=older_than_days)
+        ).isoformat(timespec="milliseconds")
+        with self._lock:
+            conn = self._connection()
+            cursor = conn.execute(
+                "DELETE FROM jobs WHERE state IN (?, ?, ?)"
+                " AND COALESCE(finished_at, created_at) < ?",
+                (*TERMINAL_STATES, cutoff),
+            )
+            deleted = int(cursor.rowcount or 0)
+            conn.commit()
+            if deleted:
+                # 删除大量行后 VACUUM 回收文件空间；必须在事务外执行。
+                conn.execute("VACUUM")
+        if deleted:
+            logger.info("任务历史清理：删除 %d 条终态记录（保留 %d 天）", deleted, older_than_days)
+        return deleted
 
     # ------------------------------------------------------------------
     # 崩溃恢复

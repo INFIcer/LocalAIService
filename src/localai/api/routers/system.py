@@ -12,9 +12,12 @@ from fastapi.responses import JSONResponse
 
 from ... import API_VERSION, __version__
 from ...constants import (
+    AUDIO_MAX_BYTES,
+    MEDIA_MAX_BYTES,
     TRANSLATE_BATCH_CHARS,
     TRANSLATE_BATCH_MAX,
     TRANSLATE_MAX_TEXT,
+    TTS_MAX_TEXT,
 )
 from ...core.voices import scan_voices
 from ..deps import get_cfg, get_client, get_registry, get_vram_manager
@@ -29,6 +32,8 @@ async def health(request: Request) -> dict[str, Any]:
     registry = get_registry(request)
     vram = get_vram_manager(request)
     media = registry.get("media")
+    # 各能力的空闲卸载阈值统一来自 config.idle_unload_map()。
+    idle = cfg.idle_unload_map()
 
     # ASR / 声纹状态只读文件/内存标志，不会触发加载。
     # 显存数字走 1 秒缓存 + nvidia-smi，避免 /health 触发 CUDA context。
@@ -40,7 +45,7 @@ async def health(request: Request) -> dict[str, Any]:
         "ready": bool(asr["ready"]),
         "loaded": bool(asr["loaded"]),
         "engine": cfg.asr_engine,
-        "idle_unload_seconds": cfg.asr_idle_unload,
+        "idle_unload_seconds": idle["asr"],
         "vad": asr.get("vad"),
     }
     whisper = registry.get("whisper").status()
@@ -48,14 +53,14 @@ async def health(request: Request) -> dict[str, Any]:
         "ready": bool(whisper.get("ready")),
         "loaded": bool(whisper.get("loaded")),
         "model": whisper.get("model") or f"faster-whisper-{cfg.whisper_model}",
-        "idle_unload_seconds": cfg.whisper_idle_unload,
+        "idle_unload_seconds": idle["whisper"],
     }
     translate_status = registry.get("translate").status()
     translate_health = {
         "ready": bool(translate_status.get("ready")),
         "loaded": bool(translate_status.get("loaded")),
         "model": translate_status.get("model") or "nllb-200-distilled-600M",
-        "idle_unload_seconds": cfg.translate_idle_unload,
+        "idle_unload_seconds": idle["translate"],
         "device": translate_status.get("device"),
         "dtype": translate_status.get("dtype"),
     }
@@ -63,13 +68,13 @@ async def health(request: Request) -> dict[str, Any]:
     speaker_health = {
         "ready": bool(spk["ready"]),
         "loaded": bool(spk["loaded"]),
-        "idle_unload_seconds": cfg.speaker_idle_unload,
+        "idle_unload_seconds": idle["speaker"],
     }
     sep = registry.get("separate").status()
     separate_health = {
         "ready": bool(sep["ready"]),
         "loaded": bool(sep["loaded"]),
-        "idle_unload_seconds": cfg.separate_idle_unload,
+        "idle_unload_seconds": idle["separate"],
         "model": sep.get("loaded_model") or sep.get("model") or "htdemucs",
     }
     vision_status = registry.get("vision").status()
@@ -80,7 +85,7 @@ async def health(request: Request) -> dict[str, Any]:
         "runtime": vision_status.get("runtime"),
         "runtime_version": vision_status.get("runtime_version"),
         "port": vision_status.get("port"),
-        "idle_unload_seconds": cfg.vision_idle_unload,
+        "idle_unload_seconds": idle["vision"],
         "model_size_mb": vision_status.get("model_size_mb"),
         "mmproj_size_mb": vision_status.get("mmproj_size_mb"),
         "detail": vision_status.get("detail"),
@@ -107,50 +112,8 @@ async def health(request: Request) -> dict[str, Any]:
         else {"queued": 0, "running": 0, "current_kind": None}
     )
 
-    if cfg.tts_backend == "engine":
-        tts = registry.get("tts")
-        status = tts.status()
-        voices = scan_voices()
-        idle = tts.idle_seconds()
-        return {
-            "ok": bool(status["ready"]),
-            "backend": "engine",
-            "model_ready": bool(status["ready"]),
-            "engine_loaded": bool(status.get("loaded")),
-            "voices": len(voices),
-            "model_detail": status["detail"],
-            "model_dir": status["model_dir"],
-            "engine_dir": str(cfg.engine_dir),
-            "idle_unload_seconds": cfg.idle_unload,
-            "idle_seconds": None if idle is None else round(idle, 1),
-            "asr": asr_health,
-            "whisper": whisper_health,
-            "translate": translate_health,
-            "speaker": speaker_health,
-            "separate": separate_health,
-            "download": download_health,
-            "vision": vision_health,
-            "vram": vram_health,
-            "media": media.health(),
-            "comfy": "disabled",
-            "jobs": jobs_health,
-        }
-
-    # TTS_BACKEND=comfy：health 的 ok 表示「ComfyUI 可达」。
-    from ...engines.tts_comfy import comfy_up
-
-    client = get_client(request)
-    up = await comfy_up(client, cfg)
-    status = registry.get("tts").status()
-    voices = scan_voices()
-    return {
-        "ok": up,
-        "backend": "comfy",
-        "comfy": "up" if up else "down",
-        "model_ready": status["ready"],
-        "voices": len(voices),
-        "model_detail": status["detail"],
-        "comfy_url": cfg.comfy_base,
+    # 与后端无关的部分只写一次；两种 backend 都给出同一组字段。
+    common: dict[str, Any] = {
         "asr": asr_health,
         "whisper": whisper_health,
         "translate": translate_health,
@@ -161,6 +124,45 @@ async def health(request: Request) -> dict[str, Any]:
         "vram": vram_health,
         "media": media.health(),
         "jobs": jobs_health,
+    }
+    tts_status = registry.get("tts").status()
+    voices = scan_voices()
+
+    if cfg.tts_backend == "engine":
+        tts_idle = registry.get("tts").idle_seconds()
+        return {
+            "ok": bool(tts_status["ready"]),
+            "backend": "engine",
+            "model_ready": bool(tts_status["ready"]),
+            "engine_loaded": bool(tts_status.get("loaded")),
+            "voices": len(voices),
+            "model_detail": tts_status["detail"],
+            "model_dir": tts_status.get("model_dir"),
+            "engine_dir": str(cfg.engine_dir),
+            "idle_unload_seconds": idle["tts"],
+            "idle_seconds": None if tts_idle is None else round(tts_idle, 1),
+            "comfy": "disabled",
+            **common,
+        }
+
+    # TTS_BACKEND=comfy：health 的 ok 表示「ComfyUI 可达」。
+    from ...engines.tts_comfy import comfy_up
+
+    client = get_client(request)
+    up = await comfy_up(client, cfg)
+    return {
+        "ok": up,
+        "backend": "comfy",
+        "comfy": "up" if up else "down",
+        "comfy_url": cfg.comfy_base,
+        "model_ready": bool(tts_status["ready"]),
+        "voices": len(voices),
+        "model_detail": tts_status["detail"],
+        "model_dir": tts_status.get("model_dir") or str(cfg.comfy_model_dir),
+        "engine_dir": str(cfg.engine_dir),
+        "idle_unload_seconds": idle["tts"],
+        "idle_seconds": None,
+        **common,
     }
 
 
@@ -174,6 +176,7 @@ async def capabilities(request: Request) -> dict[str, Any]:
     cfg = get_cfg(request)
     registry = get_registry(request)
     vram = get_vram_manager(request)
+    idle = cfg.idle_unload_map()
     free_mb, total_mb = vram.health_memory()
 
     caps = {adapter.name: adapter.describe() for adapter in registry.all()}
@@ -210,7 +213,7 @@ async def capabilities(request: Request) -> dict[str, Any]:
                 "device": cfg.whisper_device,
                 "compute_type": cfg.whisper_compute,
                 "weights_dir": str(cfg.whisper_weights_dir(cfg.whisper_model)),
-                "idle_unload_seconds": cfg.whisper_idle_unload,
+                "idle_unload_seconds": idle["whisper"],
             },
         },
         "auth": {"required": bool(cfg.token), "scheme": "bearer"},
@@ -236,7 +239,7 @@ async def capabilities(request: Request) -> dict[str, Any]:
             **registry.get("vision").status(),
             "planner_default": cfg.vision_planner,
             "planners": ["hybrid", "agent"],
-            "idle_unload_seconds": cfg.vision_idle_unload,
+            "idle_unload_seconds": idle["vision"],
             "phash_distance": cfg.vision_phash_distance,
             "prompts_dir": str(Path(cfg.home) / "docs" / "prompts"),
             "endpoints": [
@@ -253,7 +256,7 @@ async def capabilities(request: Request) -> dict[str, Any]:
             "engine": "nllb",
             "model": "nllb-200-distilled-600M",
             "weights_dir": str(cfg.translate_weight_dir),
-            "idle_unload_seconds": cfg.translate_idle_unload,
+            "idle_unload_seconds": idle["translate"],
             "fp16": cfg.translate_fp16,
             "num_beams": cfg.translate_num_beams,
             "batch_size": cfg.translate_batch_size,
@@ -289,25 +292,15 @@ async def capabilities(request: Request) -> dict[str, Any]:
             "recover": cfg.jobs_recover,
         },
         "concurrency": {
-            "upload_max_mb": 200,
-            "audio_upload_max_mb": 50,
-            "tts_max_text_chars": 5000,
+            "upload_max_mb": MEDIA_MAX_BYTES // (1024 * 1024),
+            "audio_upload_max_mb": AUDIO_MAX_BYTES // (1024 * 1024),
+            "tts_max_text_chars": TTS_MAX_TEXT,
             "translate_max_text_chars": TRANSLATE_MAX_TEXT,
             "translate_batch_max_items": TRANSLATE_BATCH_MAX,
             "translate_batch_max_chars": TRANSLATE_BATCH_CHARS,
             "job_timeout_seconds": cfg.job_timeout,
         },
-        "defaults": {
-            "idle_unload_seconds": {
-                "tts": cfg.idle_unload,
-                "asr": cfg.asr_idle_unload,
-                "whisper": cfg.whisper_idle_unload,
-                "speaker": cfg.speaker_idle_unload,
-                "separate": cfg.separate_idle_unload,
-                "translate": cfg.translate_idle_unload,
-                "vision": cfg.vision_idle_unload,
-            },
-        },
+        "defaults": {"idle_unload_seconds": idle},
         "files": {
             "voices_dir": str(cfg.voices_dir),
             "output_dir": str(cfg.output_dir),

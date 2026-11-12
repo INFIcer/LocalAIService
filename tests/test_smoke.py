@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from pathlib import Path
+from unittest import mock
 
 import pytest
 import soundfile as sf
@@ -20,7 +22,8 @@ from fastapi.testclient import TestClient
 
 from localai import API_VERSION, __version__
 from localai.api.app import app
-from localai.config import CONFIG, get_config
+from localai.config import CONFIG, Config, get_config
+from localai.constants import AUDIO_MAX_BYTES, MEDIA_MAX_BYTES, TTS_MAX_TEXT
 from localai.core.audio import audio_headers
 from localai.core.voices import scan_voices
 
@@ -91,10 +94,19 @@ def test_health_shape(client: TestClient) -> None:
         "engine_loaded",
         "voices",
         "asr",
+        "whisper",
+        "translate",
         "speaker",
         "separate",
+        "download",
+        "vision",
         "vram",
         "media",
+        "jobs",
+        "model_dir",
+        "engine_dir",
+        "idle_unload_seconds",
+        "idle_seconds",
     ):
         assert key in body
     assert body["backend"] in ("engine", "comfy")
@@ -124,6 +136,31 @@ def test_capabilities(client: TestClient) -> None:
     assert caps["media"]["requires_gpu"] is False
     assert caps["asr"]["parallel"]["capacity"] == get_config().asr_parallel
     assert body["jobs"]["asr_parallel"] == get_config().asr_parallel
+
+
+def test_capabilities_limits_follow_constants(client: TestClient) -> None:
+    body = client.get("/capabilities").json()
+    concurrency = body["concurrency"]
+    assert concurrency["upload_max_mb"] == MEDIA_MAX_BYTES // (1024 * 1024)
+    assert concurrency["audio_upload_max_mb"] == AUDIO_MAX_BYTES // (1024 * 1024)
+    assert concurrency["tts_max_text_chars"] == TTS_MAX_TEXT
+    # 空闲卸载秒数只有 idle_unload_map() 一个出处。
+    assert body["defaults"]["idle_unload_seconds"] == get_config().idle_unload_map()
+
+
+def test_ffmpeg_path_comes_from_config_json(tmp_path: Path) -> None:
+    """本机路径来自 config.json，而不是代码里写死的常量。"""
+    fake = tmp_path / "ffmpeg.exe"
+    fake.write_bytes(b"stub")
+    (tmp_path / "config.json").write_text(
+        json.dumps({"ffmpeg": str(fake)}), encoding="utf-8"
+    )
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("LOCALAI_FFMPEG", None)
+        os.environ.pop("INDEX_TTS_FFMPEG", None)
+        cfg = Config.from_env(home=str(tmp_path))
+    assert cfg.ffmpeg == fake
+    assert cfg.ffmpeg_source == "file"
 
 
 def test_asr_status_exposes_parallel_config(client: TestClient) -> None:

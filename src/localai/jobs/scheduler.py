@@ -68,6 +68,9 @@ _PARALLEL_KINDS = ("tts", "asr", "separate")
 class JobScheduler:
     """单 worker 调度循环（一个循环派发多个同 kind 任务）；随 lifespan 启停。"""
 
+    #: 超时后等底层调用退出的宽限期（秒）；超过就放弃等待、记告警。
+    _TIMEOUT_GRACE_SECONDS = 5.0
+
     def __init__(
         self,
         cfg: Config,
@@ -99,6 +102,8 @@ class JobScheduler:
         self._errors: OrderedDict[str, BaseException] = OrderedDict()
         #: OOM 后被临时降级到 1 的 kind -> 原因
         self._degraded: dict[str, str] = {}
+        #: 超时后仍不退出、已被放弃等待的执行任务：job_id -> Task
+        self._stuck: dict[str, asyncio.Task[Any]] = {}
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -155,6 +160,29 @@ class JobScheduler:
         if running:
             with contextlib.suppress(Exception):
                 await asyncio.gather(*running, return_exceptions=True)
+        # 超时后被放弃等待的任务也要取消，避免退出后线程还在跑。
+        # 只等一个宽限期：真卡在底层阻塞调用里的任务取消不掉，不能拖住退出。
+        stuck = list(self._stuck.items())
+        for _job_id, item in stuck:
+            item.cancel()
+        if stuck:
+            done, pending = await asyncio.wait(
+                [item for _job_id, item in stuck],
+                timeout=self._TIMEOUT_GRACE_SECONDS,
+            )
+            for finished in done:
+                with contextlib.suppress(BaseException):
+                    finished.exception()
+            if pending:
+                logger.warning(
+                    "退出时仍有 %d 个超时任务未结束（底层调用无法取消）：%s",
+                    len(pending),
+                    "、".join(
+                        job_id
+                        for job_id, item in stuck
+                        if item in pending
+                    ),
+                )
         logger.info(
             "任务调度器已停止（当前运行中：%s）",
             "、".join(self._running) if self._running else "-",
@@ -618,7 +646,13 @@ class JobScheduler:
     async def _execute_once(
         self, job: dict[str, Any]
     ) -> tuple[Optional[dict[str, Any]], Optional[BaseException]]:
-        """执行一次；返回 (结果, 异常)。超时在这里直接置 failed。"""
+        """执行一次；返回 (结果, 异常)。超时在这里直接置 failed。
+
+        超时后先取消执行任务（asyncio 取消会立刻从 await 处抛出，释放锁与
+        名额），再最多等 _TIMEOUT_GRACE_SECONDS 让它走完 finally；仍不退出
+        就登记到 _stuck、后台等它结束并记告警——一个卡死的底层调用不会把
+        调度循环永久堵住。
+        """
         job_id = job["id"]
         kind = job["kind"]
         timeout = self.cfg.job_timeout_for(kind)
@@ -634,16 +668,26 @@ class JobScheduler:
             if not done:
                 message = f"任务超时（{timeout:.0f} 秒）"
                 await self.store.fail(job_id, message)
+                exec_task.cancel()
                 logger.error(
-                    "任务超时：id=%s kind=%s 超过 %.0fs，已置 failed；等待底层调用退出",
+                    "任务超时：id=%s kind=%s 超过 %.0fs，已置 failed；取消底层调用"
+                    "并最多等 %.0fs 退出",
                     job_id,
                     kind,
                     timeout,
+                    self._TIMEOUT_GRACE_SECONDS,
                 )
-                # GPU 调用无法强杀：等它真正退出，避免下一个任务和它抢显存。
-                with contextlib.suppress(BaseException):
-                    await exec_task
+                done_after, _pending_after = await asyncio.wait(
+                    {exec_task}, timeout=self._TIMEOUT_GRACE_SECONDS
+                )
+                if not done_after:
+                    self._track_stuck(job_id, kind, exec_task)
                 return None, JobTimeoutError(message)
+            exc = exec_task.exception()
+            if exc is not None:
+                if isinstance(exc, asyncio.CancelledError):
+                    raise exc
+                return None, exc
             return exec_task.result(), None
         except asyncio.CancelledError:
             exec_task.cancel()
@@ -652,6 +696,29 @@ class JobScheduler:
             raise
         except BaseException as exc:  # noqa: BLE001 - 记录到 DB，再由 waiter 重抛
             return None, exc
+
+    def _track_stuck(
+        self, job_id: str, kind: str, task: asyncio.Task[Any]
+    ) -> None:
+        """登记超时后仍不退出、已放弃等待的执行任务。"""
+        self._stuck[job_id] = task
+
+        def _done(finished: asyncio.Task[Any]) -> None:
+            self._stuck.pop(job_id, None)
+            if finished.cancelled():
+                logger.warning(
+                    "超时任务最终已退出：id=%s kind=%s（取消生效）", job_id, kind
+                )
+                return
+            error = finished.exception()
+            logger.warning(
+                "超时任务最终已退出：id=%s kind=%s（%s）",
+                job_id,
+                kind,
+                f"{type(error).__name__}: {error}" if error else "正常返回",
+            )
+
+        task.add_done_callback(_done)
 
     async def _degrade_after_oom(self, kind: str, error: BaseException) -> None:
         """并行撞 OOM：该 kind 并行临时降为 1，卸载其它模型腾空间。"""

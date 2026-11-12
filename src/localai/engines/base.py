@@ -123,15 +123,7 @@ class BaseAdapter(ABC):
 
     def idle_unload_seconds(self) -> int:
         """本能力的空闲卸载阈值（秒，0=关闭）。"""
-        return {
-            "tts": self.cfg.idle_unload,
-            "asr": self.cfg.asr_idle_unload,
-            "whisper": self.cfg.whisper_idle_unload,
-            "speaker": self.cfg.speaker_idle_unload,
-            "separate": self.cfg.separate_idle_unload,
-            "translate": self.cfg.translate_idle_unload,
-            "vision": self.cfg.vision_idle_unload,
-        }.get(self.name, 0)
+        return self.cfg.idle_unload_map().get(self.name, 0)
 
     # ------------------------------------------------------------------
     # 自描述（/capabilities）

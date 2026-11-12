@@ -35,7 +35,15 @@ from localai.jobs.store import JobStore, NewJob
 
 def _make_cfg(tmp_path: Path) -> Config:
     cfg = Config.from_env(home=str(tmp_path))
-    cfg = dataclasses.replace(cfg, jobs_timeout=5.0, jobs_poll_interval=0.03)
+    # 用例里直接造了 2026-01 的历史终态记录；关掉保留期清理，避免启动时被删。
+    cfg = dataclasses.replace(
+        cfg,
+        jobs_timeout=5.0,
+        jobs_poll_interval=0.03,
+        jobs_retention_days=0,
+        output_retention_days=0,
+        tmp_retention_hours=0,
+    )
     cfg.export_env()
     return cfg
 

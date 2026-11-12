@@ -1,7 +1,7 @@
 """媒体适配器：ffmpeg（探测 / 转 16k wav / 抽帧 / 抽音轨）。
 
 不占显存、不加载模型；ffmpeg 路径由 :mod:`localai.config` 统一探测
-（``LOCALAI_FFMPEG`` -> 本机默认路径 -> PATH）。
+（``LOCALAI_FFMPEG`` -> config.json 的 ``ffmpeg`` 字段 -> PATH）。
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ from typing import Any
 
 from fastapi import HTTPException
 
-from ..config import DEFAULT_FFMPEG
 from ._native import import_engine_module
 from .base import BaseAdapter
 
@@ -57,7 +56,10 @@ class MediaAdapter(BaseAdapter):
                 "detail": f"媒体模块不可用：{exc}",
             }
         if info.get("ffmpeg") != "ok":
-            info.setdefault("expected", DEFAULT_FFMPEG)
+            info.setdefault(
+                "hint",
+                "把 ffmpeg.exe 的完整路径写进 config.json 的 ffmpeg 字段，或设置 LOCALAI_FFMPEG",
+            )
         info["ready"] = info.get("ffmpeg") == "ok"
         info["model"] = "ffmpeg"
         info["loaded"] = False
@@ -71,7 +73,10 @@ class MediaAdapter(BaseAdapter):
         except Exception as exc:  # noqa: BLE001 - health 不能让整个接口挂掉
             return {"ffmpeg": "missing", "path": None, "detail": f"媒体模块不可用：{exc}"}
         if info.get("ffmpeg") != "ok":
-            info.setdefault("expected", DEFAULT_FFMPEG)
+            info.setdefault(
+                "hint",
+                "把 ffmpeg.exe 的完整路径写进 config.json 的 ffmpeg 字段，或设置 LOCALAI_FFMPEG",
+            )
         return info
 
     @staticmethod
