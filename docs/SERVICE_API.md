@@ -151,6 +151,14 @@ curl -X POST "http://127.0.0.1:7880/asr" \
 
 手动释放显存，不影响后续请求（会按需重新加载）。
 
+请求体：
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `models` | string[] | `[]` | 要卸载的能力名；`all=true` 时忽略 |
+| `all` | bool | `false` | 卸载全部已加载的能力 |
+| `skip_busy` | bool | `true` | 正在推理的模型是否跳过。`true` 不阻塞请求：正在使用或 0.3 秒内拿不到推理锁就跳过；`false` 等推理结束后再卸 |
+
 ```bash
 curl -X POST http://127.0.0.1:7880/vram/unload \
   -H "Content-Type: application/json" -d '{"models":["tts","separate"]}'
@@ -158,7 +166,16 @@ curl -X POST http://127.0.0.1:7880/vram/unload \
   -H "Content-Type: application/json" -d '{"all":true}'
 ```
 
-返回：`{"ok":true,"released":["tts"],"free_mb":7360,"total_mb":8192}`。
+返回：
+
+```json
+{"ok":true,"released":["asr"],"skipped":["tts"],"free_mb":7360,"total_mb":8192}
+```
+
+- `released`：真正卸下的能力名；
+- `skipped`：正在使用、本轮跳过的能力名；`skip_busy=false` 时恒为空；
+- 未加载的能力两边都不出现。
+
 可选名字：`tts` / `asr` / `whisper` / `speaker` / `separate`；未知名字返回 400。
 
 ---
