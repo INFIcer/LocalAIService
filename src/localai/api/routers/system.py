@@ -336,6 +336,7 @@ async def vram_unload(payload: VramUnloadRequest, request: Request) -> dict[str,
     result = await vram.unload_models(
         None if payload.all else payload.models,
         unload_all=payload.all,
+        skip_busy=payload.skip_busy,
     )
     return result
 

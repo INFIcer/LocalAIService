@@ -49,6 +49,9 @@ class VramUnloadRequest(BaseModel):
 
     models: list[str] = Field(default_factory=list)
     all: bool = False
+    # HTTP 手动释放默认不等正在推理的模型：拿不到推理锁就跳过，
+    # 避免请求被长推理挂住；需要「必须腾出显存」时显式传 False。
+    skip_busy: bool = Field(True, description="是否跳过正在使用的模型（True 不阻塞请求）")
 
 
 class JobCreateRequest(BaseModel):

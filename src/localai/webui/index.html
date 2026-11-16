@@ -54,7 +54,13 @@
       <section id="view-overview" class="view active">
         <div class="overview-top">
           <div id="gpu-card" class="panel gpu-panel">
-            <div class="panel-head"><h2>GPU 显存</h2><span id="gpu-state" class="pill muted">读取中</span></div>
+            <div class="panel-head">
+              <h2>GPU 显存</h2>
+              <div class="gpu-actions">
+                <span id="gpu-state" class="pill muted">读取中</span>
+                <button id="vram-unload-btn" class="ghost small" type="button">释放显存</button>
+              </div>
+            </div>
             <div class="gpu-numbers"><strong id="gpu-used">--</strong><span id="gpu-total">/ -- MB</span></div>
             <div class="progress"><div id="gpu-bar" class="progress-fill"></div></div>
             <div class="gpu-meta"><span id="gpu-free">空闲 -- MB</span><span id="gpu-margin">安全余量 -- MB</span></div>

@@ -201,6 +201,7 @@ input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px r
 .overview-top { display: grid; grid-template-columns: minmax(280px, 1fr) minmax(320px, 1.6fr); gap: 16px; }
 .overview-bottom { display: grid; grid-template-columns: 1.35fr 1fr; gap: 16px; }
 .gpu-panel { margin-bottom: 16px; }
+.gpu-actions { display: inline-flex; align-items: center; gap: 8px; }
 .gpu-numbers { display: flex; align-items: baseline; gap: 8px; margin: 4px 0 12px; }
 .gpu-numbers strong { font-size: 28px; letter-spacing: -0.5px; }
 .gpu-numbers span { color: var(--muted); font-size: 13px; }

@@ -289,6 +289,45 @@ function renderGpu(vram, caps) {
   }
 }
 
+// 显存接口里的能力名 -> 界面短名（释放结果提示用）。
+const MODEL_SHORT_NAMES = {
+  tts: "语音合成",
+  asr: "语音识别",
+  whisper: "语音识别 whisper",
+  translate: "翻译",
+  speaker: "声纹",
+  separate: "人声分离",
+  vision: "视频画面分析",
+};
+
+function shortModelNames(names) {
+  return (Array.isArray(names) ? names : []).map((name) => MODEL_SHORT_NAMES[name] || name);
+}
+
+async function releaseVram() {
+  const button = $("#vram-unload-btn");
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = "正在释放…";
+  try {
+    const data = await api("/vram/unload", {
+      method: "POST",
+      body: JSON.stringify({ all: true, skip_busy: true }),
+    });
+    const released = shortModelNames(data && data.released);
+    const skipped = shortModelNames(data && data.skipped);
+    let message = released.length ? `已释放 ${released.join("、")}` : "没有可释放的模型";
+    if (skipped.length) message += `；有 ${skipped.length} 个模型正在使用，已跳过`;
+    toast(message, "ok", skipped.length ? 6000 : 4200);
+    await refreshOverview(true);
+  } catch (err) {
+    toast(err.message || String(err), "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = label;
+  }
+}
+
 function renderCapabilities(caps, vram) {
   const grid = $("#cap-grid");
   const capabilities = (caps && caps.capabilities) || {};
@@ -1746,6 +1785,7 @@ function bindEvents() {
     btn.addEventListener("click", () => switchView(btn.dataset.view));
   });
   $("#refresh-btn").addEventListener("click", () => loadView(state.view, false));
+  $("#vram-unload-btn").addEventListener("click", releaseVram);
   $("#auto-refresh").addEventListener("change", (event) => {
     state.autoRefresh = event.target.checked;
     toast(state.autoRefresh ? "自动刷新已开启" : "自动刷新已暂停", "ok", 1800);

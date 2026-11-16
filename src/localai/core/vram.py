@@ -47,6 +47,9 @@ logger = logging.getLogger("localai.vram")
 FALLBACK_TOTAL_MB = 8192.0
 # Windows 桌面/驱动的基础占用，兜底估算时减掉，宁可保守也不要盲目放行。
 FALLBACK_BASE_MB = 800.0
+# 手动释放显存（``skip_busy=True``）时等推理独占锁的上限（秒）。
+# 超时即视为模型正忙、本轮跳过，保证 HTTP 请求不会被长推理挂住。
+SKIP_BUSY_LOCK_TIMEOUT = 0.3
 
 
 def _async_lock(lock: Any) -> Any:
@@ -486,8 +489,19 @@ class VramManager:
         names: Optional[list[str]] = None,
         *,
         unload_all: bool = False,
+        skip_busy: bool = False,
     ) -> dict[str, Any]:
-        """手动卸载指定能力（或全部）；会等推理锁，不会卸到一半。"""
+        """手动卸载指定能力（或全部）。
+
+        ``skip_busy=False``（默认）：等推理锁，正在推理的模型卸载完才返回；
+        调度器的 OOM 降级与空闲回收走这条路径，必须真的腾出显存。
+
+        ``skip_busy=True``：给 HTTP 手动释放用。``entry.active > 0`` 或等待
+        独占锁超过 :data:`SKIP_BUSY_LOCK_TIMEOUT` 秒都记为跳过，请求不会被
+        正在跑的推理挂住。
+
+        返回值恒定包含 ``released`` 与 ``skipped``；未加载的能力两边都不出现。
+        """
         with self._lock:
             if unload_all:
                 targets = list(self._entries.values())
@@ -498,8 +512,16 @@ class VramManager:
                     if name in self._entries
                 ]
         released: list[str] = []
+        skipped: list[str] = []
         for entry in targets:
             if not entry.is_loaded():
+                continue
+            if skip_busy:
+                outcome = await self._unload_if_idle(entry)
+                if outcome == "released":
+                    released.append(entry.name)
+                elif outcome == "busy":
+                    skipped.append(entry.name)
                 continue
             async with _async_lock(entry.infer_lock):
                 if not entry.is_loaded():
@@ -519,9 +541,54 @@ class VramManager:
         return {
             "ok": True,
             "released": released,
+            "skipped": skipped,
             "free_mb": int(round(free_mb)),
             "total_mb": int(round(total_mb)),
         }
+
+    async def _unload_if_idle(self, entry: ModelEntry) -> str:
+        """尽力卸载一个能力，不等正在跑的推理。
+
+        返回 ``released`` / ``busy`` / ``noop``：
+
+        - ``busy``：``active > 0``，或独占锁在 :data:`SKIP_BUSY_LOCK_TIMEOUT`
+          秒内拿不到（有推理占着槽位）；
+        - ``noop``：卸载函数报错、或调用后仍显示已加载；
+        - ``released``：已确认从显存里卸下。
+        """
+        with self._lock:
+            if entry.active > 0:
+                return "busy"
+        lock_ctx = _async_lock(entry.infer_lock)
+        try:
+            # 用 wait_for 包住 __aenter__：超时即放弃，不等长推理跑完。
+            await asyncio.wait_for(
+                lock_ctx.__aenter__(), timeout=SKIP_BUSY_LOCK_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            return "busy"
+        try:
+            # 拿到锁后再查一次：检查与加锁之间可能刚有请求进来。
+            with self._lock:
+                if entry.active > 0:
+                    return "busy"
+            if not entry.is_loaded():
+                return "noop"
+            try:
+                await asyncio.to_thread(entry.unload_fn)
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning("手动卸载 %s 失败：%s", entry.name, exc)
+                return "noop"
+            if entry.is_loaded():
+                self.log.warning("手动卸载 %s 后仍显示已加载，跳过", entry.name)
+                return "noop"
+            with self._lock:
+                entry.last_used = None
+                entry.last_used_mono = None
+            self.log.info("手动释放：已卸掉 %s（忙的模型跳过）", entry.name)
+            return "released"
+        finally:
+            await lock_ctx.__aexit__(None, None, None)
 
     # ------------------------------------------------------------------
     # 诊断快照
