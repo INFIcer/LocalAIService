@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import argparse
+import os
 import socket
 import subprocess
 from pathlib import Path
@@ -181,6 +183,8 @@ def _make_controller(probe_state: str, monkeypatch: pytest.MonkeyPatch, tmp_path
         port=7899,
         home=tmp_path,
         probe=lambda port: probe_state,
+        # 探测与重启空窗的重试都用注入值，测试不碰真实网络。
+        health_wait=lambda port: probe_state,
         spawn=fake_spawn,
         shutdown_client=lambda: True,
     )
@@ -412,3 +416,266 @@ def test_tray_icon_asset_exists() -> None:
     header = icon.read_bytes()[:4]
     assert header[:2] == b"\x00\x00"
     assert header[2:4] == b"\x01\x00"
+
+
+# ---------------------------------------------------------------------------
+# 失败可见性、重复实例、首次启动提示、重启空窗
+# ---------------------------------------------------------------------------
+HEALTHY = {"ok": True, "backend": "engine", "jobs": {}, "vision": {}, "asr": {}}
+
+
+def _tray_app():
+    if os.name != "nt":
+        pytest.skip("托盘入口只在 Windows 上可用")
+    from localai.tray import app
+
+    return app
+
+
+def _winicon():
+    if os.name != "nt":
+        pytest.skip("通知区图标只在 Windows 上可用")
+    from localai.tray import winicon
+
+    return winicon
+
+
+def _reset_tray_log(app) -> None:
+    """_configure_logging 只在没有 handler 时挂新的；测试间要清掉上一个临时目录的句柄。"""
+    for handler in list(app.log.handlers):
+        app.log.removeHandler(handler)
+        handler.close()
+
+
+def _free_port() -> int:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
+
+
+class _FakeConfig:
+    def __init__(self, home: Path) -> None:
+        self.home = home
+        self.port = 7880
+        self.host = "127.0.0.1"
+        self.token = ""
+
+
+# -- A：任何启动失败都要写日志 + 弹框 ----------------------------------------
+def test_fatal_error_logs_traceback_and_popup_is_one_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    app = _tray_app()
+    dialogs: list[tuple[str, str]] = []
+    monkeypatch.setattr(app, "_show_dialog", lambda title, text: dialogs.append((title, text)))
+
+    try:
+        raise RuntimeError("端口 99999 不可用")
+    except RuntimeError as exc:
+        app.report_fatal(tmp_path, "LocalAIService 托盘启动失败", exc)
+
+    path = app.error_log_path(tmp_path)
+    assert path.name == "tray-error.log"
+    written = path.read_text(encoding="utf-8")
+    assert "Traceback (most recent call last)" in written
+    assert "RuntimeError: 端口 99999 不可用" in written
+
+    assert dialogs, "失败必须弹框，pythonw 下没有别的可见通道"
+    title, message = dialogs[0]
+    assert "失败" in title
+    assert "RuntimeError: 端口 99999 不可用" in message
+    assert str(path) in message
+    # 弹框只给一句话，不贴整段 traceback。
+    assert "Traceback" not in message
+
+
+def test_main_reports_failure_before_run_can_handle_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    app = _tray_app()
+    _reset_tray_log(app)
+    dialogs: list[tuple[str, str]] = []
+    monkeypatch.setattr(app, "_show_dialog", lambda title, text: dialogs.append((title, text)))
+    monkeypatch.setattr(app, "_parse_args", lambda argv: argparse.Namespace(port=None, host=None))
+    monkeypatch.setattr("localai.config.get_config", lambda: _FakeConfig(tmp_path))
+
+    def boom(args):
+        raise OSError("配置读不出来")
+
+    monkeypatch.setattr(app, "_run", boom)
+
+    assert app.main([]) == 1
+    assert "OSError: 配置读不出来" in app.error_log_path(tmp_path).read_text(encoding="utf-8")
+    assert dialogs and "配置读不出来" in dialogs[0][1]
+
+
+def test_icon_add_failure_is_raised_not_silent(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    winicon = _winicon()
+    window = winicon.TrayWindow(
+        object(), _FakeModeController(winicon.MODE_OWNED), icon_path=tmp_path / "missing.ico"
+    )
+
+    def no_icon() -> bool:
+        return False
+
+    monkeypatch.setattr(window, "_create_window", lambda: setattr(window, "_hwnd", 4321))
+    monkeypatch.setattr(window, "_load_icon", lambda: None)
+    monkeypatch.setattr(window, "_add_icon", no_icon)
+    with pytest.raises(RuntimeError):
+        window.run()
+
+
+# -- B：第二次双击必须看得见 ------------------------------------------------
+def test_second_launch_shows_hint_instead_of_exiting_silently(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    app = _tray_app()
+    _reset_tray_log(app)
+    dialogs: list[tuple[str, str]] = []
+    woken: list[bool] = []
+    monkeypatch.setattr(app, "_show_dialog", lambda title, text: dialogs.append((title, text)))
+    monkeypatch.setattr(
+        app, "_wake_existing_tray", lambda timeout=3.0: woken.append(True) or False
+    )
+    monkeypatch.setattr(app, "_acquire_instance_mutex", lambda: None)
+    monkeypatch.setattr("localai.config.get_config", lambda: _FakeConfig(tmp_path))
+    try:
+        code = app._run(argparse.Namespace(port=None, host=None))
+    finally:
+        _reset_tray_log(app)
+
+    assert code == app.EXIT_ALREADY_RUNNING != 0
+    assert woken == [True], "第二次双击要顺手叫醒已有托盘打开页面"
+    assert dialogs and "托盘已经在运行" in dialogs[0][1]
+    assert "通知区" in dialogs[0][1]
+    log_text = (tmp_path / "logs" / "tray.log").read_text(encoding="utf-8")
+    assert "托盘已在运行" in log_text
+
+
+# -- C：图标注册成功后弹一次气球 --------------------------------------------
+class _FakeModeController:
+    def __init__(self, mode: str) -> None:
+        self.mode = mode
+        self.port = 7880
+
+    def health_state(self) -> str:
+        return tray.STATE_RUNNING
+
+    def process_exited(self) -> bool:
+        return False
+
+
+class _FakeShell32:
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, object]] = []
+
+    def Shell_NotifyIconW(self, operation, data) -> bool:
+        self.calls.append((operation, data._obj))
+        return True
+
+
+def test_startup_balloon_is_shown_exactly_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    winicon = _winicon()
+    shell = _FakeShell32()
+    monkeypatch.setattr(winicon, "_shell32", shell)
+    window = winicon.TrayWindow(
+        object(), _FakeModeController(winicon.MODE_OWNED), icon_path=tmp_path / "tray.ico"
+    )
+    window._hwnd = 4321
+
+    window._announce_initial()
+    window._announce_initial()
+    _keep = window  # 防止 WNDPROC 回调被提前回收
+
+    infos = [data for _op, data in shell.calls if data.uFlags & winicon.NIF_INFO]
+    assert len(infos) == 1, "气球只在启动时弹一次"
+    assert "托盘已启动" in infos[0].szInfoTitle
+    assert "双击" in infos[0].szInfo
+    assert "^" in infos[0].szInfo, "要告诉人去哪个区域找图标"
+    assert infos[0].dwInfoFlags == winicon.NIIF_INFO
+    assert _keep._ballooned == {"started"}
+
+
+# -- D：重启空窗里不拉起第二份 ----------------------------------------------
+def test_restart_wait_attaches_as_soon_as_health_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def fake_get(url: str, timeout: float = 2.5):
+        calls.append(url)
+        return HEALTHY if len(calls) >= 3 else None
+
+    monkeypatch.setattr(tray, "http_get_json", fake_get)
+    state = tray.wait_for_restarting_service(7880, interval=0.0, sleep=lambda seconds: None)
+    assert state == tray.STATE_RUNNING
+    assert len(calls) == 3
+    assert calls[0].endswith("/health")
+
+
+def test_restart_wait_gives_up_after_its_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = [0.0]
+
+    def fake_sleep(seconds: float) -> None:
+        now[0] += seconds
+
+    monkeypatch.setattr(tray, "http_get_json", lambda url, timeout=2.5: None)
+    state = tray.wait_for_restarting_service(
+        7880,
+        wait_seconds=0.5,
+        interval=0.25,
+        monotonic=lambda: now[0],
+        sleep=fake_sleep,
+    )
+    assert state == tray.STATE_FREE
+
+
+def test_controller_attaches_when_health_appears_after_port_freed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # 真实 probe：端口 bind 成功（服务正在重启，旧进程已退），随后 /health 回来。
+    port = _free_port()
+    monkeypatch.setattr(tray, "http_get_json", lambda url, timeout=2.5: HEALTHY)
+    spawned: list[tray.SpawnedService] = []
+
+    controller = tray.TrayController(
+        port=port,
+        home=tmp_path,
+        spawn=lambda token: spawned.append(
+            tray.SpawnedService(proc=FakeProc(), command=["python"], token=token)
+        ),
+        shutdown_client=lambda: True,
+    )
+    try:
+        assert controller.start() == tray.MODE_ATTACHED
+    finally:
+        for handler in list(tray.log.handlers):
+            tray.log.removeHandler(handler)
+            handler.close()
+    assert spawned == [], "重启空窗里不能拉起第二份服务"
+
+
+def test_controller_spawns_after_restart_window_is_empty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    spawned: list[FakeProc] = []
+
+    def fake_spawn(token: str) -> tray.SpawnedService:
+        proc = FakeProc()
+        spawned.append(proc)
+        return tray.SpawnedService(proc=proc, command=["python"], token=token)
+
+    controller = tray.TrayController(
+        port=7899,
+        home=tmp_path,
+        probe=lambda port: tray.STATE_FREE,
+        health_wait=lambda port: tray.STATE_FREE,
+        spawn=fake_spawn,
+        shutdown_client=lambda: True,
+    )
+    assert controller.start() == tray.MODE_OWNED
+    assert len(spawned) == 1

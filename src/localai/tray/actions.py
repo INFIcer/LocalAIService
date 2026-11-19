@@ -13,6 +13,7 @@ import secrets
 import socket
 import subprocess
 import sys
+import time
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,6 +49,12 @@ STATE_CONFLICT = "conflict"
 MODE_OWNED = "owned"
 MODE_ATTACHED = "attached"
 MODE_CONFLICT = "conflict"
+
+#: 端口刚空出来时先看 /health 会不会回来：服务重启的空窗里 bind 是成功的，
+#: 直接拉起会撞端口。窗口约 5 秒，与重启脚本的实际停顿时长同量级。
+RESTART_WAIT_SECONDS = 5.0
+RESTART_WAIT_INTERVAL = 0.25
+RESTART_HEALTH_TIMEOUT = 0.5
 
 
 def ui_url(port: int) -> str:
@@ -119,6 +126,28 @@ def probe_service(port: int, *, timeout: float = 2.5) -> str:
         return STATE_FREE
     payload = http_get_json(health_url(port), timeout=timeout)
     return STATE_RUNNING if is_localai_health(payload) else STATE_CONFLICT
+
+
+def wait_for_restarting_service(
+    port: int,
+    *,
+    wait_seconds: float = RESTART_WAIT_SECONDS,
+    interval: float = RESTART_WAIT_INTERVAL,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> str:
+    """端口刚空闲时先短轮询 /health：服务可能正在重启，等它自己回来。
+
+    返回 STATE_RUNNING（服务已回来，应挂靠）或 STATE_FREE（等满仍没有，可拉起）。
+    只认本服务形状的 /health：别的程序抢到端口不会让托盘误挂靠。
+    """
+    deadline = monotonic() + float(wait_seconds)
+    while True:
+        if is_localai_health(http_get_json(health_url(port), timeout=RESTART_HEALTH_TIMEOUT)):
+            return STATE_RUNNING
+        if monotonic() >= deadline:
+            return STATE_FREE
+        sleep(interval)
 
 
 @dataclass(frozen=True)
@@ -292,6 +321,7 @@ class TrayController:
         probe: Callable[[int], str] = probe_service,
         shutdown_client: Optional[Callable[[], bool]] = None,
         spawn: Optional[Callable[[str], SpawnedService]] = None,
+        health_wait: Optional[Callable[[int], str]] = None,
         log_: Optional[logging.Logger] = None,
     ) -> None:
         self.port = int(port)
@@ -305,11 +335,22 @@ class TrayController:
         self._probe = probe
         self._spawn_override = spawn
         self._shutdown_override = shutdown_client
+        self._health_wait = health_wait or wait_for_restarting_service
         self._log = log_ or log
 
     # -- 状态 ---------------------------------------------------------
     def start(self) -> str:
         state = self._probe(self.port)
+        if state == STATE_FREE:
+            # bind 成功不等于没人管：服务可能刚被重启流程结束、新进程还没起来。
+            # 先短等 /health 回来，避免在重启空窗里拉起第二份。
+            self._log.info(
+                "端口 %s 空闲，先确认不是服务重启的空窗（最多 %s 秒）",
+                self.port,
+                RESTART_WAIT_SECONDS,
+            )
+            if self._health_wait(self.port) == STATE_RUNNING:
+                state = STATE_RUNNING
         if state == STATE_RUNNING:
             self.mode = MODE_ATTACHED
             self._log.info("端口 %s 上已有服务，托盘只挂图标，不重复启动", self.port)
@@ -452,4 +493,5 @@ __all__ = [
     "probe_service",
     "stop_owned_process",
     "ui_url",
+    "wait_for_restarting_service",
 ]

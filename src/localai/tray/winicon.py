@@ -268,8 +268,9 @@ class TrayWindow:
         self._create_window()
         self._load_icon()
         if not self._add_icon():
+            # 图标没建起来时窗口循环不会启动，必须让调用方看到失败（pythonw 无控制台）。
             self._destroy()
-            return 1
+            raise RuntimeError("Shell_NotifyIcon(NIM_ADD) 失败：通知区图标未创建")
         self._update_tooltip(force=True)
         self._announce_initial()
         if self._controller.mode == MODE_OWNED:
@@ -364,12 +365,20 @@ class TrayWindow:
 
     # -- 状态 ---------------------------------------------------------
     def _announce_initial(self) -> None:
+        """图标刚注册时弹一次气球：新图标默认收在通知区溢出区，不提示就找不到。"""
         mode = self._controller.mode
-        if mode == MODE_ATTACHED:
+        if mode == MODE_OWNED:
+            self._balloon(
+                "started",
+                "本地 AI 服务托盘已启动",
+                "双击图标打开 WebUI。图标在任务栏右下角通知区，可能收在 ^ 里。",
+                NIIF_INFO,
+            )
+        elif mode == MODE_ATTACHED:
             self._balloon(
                 "attached",
                 "服务已在运行",
-                "托盘只负责打开页面；退出托盘不会关闭它。",
+                "托盘只负责打开页面；退出托盘不会关闭它。图标在通知区，可能收在 ^ 里。",
                 NIIF_INFO,
             )
         elif mode == MODE_CONFLICT:
