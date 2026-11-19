@@ -420,13 +420,15 @@ def test_shutdown_endpoint_requires_injected_token(
 def test_shutdown_endpoint_accepts_generated_token_for_manually_started_service(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """手工启动的服务也生成令牌并写文件：挂靠模式的托盘靠它走优雅关停。"""
+    """手工启动的服务也生成令牌：挂靠模式的托盘靠它走优雅关停。"""
     app, server = _client_with_token(monkeypatch, tmp_path, token="")
     path = token_file.shutdown_token_path(tmp_path, app.state.cfg.port)
     with TestClient(app) as client:
-        assert path.is_file(), "服务运行时必须把令牌写到运行目录"
-        generated = path.read_text(encoding="utf-8").strip()
-        assert generated == app.state.shutdown_token
+        generated = app.state.shutdown_token
+        assert generated, "服务总会持有一个退出令牌"
+        # 令牌文件属于真正在跑的 serve 进程；应用装配与测试客户端都不该碰它，
+        # 否则旁路进程会覆盖/删掉线上服务写下的令牌。
+        assert not path.exists(), "应用装配不应写令牌文件"
 
         denied = client.post(
             "/admin/shutdown", headers={tray.SHUTDOWN_HEADER: "anything"}
@@ -437,8 +439,6 @@ def test_shutdown_endpoint_accepts_generated_token_for_manually_started_service(
         ok = client.post("/admin/shutdown", headers={tray.SHUTDOWN_HEADER: generated})
         assert ok.status_code == 200
         assert server.should_exit is True
-
-    assert not path.exists(), "服务正常退出后要删掉令牌文件"
 
 
 def test_shutdown_endpoint_respects_global_bearer(
@@ -1143,6 +1143,45 @@ def test_quit_stops_service_replaced_by_webui_restart(
     assert killed == [7777]
 
 
+def test_quit_retries_with_token_file_after_service_was_replaced(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """重启换进程后旧令牌不被接受，改用新服务写下的令牌走优雅关停。"""
+    tried: list[str] = []
+
+    class FakeClient:
+        def __init__(self, port: int, token: str, bearer_token: str = "") -> None:
+            tried.append(token)
+
+        def request(self) -> bool:
+            return tried[-1] == "fresh-token"
+
+    monkeypatch.setattr(tray, "ShutdownClient", FakeClient)
+    states = [tray.STATE_FREE]
+
+    def probe(port: int) -> str:
+        return states.pop(0) if len(states) > 1 else states[0]
+
+    controller, spawned = _make_controller(
+        tray.STATE_FREE,
+        monkeypatch,
+        tmp_path,
+        probe=probe,
+        shutdown_client=None,
+        token_reader=lambda home, port: "fresh-token",
+    )
+    assert controller.start() == tray.MODE_OWNED
+    own_token = controller.shutdown_token
+    spawned[0].returncode = 0  # 旧服务已经退出
+    states[:] = [tray.STATE_RUNNING]
+
+    result = controller.quit()
+
+    assert tried[0] == own_token, "先用自己的令牌"
+    assert tried[-1] == "fresh-token", "被拒后改读令牌文件里的新令牌"
+    assert result.steps == ["shutdown-requested", "graceful-exit"]
+
+
 def test_quit_stops_own_process_before_giving_up_on_foreign_port(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1229,6 +1268,13 @@ def test_shutdown_token_file_roundtrip_and_port_scope(tmp_path: Path) -> None:
 def test_write_shutdown_token_ignores_empty_token(tmp_path: Path) -> None:
     assert token_file.write_shutdown_token(tmp_path, 7899, "  ") is None
     assert not token_file.shutdown_token_path(tmp_path, 7899).exists()
+
+
+def test_shutdown_token_file_context_writes_and_removes(tmp_path: Path) -> None:
+    path = token_file.shutdown_token_path(tmp_path, 7899)
+    with token_file.shutdown_token_file(tmp_path, 7899, "abc"):
+        assert token_file.read_shutdown_token(tmp_path, 7899) == "abc"
+    assert not path.exists()
 
 
 # ---------------------------------------------------------------------------

@@ -11,6 +11,7 @@ import logging
 
 from .api.app import app, create_app
 from .config import get_config
+from .core.runtime import shutdown_token_file
 
 __all__ = ["app", "create_app", "main"]
 
@@ -21,7 +22,8 @@ def main() -> None:
 
     cfg = get_config()
     logging.getLogger("localai").info("旧入口启动：%s", cfg.base_url)
-    uvicorn.run(app, host=cfg.host, port=cfg.port, log_level=cfg.log_level.lower())
+    with shutdown_token_file(cfg.home, cfg.port, app.state.shutdown_token):
+        uvicorn.run(app, host=cfg.host, port=cfg.port, log_level=cfg.log_level.lower())
 
 
 if __name__ == "__main__":

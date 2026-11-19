@@ -14,8 +14,9 @@
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 #: 托盘注入服务环境的退出令牌变量名（服务自己也读它）。
 SHUTDOWN_TOKEN_ENV = "LOCALAI_SHUTDOWN_TOKEN"
@@ -54,6 +55,20 @@ def read_shutdown_token(home: Path, port: int) -> str:
         return ""
 
 
+@contextmanager
+def shutdown_token_file(home: Path, port: int, token: str) -> Iterator[None]:
+    """服务运行期间持有令牌文件：进入时写、退出时删。
+
+    只有真正在跑的 serve 进程才读写这个文件；应用装配、测试里的 TestClient
+    都不碰它，避免旁路进程覆盖或删掉正在运行的服务写下的令牌。
+    """
+    write_shutdown_token(home, port, token)
+    try:
+        yield
+    finally:
+        remove_shutdown_token(home, port, token)
+
+
 def remove_shutdown_token(home: Path, port: int, token: str) -> None:
     """删除令牌文件，仅当内容仍是自己写的那份。
 
@@ -75,6 +90,7 @@ __all__ = [
     "SHUTDOWN_TOKEN_ENV",
     "read_shutdown_token",
     "remove_shutdown_token",
+    "shutdown_token_file",
     "shutdown_token_path",
     "write_shutdown_token",
 ]

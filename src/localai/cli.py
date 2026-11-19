@@ -167,6 +167,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     import uvicorn
 
     from .api.app import app
+    from .core.runtime import shutdown_token_file
 
     cfg = get_config()
     host = args.host or cfg.host
@@ -178,7 +179,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
     # 托盘通过 /admin/shutdown 请求退出时，需要从请求里把 should_exit 置位，
     # 让 uvicorn 走正常关停流程（lifespan finally 会停调度器与视觉子进程）。
     app.state.uvicorn_server = server
-    server.run()
+    # 运行期间写下退出令牌：托盘（含挂靠模式、WebUI 重启换来的新进程）读它优雅关停。
+    with shutdown_token_file(cfg.home, port, app.state.shutdown_token):
+        server.run()
     return 0
 
 

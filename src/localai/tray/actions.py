@@ -667,10 +667,10 @@ class TrayController:
             result.steps.append("foreign-port")
             return
 
-        token = self._shutdown_token()
-        if not token:
+        tokens = self._shutdown_tokens()
+        if not tokens:
             result.steps.append("no-token")
-        elif self._request_shutdown_with(token):
+        elif self._request_shutdown_any(tokens):
             result.steps.append("shutdown-requested")
             if self._wait_stop(self.port):
                 result.steps.append("graceful-exit")
@@ -690,14 +690,29 @@ class TrayController:
         result.steps.append("kill-tree")
         result.steps.append("tree-killed" if self._kill_tree(pid) else "tree-kill-failed")
 
-    def _shutdown_token(self) -> str:
-        """优雅退出令牌：自己的优先，否则读服务写下的令牌文件（挂靠模式）。"""
+    def _shutdown_tokens(self) -> list[str]:
+        """优雅退出令牌候选：自己的优先，其次是服务写下令牌文件（挂靠/重启换进程）。
+
+        WebUI 的「重启服务」用 WMI 拉起新进程，旧令牌传不过去；新进程会把自己
+        生成的令牌写进同一个文件，所以第二个候选往往才是能用的那个。
+        """
+        tokens: list[str] = []
         if self.shutdown_token:
-            return self.shutdown_token
+            tokens.append(self.shutdown_token)
         try:
-            return str(self._token_reader(self.home, self.port) or "")
+            stored = str(self._token_reader(self.home, self.port) or "").strip()
         except Exception:  # noqa: BLE001 - 读不到就当没有令牌
-            return ""
+            stored = ""
+        if stored and stored not in tokens:
+            tokens.append(stored)
+        return tokens
+
+    def _request_shutdown_any(self, tokens: Optional[list[str]] = None) -> bool:
+        """按候选顺序请求优雅关停；返回是否有令牌被服务接受。"""
+        for token in tokens if tokens is not None else self._shutdown_tokens():
+            if self._request_shutdown_with(token):
+                return True
+        return False
 
     def _is_our_service(self, pid: int) -> bool:
         """确认 pid 就是应答 /health 的那个进程（形状判定 + 可选的 pid 对比）。"""
@@ -716,7 +731,7 @@ class TrayController:
             return False
 
     def _request_shutdown(self) -> bool:
-        return self._request_shutdown_with(self._shutdown_token())
+        return self._request_shutdown_any()
 
     def _request_shutdown_with(self, token: str) -> bool:
         if self._shutdown_override is not None:
