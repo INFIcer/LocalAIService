@@ -185,6 +185,23 @@ def test_quit_treats_shutdown_exception_as_refused() -> None:
 # ---------------------------------------------------------------------------
 # 控制器：拉起 / 挂靠 / 冲突
 # ---------------------------------------------------------------------------
+class FakeJob:
+    """假作业对象：只记录谁被挂进来、句柄何时释放。"""
+
+    def __init__(self, *, ok: bool = True) -> None:
+        self.adopted: list[int] = []
+        self.released = 0
+        self._ok = ok
+
+    def adopt(self, pid: Optional[int]) -> bool:
+        if pid:
+            self.adopted.append(int(pid))
+        return self._ok
+
+    def release(self) -> None:
+        self.released += 1
+
+
 def _make_controller(
     probe_state: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -213,6 +230,7 @@ def _make_controller(
         wait_stop=overrides.pop("wait_stop", lambda port: True),
         health=overrides.pop("health", lambda port: HEALTHY),
         token_reader=overrides.pop("token_reader", lambda home, port: "file-token"),
+        job=overrides.pop("job", FakeJob()),
         **overrides,
     )
     return controller, spawned
@@ -1148,6 +1166,7 @@ def test_quit_with_nothing_to_stop_reports_no_service(tmp_path: Path) -> None:
         kill_tree=lambda pid: False,
         health=lambda port: None,
         token_reader=lambda home, port: "",
+        job=FakeJob(),
     )
     result = controller.quit()
     assert result.steps == ["no-service"]
@@ -1213,8 +1232,41 @@ def test_write_shutdown_token_ignores_empty_token(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Windows 进程工具：按端口定位监听进程、taskkill 兜底
+# 作业对象：托盘消失时，自己拉起的服务跟着结束
 # ---------------------------------------------------------------------------
+def test_service_job_adopts_spawned_process_and_releases(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events: list[object] = []
+    job = tray.ServiceJob(
+        create=lambda: events.append("create") or 555,
+        assign=lambda handle, pid: events.append(("assign", handle, pid)) or True,
+        close=lambda handle: events.append(("close", handle)),
+    )
+    controller, _spawned = _make_controller(
+        tray.STATE_FREE, monkeypatch, tmp_path, job=job
+    )
+
+    assert controller.start() == tray.MODE_OWNED
+    assert job.handle == 555
+    assert events == ["create", ("assign", 555, 4242)]
+
+    controller.quit()
+    assert ("close", 555) in events
+    assert job.handle is None
+
+
+def test_service_job_failure_does_not_block_start(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    job = tray.ServiceJob(create=lambda: None)
+    controller, _spawned = _make_controller(
+        tray.STATE_FREE, monkeypatch, tmp_path, job=job
+    )
+    assert controller.start() == tray.MODE_OWNED
+    assert job.handle is None
+
+
 def _winproc():
     if os.name != "nt":
         pytest.skip("Win32 进程工具只在 Windows 上可用")
@@ -1254,6 +1306,29 @@ def test_kill_process_tree_ends_a_real_process() -> None:
         proc.wait(timeout=10)
         assert proc.poll() is not None
     finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+def test_kill_on_close_job_ends_child_when_tray_dies() -> None:
+    winproc = _winproc()
+    job = winproc.create_kill_on_close_job()
+    if job is None:
+        pytest.skip("无法创建作业对象")
+    proc = _spawn_sleeper()
+    closed = False
+    try:
+        if not winproc.assign_process_to_job(job, proc.pid):
+            pytest.skip("无法把进程挂进作业对象（可能受外层作业限制）")
+        # 托盘进程消失 = 最后一个作业句柄关闭，内核结束作业里的进程。
+        winproc.close_job(job)
+        closed = True
+        proc.wait(timeout=10)
+        assert proc.poll() is not None
+    finally:
+        if not closed:
+            winproc.close_job(job)
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)

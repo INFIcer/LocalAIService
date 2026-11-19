@@ -5,7 +5,11 @@
 - ``find_listening_pid(port)``：读系统 TCP 监听表，回答「谁占着这个端口」。用
   ``GetExtendedTcpTable`` 而不是解析 ``netstat -ano``：后者输出随系统语言变化，
   列位置也不稳定；
-- ``kill_process_tree(pid)``：``taskkill /T /F``，只作为优雅关停失败后的兜底。
+- ``kill_process_tree(pid)``：``taskkill /T /F``，只作为优雅关停失败后的兜底；
+- 作业对象：托盘自己拉起的服务连同它的子孙进程（视觉引擎等）一起挂进
+  ``kill-on-close`` 作业。托盘进程无论正常退出还是被任务管理器强杀/崩溃，内核
+  都会在最后一个作业句柄关闭时结束整棵树。挂靠模式的外部服务没有子进程句柄，
+  不在此列。
 """
 
 from __future__ import annotations
@@ -23,6 +27,11 @@ ERROR_INSUFFICIENT_BUFFER = 122
 _BUFFER_START = 16 * 1024
 _BUFFER_MAX = 4 * 1024 * 1024
 _BUFFER_TRIES = 4
+
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_PROCESS_TERMINATE = 0x0001
+_PROCESS_SET_QUOTA = 0x0100
 
 
 class MIB_TCPROW_OWNER_PID(ctypes.Structure):
@@ -49,6 +58,42 @@ class MIB_TCP6ROW_OWNER_PID(ctypes.Structure):
     ]
 
 
+class IO_COUNTERS(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_ulonglong),
+        ("WriteOperationCount", ctypes.c_ulonglong),
+        ("OtherOperationCount", ctypes.c_ulonglong),
+        ("ReadTransferCount", ctypes.c_ulonglong),
+        ("WriteTransferCount", ctypes.c_ulonglong),
+        ("OtherTransferCount", ctypes.c_ulonglong),
+    ]
+
+
+class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_longlong),
+        ("PerJobUserTimeLimit", ctypes.c_longlong),
+        ("LimitFlags", wintypes.DWORD),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", wintypes.DWORD),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", wintypes.DWORD),
+        ("SchedulingClass", wintypes.DWORD),
+    ]
+
+
+class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+        ("IoInfo", IO_COUNTERS),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
 def _iphlpapi():
     library = ctypes.WinDLL("iphlpapi", use_last_error=True)
     library.GetExtendedTcpTable.argtypes = [
@@ -60,6 +105,26 @@ def _iphlpapi():
         wintypes.ULONG,
     ]
     library.GetExtendedTcpTable.restype = wintypes.DWORD
+    return library
+
+
+def _kernel32():
+    library = ctypes.WinDLL("kernel32", use_last_error=True)
+    library.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    library.CreateJobObjectW.restype = wintypes.HANDLE
+    library.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    library.SetInformationJobObject.restype = wintypes.BOOL
+    library.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    library.AssignProcessToJobObject.restype = wintypes.BOOL
+    library.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    library.OpenProcess.restype = wintypes.HANDLE
+    library.CloseHandle.argtypes = [wintypes.HANDLE]
+    library.CloseHandle.restype = wintypes.BOOL
     return library
 
 
@@ -140,7 +205,56 @@ def kill_process_tree(pid: int) -> bool:
     return completed.returncode == 0
 
 
+def create_kill_on_close_job() -> Optional[int]:
+    """创建 kill-on-close 作业对象；返回句柄，失败返回 None。"""
+    kernel32 = _kernel32()
+    handle = kernel32.CreateJobObjectW(None, None)
+    if not handle:
+        return None
+    limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    ok = kernel32.SetInformationJobObject(
+        handle,
+        _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+        ctypes.byref(limits),
+        ctypes.sizeof(limits),
+    )
+    if not ok:
+        kernel32.CloseHandle(handle)
+        return None
+    return int(handle)
+
+
+def assign_process_to_job(job_handle: int, pid: int) -> bool:
+    """把进程挂进作业对象；进程已退出或没有权限时返回 False。"""
+    if not job_handle or int(pid) <= 0:
+        return False
+    kernel32 = _kernel32()
+    process = kernel32.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, int(pid))
+    if not process:
+        return False
+    try:
+        return bool(kernel32.AssignProcessToJobObject(int(job_handle), process))
+    finally:
+        kernel32.CloseHandle(process)
+
+
+def close_job(job_handle: Optional[int]) -> None:
+    """关闭作业句柄；最后一个句柄关闭时内核结束作业里的全部进程。"""
+    if not job_handle:
+        return
+    try:
+        _kernel32().CloseHandle(int(job_handle))
+    except OSError:
+        pass
+
+
 __all__ = [
+    "JOBOBJECT_EXTENDED_LIMIT_INFORMATION",
+    "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE",
+    "close_job",
+    "assign_process_to_job",
+    "create_kill_on_close_job",
     "find_listening_pid",
     "kill_process_tree",
 ]

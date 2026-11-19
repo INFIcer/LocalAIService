@@ -477,6 +477,73 @@ def _default_health(port: int) -> object:
     return http_get_json(health_url(port))
 
 
+def _default_create_job() -> Optional[int]:
+    from .winproc import create_kill_on_close_job
+
+    try:
+        return create_kill_on_close_job()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _default_assign_job(job_handle: int, pid: int) -> bool:
+    from .winproc import assign_process_to_job
+
+    try:
+        return assign_process_to_job(job_handle, pid)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _default_close_job(job_handle: Optional[int]) -> None:
+    from .winproc import close_job
+
+    try:
+        close_job(job_handle)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+class ServiceJob:
+    """托盘自己拉起的那份服务的 kill-on-close 作业对象。
+
+    只有 spawn 出来的子进程可以 adopt：挂靠模式拿不到外部进程句柄，那部分由
+    退出流程按端口定位后显式结束。作业句柄由 TrayController 持有并活到托盘进程
+    退出，所以托盘被强杀/崩溃时内核会替它结束整棵进程树；退出流程结束时
+    release()，若还有残留进程，关句柄同样会收掉。
+    """
+
+    def __init__(
+        self,
+        *,
+        create: Callable[[], Optional[int]] = _default_create_job,
+        assign: Callable[[int, int], bool] = _default_assign_job,
+        close: Callable[[Optional[int]], None] = _default_close_job,
+    ) -> None:
+        self._create = create
+        self._assign = assign
+        self._close = close
+        self.handle: Optional[int] = None
+
+    def adopt(self, pid: Optional[int]) -> bool:
+        """把 pid 挂进作业对象；失败只影响强杀兜底，不影响服务启动。"""
+        if not pid or int(pid) <= 0:
+            return False
+        if self.handle is None:
+            self.handle = self._create()
+        if self.handle is None:
+            return False
+        try:
+            return bool(self._assign(self.handle, int(pid)))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def release(self) -> None:
+        handle, self.handle = self.handle, None
+        if handle is not None:
+            self._close(handle)
+
+
 class TrayController:
     """服务生命周期：探测端口、决定是否拉起、退出时停掉当前服务。
 
@@ -503,6 +570,7 @@ class TrayController:
         wait_stop: Optional[Callable[[int], bool]] = None,
         health: Optional[Callable[[int], object]] = None,
         token_reader: Callable[[Path, int], str] = read_shutdown_token,
+        job: Optional[ServiceJob] = None,
         log_: Optional[logging.Logger] = None,
     ) -> None:
         self.port = int(port)
@@ -513,6 +581,7 @@ class TrayController:
         self.proc: Optional[ProcessLike] = None
         self.mode = ""
         self.shutdown_token = ""
+        self.job = job or ServiceJob()
         self._probe = probe
         self._spawn_override = spawn
         self._shutdown_override = shutdown_client
@@ -550,6 +619,11 @@ class TrayController:
         spawned = (self._spawn_override or self._spawn)(self.shutdown_token)
         self.proc = spawned.proc
         self.mode = MODE_OWNED
+        # 自己拉起的服务才挂得上作业对象；挂靠的外部进程没有句柄可挂。
+        if self.job.adopt(getattr(spawned.proc, "pid", None)):
+            self._log.info("服务已加入 kill-on-close 作业对象")
+        else:
+            self._log.warning("服务未能加入作业对象，退出时改用显式结束进程树")
         self._log.info("已启动服务：pid=%s", getattr(spawned.proc, "pid", "?"))
         return self.mode
 
@@ -568,6 +642,7 @@ class TrayController:
         result = StopResult(owned=self.mode == MODE_OWNED)
         self._stop_owned_process(result)
         self._stop_current_service(result)
+        self.job.release()
         self._log.info("托盘退出：%s", " -> ".join(result.steps))
         return result
 
@@ -772,6 +847,7 @@ __all__ = [
     "STATE_FREE",
     "STATE_RUNNING",
     "GRACEFUL_EXIT_SECONDS",
+    "ServiceJob",
     "ServiceProcess",
     "ShutdownClient",
     "ShutdownRequest",
