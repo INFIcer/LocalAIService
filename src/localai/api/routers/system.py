@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import platform
 from pathlib import Path
 from typing import Any
@@ -114,6 +115,8 @@ async def health(request: Request) -> dict[str, Any]:
 
     # 与后端无关的部分只写一次；两种 backend 都给出同一组字段。
     common: dict[str, Any] = {
+        # 进程号：托盘按它核对「监听端口的进程」就是应答 /health 的这个进程。
+        "pid": os.getpid(),
         "asr": asr_health,
         "whisper": whisper_health,
         "translate": translate_health,

@@ -11,6 +11,7 @@ import json
 import os
 import socket
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -20,6 +21,7 @@ from fastapi.testclient import TestClient
 from localai.api.app import create_app
 from localai.cli import build_parser
 from localai.config import Config
+from localai.core import runtime as token_file
 from localai.tray import actions as tray
 
 
@@ -183,7 +185,13 @@ def test_quit_treats_shutdown_exception_as_refused() -> None:
 # ---------------------------------------------------------------------------
 # 控制器：拉起 / 挂靠 / 冲突
 # ---------------------------------------------------------------------------
-def _make_controller(probe_state: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+def _make_controller(
+    probe_state: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    **overrides,
+):
+    """控制器工厂：所有外部副作用（探测、等待、探测进程、杀进程）都可注入。"""
     spawned: list[FakeProc] = []
 
     def fake_spawn(token: str) -> tray.SpawnedService:
@@ -191,14 +199,21 @@ def _make_controller(probe_state: str, monkeypatch: pytest.MonkeyPatch, tmp_path
         spawned.append(proc)
         return tray.SpawnedService(proc=proc, command=["python"], token=token)
 
+    probe = overrides.pop("probe", lambda port: probe_state)
     controller = tray.TrayController(
         port=7899,
         home=tmp_path,
-        probe=lambda port: probe_state,
+        probe=probe,
         # 探测与重启空窗的重试都用注入值，测试不碰真实网络。
-        health_wait=lambda port: probe_state,
+        health_wait=overrides.pop("health_wait", lambda port: probe_state),
         spawn=fake_spawn,
-        shutdown_client=lambda: True,
+        shutdown_client=overrides.pop("shutdown_client", lambda: True),
+        find_listener=overrides.pop("find_listener", lambda port: None),
+        kill_tree=overrides.pop("kill_tree", lambda pid: True),
+        wait_stop=overrides.pop("wait_stop", lambda port: True),
+        health=overrides.pop("health", lambda port: HEALTHY),
+        token_reader=overrides.pop("token_reader", lambda home, port: "file-token"),
+        **overrides,
     )
     return controller, spawned
 
@@ -216,14 +231,15 @@ def test_controller_attaches_to_running_service(monkeypatch: pytest.MonkeyPatch,
     assert controller.start() == tray.MODE_ATTACHED
     assert spawned == []
     assert controller.proc is None
-    assert controller.quit().steps == ["external-service"]
+    # 挂靠模式下退出同样要关掉服务：先走优雅请求。
+    assert controller.quit().steps == ["shutdown-requested", "graceful-exit"]
 
 
 def test_controller_refuses_to_start_on_foreign_port(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     controller, spawned = _make_controller(tray.STATE_CONFLICT, monkeypatch, tmp_path)
     assert controller.start() == tray.MODE_CONFLICT
     assert spawned == []
-    assert controller.quit().steps == ["external-service"]
+    assert controller.quit().steps == ["foreign-port"]
 
 
 def test_controller_quit_uses_shutdown_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -383,15 +399,28 @@ def test_shutdown_endpoint_requires_injected_token(
         assert app.state.shutdown_requested is True
 
 
-def test_shutdown_endpoint_rejects_manually_started_service(
+def test_shutdown_endpoint_accepts_generated_token_for_manually_started_service(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """手工启动的服务也生成令牌并写文件：挂靠模式的托盘靠它走优雅关停。"""
     app, server = _client_with_token(monkeypatch, tmp_path, token="")
+    path = token_file.shutdown_token_path(tmp_path, app.state.cfg.port)
     with TestClient(app) as client:
-        response = client.post("/admin/shutdown", headers={tray.SHUTDOWN_HEADER: "anything"})
-    assert response.status_code == 403
-    assert "托盘" in response.json()["detail"]
-    assert server.should_exit is False
+        assert path.is_file(), "服务运行时必须把令牌写到运行目录"
+        generated = path.read_text(encoding="utf-8").strip()
+        assert generated == app.state.shutdown_token
+
+        denied = client.post(
+            "/admin/shutdown", headers={tray.SHUTDOWN_HEADER: "anything"}
+        )
+        assert denied.status_code == 403
+        assert server.should_exit is False
+
+        ok = client.post("/admin/shutdown", headers={tray.SHUTDOWN_HEADER: generated})
+        assert ok.status_code == 200
+        assert server.should_exit is True
+
+    assert not path.exists(), "服务正常退出后要删掉令牌文件"
 
 
 def test_shutdown_endpoint_respects_global_bearer(
@@ -904,3 +933,354 @@ def test_notify_result_queues_then_shows(monkeypatch: pytest.MonkeyPatch, tmp_pa
             {"once": False},
         )
     ]
+
+
+# ---------------------------------------------------------------------------
+# 生命周期归属：退出托盘 = 服务退出
+# ---------------------------------------------------------------------------
+def test_quit_uses_persisted_token_for_attached_service(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """挂靠模式没有注入的令牌，读服务写下的令牌文件走优雅关停。"""
+    calls: list[tuple[int, str, str]] = []
+
+    class FakeClient:
+        def __init__(self, port: int, token: str, bearer_token: str = "") -> None:
+            calls.append((int(port), token, bearer_token))
+
+        def request(self) -> bool:
+            return True
+
+    monkeypatch.setattr(tray, "ShutdownClient", FakeClient)
+    controller, _spawned = _make_controller(
+        tray.STATE_RUNNING,
+        monkeypatch,
+        tmp_path,
+        shutdown_client=None,
+        token_reader=lambda home, port: "file-token",
+    )
+    assert controller.start() == tray.MODE_ATTACHED
+
+    result = controller.quit()
+
+    assert calls == [(7899, "file-token", "")]
+    assert result.steps == ["shutdown-requested", "graceful-exit"]
+    assert result.owned is False
+
+
+def test_quit_kills_attached_service_when_no_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    killed: list[int] = []
+    controller, _spawned = _make_controller(
+        tray.STATE_RUNNING,
+        monkeypatch,
+        tmp_path,
+        token_reader=lambda home, port: "",
+        find_listener=lambda port: 4321,
+        kill_tree=lambda pid: killed.append(pid) or True,
+    )
+    assert controller.start() == tray.MODE_ATTACHED
+
+    result = controller.quit()
+
+    assert result.steps == ["no-token", "kill-tree", "tree-killed"]
+    assert killed == [4321]
+
+
+def test_quit_falls_back_to_kill_after_graceful_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    killed: list[int] = []
+    controller, _spawned = _make_controller(
+        tray.STATE_RUNNING,
+        monkeypatch,
+        tmp_path,
+        token_reader=lambda home, port: "tok",
+        wait_stop=lambda port: False,
+        find_listener=lambda port: 4321,
+        kill_tree=lambda pid: killed.append(pid) or True,
+        health=lambda port: {**HEALTHY, "pid": 4321},
+    )
+    assert controller.start() == tray.MODE_ATTACHED
+
+    result = controller.quit()
+
+    # 顺序不可颠倒：先请求优雅退出，等满超时才强杀。
+    assert result.steps == [
+        "shutdown-requested",
+        "graceful-timeout",
+        "kill-tree",
+        "tree-killed",
+    ]
+    assert killed == [4321]
+
+
+def test_quit_leaves_foreign_port_alone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    touched: list[str] = []
+    controller, _spawned = _make_controller(
+        tray.STATE_CONFLICT,
+        monkeypatch,
+        tmp_path,
+        find_listener=lambda port: touched.append("find") or 4321,
+        kill_tree=lambda pid: touched.append("kill") or True,
+    )
+    assert controller.start() == tray.MODE_CONFLICT
+
+    result = controller.quit()
+
+    assert result.steps == ["foreign-port"]
+    assert touched == [], "端口属于别的程序时既不能定位也不该强杀"
+
+
+def test_quit_leaves_service_alone_when_health_shape_is_foreign(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    killed: list[int] = []
+    controller, _spawned = _make_controller(
+        tray.STATE_RUNNING,
+        monkeypatch,
+        tmp_path,
+        token_reader=lambda home, port: "",
+        find_listener=lambda port: 4321,
+        kill_tree=lambda pid: killed.append(pid) or True,
+        health=lambda port: {"hello": "world"},
+    )
+    assert controller.start() == tray.MODE_ATTACHED
+
+    result = controller.quit()
+
+    assert result.steps == ["no-token", "foreign-port"]
+    assert killed == []
+
+
+def test_quit_aborts_when_health_pid_differs_from_listener(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    killed: list[int] = []
+    controller, _spawned = _make_controller(
+        tray.STATE_RUNNING,
+        monkeypatch,
+        tmp_path,
+        token_reader=lambda home, port: "",
+        find_listener=lambda port: 4321,
+        kill_tree=lambda pid: killed.append(pid) or True,
+        health=lambda port: {**HEALTHY, "pid": 999},
+    )
+    assert controller.start() == tray.MODE_ATTACHED
+
+    result = controller.quit()
+
+    assert result.steps == ["no-token", "foreign-port"]
+    assert killed == [], "监听进程与应答 /health 的进程不是同一个时不能动手"
+
+
+def test_quit_reports_no_listener_when_pid_is_unknown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    controller, _spawned = _make_controller(
+        tray.STATE_RUNNING,
+        monkeypatch,
+        tmp_path,
+        token_reader=lambda home, port: "",
+        find_listener=lambda port: None,
+    )
+    assert controller.start() == tray.MODE_ATTACHED
+
+    result = controller.quit()
+
+    assert result.steps == ["no-token", "no-listener"]
+
+
+def test_quit_stops_service_replaced_by_webui_restart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """托盘拉起的旧进程被重启脚本结束后，退出时按端口关掉新进程。"""
+    killed: list[int] = []
+    states = [tray.STATE_FREE]
+
+    def probe(port: int) -> str:
+        return states.pop(0) if len(states) > 1 else states[0]
+
+    controller, spawned = _make_controller(
+        tray.STATE_FREE,
+        monkeypatch,
+        tmp_path,
+        probe=probe,
+        # 重启脚本用 WMI 拉起新进程，旧令牌传不过去：新服务不认它。
+        shutdown_client=lambda: False,
+        find_listener=lambda port: 7777,
+        kill_tree=lambda pid: killed.append(pid) or True,
+        health=lambda port: {**HEALTHY, "pid": 7777},
+    )
+    assert controller.start() == tray.MODE_OWNED
+    spawned[0].returncode = 0  # 旧服务已经退出
+    states[:] = [tray.STATE_RUNNING]  # 新服务接管了同一个端口
+
+    result = controller.quit()
+
+    assert result.steps == ["shutdown-refused", "kill-tree", "tree-killed"]
+    assert killed == [7777]
+
+
+def test_quit_stops_own_process_before_giving_up_on_foreign_port(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    controller, spawned = _make_controller(tray.STATE_FREE, monkeypatch, tmp_path)
+    assert controller.start() == tray.MODE_OWNED
+    controller._probe = lambda port: tray.STATE_CONFLICT
+
+    result = controller.quit()
+
+    # 端口虽然被别的程序占了，自己拉起的进程仍必须收干净。
+    assert result.steps == ["shutdown-requested", "graceful-exit", "foreign-port"]
+    assert spawned[0].calls == ["wait:20.0"]
+
+
+def test_quit_with_nothing_to_stop_reports_no_service(tmp_path: Path) -> None:
+    controller = tray.TrayController(
+        port=7899,
+        home=tmp_path,
+        probe=lambda port: tray.STATE_FREE,
+        find_listener=lambda port: None,
+        kill_tree=lambda pid: False,
+        health=lambda port: None,
+        token_reader=lambda home, port: "",
+    )
+    result = controller.quit()
+    assert result.steps == ["no-service"]
+    assert result.owned is False
+
+
+def test_wait_for_service_stop_returns_true_when_service_stops() -> None:
+    states = [tray.STATE_RUNNING, tray.STATE_RUNNING, tray.STATE_FREE]
+    calls: list[int] = []
+
+    def probe(port: int) -> str:
+        calls.append(port)
+        return states.pop(0)
+
+    assert tray.wait_for_service_stop(7880, probe=probe, sleep=lambda seconds: None) is True
+    assert calls == [7880, 7880, 7880]
+
+
+def test_wait_for_service_stop_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = [0.0]
+    monkeypatch.setattr(tray, "probe_service", lambda port: tray.STATE_RUNNING)
+
+    def fake_sleep(seconds: float) -> None:
+        now[0] += seconds
+
+    assert (
+        tray.wait_for_service_stop(
+            7880,
+            wait_seconds=0.5,
+            interval=0.25,
+            monotonic=lambda: now[0],
+            sleep=fake_sleep,
+        )
+        is False
+    )
+    assert now[0] >= 0.5
+
+
+# ---------------------------------------------------------------------------
+# 令牌文件：服务写、托盘读，按端口区分
+# ---------------------------------------------------------------------------
+def test_shutdown_token_file_roundtrip_and_port_scope(tmp_path: Path) -> None:
+    path = token_file.shutdown_token_path(tmp_path, 7899)
+    assert path == tmp_path / "run" / "shutdown-7899.token"
+    assert token_file.read_shutdown_token(tmp_path, 7899) == ""
+
+    assert token_file.write_shutdown_token(tmp_path, 7899, "abc") == path
+    assert token_file.read_shutdown_token(tmp_path, 7899) == "abc"
+    token_file.write_shutdown_token(tmp_path, 7880, "other")
+    assert token_file.read_shutdown_token(tmp_path, 7899) == "abc"
+    assert token_file.read_shutdown_token(tmp_path, 7880) == "other"
+
+    # 只删自己写的那份，别把后来者（重启后的新进程）写的删掉。
+    token_file.remove_shutdown_token(tmp_path, 7899, "stale")
+    assert path.is_file()
+    token_file.remove_shutdown_token(tmp_path, 7899, "abc")
+    assert not path.exists()
+
+
+def test_write_shutdown_token_ignores_empty_token(tmp_path: Path) -> None:
+    assert token_file.write_shutdown_token(tmp_path, 7899, "  ") is None
+    assert not token_file.shutdown_token_path(tmp_path, 7899).exists()
+
+
+# ---------------------------------------------------------------------------
+# Windows 进程工具：按端口定位监听进程、taskkill 兜底
+# ---------------------------------------------------------------------------
+def _winproc():
+    if os.name != "nt":
+        pytest.skip("Win32 进程工具只在 Windows 上可用")
+    from localai.tray import winproc
+
+    return winproc
+
+
+def _spawn_sleeper(seconds: int = 60) -> subprocess.Popen:
+    return subprocess.Popen(
+        [sys.executable, "-c", f"import time; time.sleep({int(seconds)})"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+
+def test_find_listening_pid_returns_own_process() -> None:
+    winproc = _winproc()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    port = sock.getsockname()[1]
+    try:
+        assert winproc.find_listening_pid(port) == os.getpid()
+    finally:
+        sock.close()
+    assert winproc.find_listening_pid(port) is None
+
+
+def test_kill_process_tree_ends_a_real_process() -> None:
+    winproc = _winproc()
+    proc = _spawn_sleeper()
+    try:
+        assert winproc.kill_process_tree(proc.pid) is True
+        proc.wait(timeout=10)
+        assert proc.poll() is not None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# 挂靠模式的启动气泡：退出托盘会关服务
+# ---------------------------------------------------------------------------
+def test_attached_balloon_says_quitting_tray_closes_service(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    winicon = _winicon()
+    shell = _FakeShell32()
+    monkeypatch.setattr(winicon, "_shell32", shell)
+    window = winicon.TrayWindow(
+        object(),
+        _FakeModeController(winicon.MODE_ATTACHED),
+        icon_path=tmp_path / "tray.ico",
+    )
+    window._hwnd = 4321
+
+    window._announce_initial()
+    _keep = window
+
+    infos = [data for _op, data in shell.calls if data.uFlags & winicon.NIF_INFO]
+    assert len(infos) == 1
+    assert infos[0].szInfoTitle == "服务已在运行"
+    assert infos[0].szInfo == "退出托盘会一并关闭服务。"
+    assert "通知区" not in infos[0].szInfo
+    assert "^" not in infos[0].szInfo

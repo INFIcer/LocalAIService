@@ -13,6 +13,7 @@ import asyncio
 import hmac
 import logging
 import os
+import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -41,6 +42,11 @@ from ..core.errors import (
 )
 from ..core.idle import IdleWatchdog
 from ..core.retention import retention_loop
+from ..core.runtime import (
+    SHUTDOWN_TOKEN_ENV,
+    remove_shutdown_token,
+    write_shutdown_token,
+)
 from ..core.vram import register_adapters
 from ..engines import build_registry
 from ..jobs import JobScheduler, JobStore
@@ -91,6 +97,9 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         ensure_directories(cfg)
+        # 令牌文件只在服务运行期间有意义：托盘（含挂靠模式）退出时读它来请求
+        # 优雅关停；写不出来时托盘的强杀兜底仍然可用。
+        write_shutdown_token(cfg.home, cfg.port, app.state.shutdown_token)
         app.state.client = _http_client(cfg)
         app.state.idle_tasks = []
         app.state.idle_watchdogs = []
@@ -223,6 +232,8 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
                     await asyncio.to_thread(vision_adapter.unload)
                 except Exception:  # noqa: BLE001
                     logger.exception("停止视觉引擎时出错")
+            # 令牌文件随服务一起消失；被强杀时留下的旧文件由下次启动覆盖。
+            remove_shutdown_token(cfg.home, cfg.port, app.state.shutdown_token or "")
             await app.state.client.aclose()
 
     app = FastAPI(
@@ -242,8 +253,12 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
     app.state.registry = registry
     app.state.vram = vram
     app.state.started_at = datetime.now().astimezone().isoformat(timespec="seconds")
-    # 托盘启动时把随机令牌注入子进程环境；只有带上它才能请求优雅退出。
-    app.state.shutdown_token = (os.environ.get("LOCALAI_SHUTDOWN_TOKEN") or "").strip() or None
+    # 退出令牌：托盘拉起服务时从环境继承；否则自己生成一个。两者都会在启动后
+    # 写进 <HOME>/run/shutdown-<port>.token，供挂靠模式（含 WebUI 重启换来的新
+    # 进程）读出来走同一条优雅关停路径。
+    app.state.shutdown_token = (
+        os.environ.get(SHUTDOWN_TOKEN_ENV) or ""
+    ).strip() or secrets.token_hex(16)
     app.state.shutdown_requested = False
     # 管理界面的模型下载任务管理器（单例；同一时刻只跑一个下载）。
     app.state.model_downloader = ModelDownloader()

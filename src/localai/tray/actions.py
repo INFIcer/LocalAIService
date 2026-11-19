@@ -1,7 +1,8 @@
 """托盘的动作层：URL、菜单契约、服务探测与进程收尾。
 
-UI 层（winicon）只把点击事件翻译成这里的动作 id；本模块不 import ctypes、
-不创建窗口、不打开浏览器，因此可以在普通测试里替换掉所有外部副作用。
+UI 层（winicon）只把点击事件翻译成这里的动作 id；本模块不创建窗口、不打开
+浏览器，也不直接 import ctypes（Win32 细节在 winproc 里按需加载），因此可以在
+普通测试里替换掉所有外部副作用。
 """
 
 from __future__ import annotations
@@ -19,9 +20,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Protocol
 
+from ..core.runtime import SHUTDOWN_TOKEN_ENV, read_shutdown_token
+
 log = logging.getLogger("localai.tray")
 
-#: 与服务内部约定的退出头：只有托盘拉起的服务才接受这个请求。
+#: 与服务约定的退出头：令牌由服务自己持有，见 core.runtime。
 SHUTDOWN_HEADER = "X-LocalAI-Shutdown-Token"
 SHUTDOWN_PATH = "/admin/shutdown"
 
@@ -62,6 +65,11 @@ MODE_CONFLICT = "conflict"
 RESTART_WAIT_SECONDS = 5.0
 RESTART_WAIT_INTERVAL = 0.25
 RESTART_HEALTH_TIMEOUT = 0.5
+
+#: 优雅退出最多等多久：服务要停调度器、取消看门狗、关任务库、停视觉子进程。
+#: 与 stop_owned_process 的 graceful_timeout 取同一个数量级，超时后转强杀。
+GRACEFUL_EXIT_SECONDS = 20.0
+GRACEFUL_POLL_INTERVAL = 0.25
 
 
 def ui_url(port: int) -> str:
@@ -154,6 +162,30 @@ def wait_for_restarting_service(
             return STATE_RUNNING
         if monotonic() >= deadline:
             return STATE_FREE
+        sleep(interval)
+
+
+def wait_for_service_stop(
+    port: int,
+    *,
+    wait_seconds: float = GRACEFUL_EXIT_SECONDS,
+    interval: float = GRACEFUL_POLL_INTERVAL,
+    probe: Optional[Callable[[int], str]] = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> bool:
+    """等「本服务」不再应答：返回 True（已关）或 False（等满超时）。
+
+    判定口径与 probe_service 一致：端口空出来、或者被换成了别的程序，都算本服务
+    已经不在；仍在应答本服务形状的 /health 才算没关掉。
+    """
+    check = probe or probe_service  # 调用时再取模块属性，测试可以打桩
+    deadline = monotonic() + float(wait_seconds)
+    while True:
+        if check(port) != STATE_RUNNING:
+            return True
+        if monotonic() >= deadline:
+            return False
         sleep(interval)
 
 
@@ -365,9 +397,10 @@ def stop_owned_process(
     terminate_timeout: float = 5.0,
     kill_timeout: float = 5.0,
 ) -> StopResult:
-    """退出顺序：请求自收尾 -> terminate -> kill。
+    """自己拉起的那份服务的退出顺序：请求自收尾 -> terminate -> kill。
 
-    托盘只结束自己拉起的进程；外部实例由调用方判断后直接跳过。
+    挂靠模式没有进程句柄，走 TrayController 的「按端口定位 + 优雅请求 + 强杀」
+    路径；两条路径都先请求服务自己收尾，强杀只作兜底。
     """
     result = StopResult(owned=True)
     if proc is None or proc.poll() is not None:
@@ -419,8 +452,39 @@ class SpawnedService:
     token: str
 
 
+def _default_find_listener(port: int) -> Optional[int]:
+    """谁在监听这个端口；查不到时返回 None（调用方按「不动手」处理）。"""
+    from .winproc import find_listening_pid  # 延迟加载：动作层不直接依赖 ctypes
+
+    try:
+        return find_listening_pid(port)
+    except Exception:  # noqa: BLE001 - 查询失败只影响兜底强杀
+        log.debug("查询监听进程失败", exc_info=True)
+        return None
+
+
+def _default_kill_tree(pid: int) -> bool:
+    from .winproc import kill_process_tree
+
+    try:
+        return kill_process_tree(pid)
+    except Exception:  # noqa: BLE001
+        log.debug("结束进程树失败", exc_info=True)
+        return False
+
+
+def _default_health(port: int) -> object:
+    return http_get_json(health_url(port))
+
+
 class TrayController:
-    """服务生命周期：探测端口、决定是否拉起、退出时只收自己那份。"""
+    """服务生命周期：探测端口、决定是否拉起、退出时停掉当前服务。
+
+    托盘是服务的生命周期所有者：退出托盘 = 服务退出。服务可能是本托盘拉起的
+    （owned），也可能是启动时已经在跑、托盘挂靠上去的（attached），还可能被
+    WebUI 的「重启服务」换成了新进程；退出时一律按「当前监听该端口、且 /health
+    形状是本服务」的进程处置，端口属于别的程序时不动手。
+    """
 
     def __init__(
         self,
@@ -434,6 +498,11 @@ class TrayController:
         shutdown_client: Optional[Callable[[], bool]] = None,
         spawn: Optional[Callable[[str], SpawnedService]] = None,
         health_wait: Optional[Callable[[int], str]] = None,
+        find_listener: Optional[Callable[[int], Optional[int]]] = None,
+        kill_tree: Optional[Callable[[int], bool]] = None,
+        wait_stop: Optional[Callable[[int], bool]] = None,
+        health: Optional[Callable[[int], object]] = None,
+        token_reader: Callable[[Path, int], str] = read_shutdown_token,
         log_: Optional[logging.Logger] = None,
     ) -> None:
         self.port = int(port)
@@ -448,6 +517,11 @@ class TrayController:
         self._spawn_override = spawn
         self._shutdown_override = shutdown_client
         self._health_wait = health_wait or wait_for_restarting_service
+        self._find_listener = find_listener or _default_find_listener
+        self._kill_tree = kill_tree or _default_kill_tree
+        self._wait_stop = wait_stop or wait_for_service_stop
+        self._health = health or _default_health
+        self._token_reader = token_reader
         self._log = log_ or log
 
     # -- 状态 ---------------------------------------------------------
@@ -486,22 +560,95 @@ class TrayController:
         return self.proc is not None and self.proc.poll() is not None
 
     def quit(self) -> StopResult:
-        if self.mode != MODE_OWNED:
-            self._log.info("托盘退出：服务不是本进程拉起的，保持运行")
-            return StopResult(owned=False, steps=["external-service"])
-        result = stop_owned_process(self.proc, self._request_shutdown)
+        """退出托盘：先收自己拉起的进程，再按端口处置「当前服务」。
+
+        两步都遵守「先请求自收尾、超时再强杀」；第二步覆盖挂靠模式，以及服务被
+        WebUI 的「重启服务」换成新进程的情况。端口属于别的程序时第二步不动手。
+        """
+        result = StopResult(owned=self.mode == MODE_OWNED)
+        self._stop_owned_process(result)
+        self._stop_current_service(result)
         self._log.info("托盘退出：%s", " -> ".join(result.steps))
         return result
 
     # -- 内部 ---------------------------------------------------------
+    def _stop_owned_process(self, result: StopResult) -> None:
+        if self.proc is None or self.proc.poll() is not None:
+            return
+        owned = stop_owned_process(self.proc, self._request_shutdown)
+        result.steps.extend(owned.steps)
+        result.exit_code = owned.exit_code
+
+    def _stop_current_service(self, result: StopResult) -> None:
+        """按端口再判定一次：优雅关停优先，拿不到令牌或服务不配合时才强杀。"""
+        state = self._probe(self.port)
+        if state == STATE_FREE:
+            # 自己拉起的进程已经收干净；「端口空着」不必单独记一步。
+            if not result.steps:
+                result.steps.append("no-service")
+            return
+        if state == STATE_CONFLICT:
+            # 端口上不是本服务：绝不碰它。
+            result.steps.append("foreign-port")
+            return
+
+        token = self._shutdown_token()
+        if not token:
+            result.steps.append("no-token")
+        elif self._request_shutdown_with(token):
+            result.steps.append("shutdown-requested")
+            if self._wait_stop(self.port):
+                result.steps.append("graceful-exit")
+                return
+            result.steps.append("graceful-timeout")
+        else:
+            result.steps.append("shutdown-refused")
+
+        pid = self._find_listener(self.port)
+        if not pid:
+            result.steps.append("no-listener")
+            return
+        if not self._is_our_service(pid):
+            # 定位到进程后再确认一次身份：两步之间端口可能已经换了主人。
+            result.steps.append("foreign-port")
+            return
+        result.steps.append("kill-tree")
+        result.steps.append("tree-killed" if self._kill_tree(pid) else "tree-kill-failed")
+
+    def _shutdown_token(self) -> str:
+        """优雅退出令牌：自己的优先，否则读服务写下的令牌文件（挂靠模式）。"""
+        if self.shutdown_token:
+            return self.shutdown_token
+        try:
+            return str(self._token_reader(self.home, self.port) or "")
+        except Exception:  # noqa: BLE001 - 读不到就当没有令牌
+            return ""
+
+    def _is_our_service(self, pid: int) -> bool:
+        """确认 pid 就是应答 /health 的那个进程（形状判定 + 可选的 pid 对比）。"""
+        try:
+            payload = self._health(self.port)
+        except Exception:  # noqa: BLE001
+            return False
+        if not is_localai_health(payload):
+            return False
+        reported = payload.get("pid") if isinstance(payload, Mapping) else None
+        if reported is None:
+            return True
+        try:
+            return int(reported) == int(pid)
+        except (TypeError, ValueError):
+            return False
+
     def _request_shutdown(self) -> bool:
+        return self._request_shutdown_with(self._shutdown_token())
+
+    def _request_shutdown_with(self, token: str) -> bool:
         if self._shutdown_override is not None:
             return bool(self._shutdown_override())
-        if not self.shutdown_token:
+        if not token:
             return False
-        return ShutdownClient(
-            self.port, self.shutdown_token, self.bearer_token
-        ).request()
+        return ShutdownClient(self.port, token, self.bearer_token).request()
 
     def _spawn(self, token: str) -> SpawnedService:
         logs_dir = self.home / "logs"
@@ -624,6 +771,7 @@ __all__ = [
     "STATE_CONFLICT",
     "STATE_FREE",
     "STATE_RUNNING",
+    "GRACEFUL_EXIT_SECONDS",
     "ServiceProcess",
     "ShutdownClient",
     "ShutdownRequest",
@@ -644,4 +792,5 @@ __all__ = [
     "stop_owned_process",
     "ui_url",
     "wait_for_restarting_service",
+    "wait_for_service_stop",
 ]

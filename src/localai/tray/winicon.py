@@ -384,7 +384,7 @@ class TrayWindow:
             self._balloon(
                 "attached",
                 "服务已在运行",
-                "托盘只负责打开页面；退出托盘不会关闭它。",
+                "退出托盘会一并关闭服务。",
                 NIIF_INFO,
             )
         elif mode == MODE_CONFLICT:

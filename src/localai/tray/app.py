@@ -1,7 +1,9 @@
 """托盘启动入口：python -m localai.tray / localai tray。
 
-托盘是父进程：先探测端口，能拉起就拉起服务，已在跑就只挂图标；
-退出时只收自己拉起的进程。日志写 <LOCALAI_HOME>/logs/tray.log。
+托盘是父进程：先探测端口，能拉起就拉起服务，已在跑就挂靠上去。托盘是服务的
+生命周期所有者——退出托盘时，不论服务是本托盘拉起的、启动时已经在跑的，还是
+被 WebUI 重启换成了新进程，都会按端口确认身份后关掉它。
+日志写 <LOCALAI_HOME>/logs/tray.log。
 
 pythonw 没有控制台，任何失败都必须留下两条痕迹：完整 traceback 写
 <LOCALAI_HOME>/logs/tray-error.log，一句话中文提示用 MessageBoxW 弹出来。
@@ -123,7 +125,7 @@ def _acquire_instance_mutex() -> Optional[int]:
 def _parse_args(argv: Optional[list[str]]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="localai tray",
-        description="Windows 通知区托盘：后台启动服务、打开 WebUI、退出时收掉自己拉起的服务",
+        description="Windows 通知区托盘：后台启动服务、打开 WebUI、退出时关闭服务",
     )
     parser.add_argument("--port", type=int, help="服务端口（默认 LOCALAI_PORT / 7880）")
     parser.add_argument("--host", help="监听地址（默认 LOCALAI_HOST / 127.0.0.1）")
@@ -204,6 +206,8 @@ def _run(args: argparse.Namespace) -> int:
         code = window.run()
         if code != 0 and controller.mode == MODE_OWNED:
             # 图标没建起来也要把服务收掉，避免留下不可见的后台进程。
+            # 挂靠模式不在此列：那份服务是托盘出现之前就在跑的，托盘启动失败
+            # 不应该把用户正在用的服务一起关掉。
             controller.quit()
         if controller.mode == MODE_OWNED:
             log.info("托盘退出，服务进程已结束=%s", controller.process_exited())

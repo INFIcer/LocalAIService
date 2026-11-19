@@ -111,6 +111,7 @@ curl -X POST "http://127.0.0.1:7880/asr" \
 | 字段 | 含义 |
 | --- | --- |
 | `ok` | TTS 模型文件就绪（engine 后端） |
+| `pid` | 服务进程号：托盘用它核对「监听端口的进程就是应答 `/health` 的进程」 |
 | `model_ready` / `engine_loaded` | 文件齐全 / 当前是否已加载 |
 | `voices` | 音色数量 |
 | `asr` / `speaker` / `separate` | 各能力的 `ready`、`loaded`、空闲秒数 |

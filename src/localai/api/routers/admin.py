@@ -4,8 +4,10 @@
 --------
 - 全部接口都走全局 ``LOCALAI_TOKEN`` 中间件；``/admin/*`` 不例外；
 - 写操作必须显式带请求体，重启额外要求 ``confirm: true``（托盘退出用令牌头，不带请求体）；
-- ``/admin/shutdown`` 只接受托盘启动时注入的随机令牌（``X-LocalAI-Shutdown-Token``），
-  手工启动的服务没有这个令牌，入口直接拒绝；
+- ``/admin/shutdown`` 只接受服务自己的退出令牌（``X-LocalAI-Shutdown-Token``）。令牌由
+  托盘启动时注入或服务自己生成，运行期间写进 ``<HOME>/run/shutdown-<port>.token``；
+  托盘退出（含挂靠模式、WebUI 重启换来的新进程）读该文件后请求优雅关停，
+  ``LOCALAI_TOKEN`` 若已配置，这里同样要求 Bearer；
 - 令牌永远不回显；模型下载同一时刻只允许一个任务。
 """
 
@@ -422,15 +424,13 @@ async def restart_service(payload: RestartRequest, request: Request) -> JSONResp
 async def shutdown_service(request: Request) -> dict[str, Any]:
     """托盘退出前调用：置位 uvicorn 的 should_exit，走正常关停流程。
 
-    只接受子进程环境里的随机令牌；没有令牌（手工启动、外部实例）一律拒绝，
-    避免本机其它程序顺手关掉正在被使用的服务。
+    只接受服务自己的退出令牌：令牌文件落在用户数据根目录（权限与 config.json
+    同级），同一用户之外的进程读不到；同一用户下的进程本来就能直接结束服务
+    进程，所以这个入口不额外扩大能力面。
     """
     expected = getattr(request.app.state, "shutdown_token", None)
     if not expected:
-        raise HTTPException(
-            status_code=403,
-            detail="服务不是由托盘启动的，未开启退出入口",
-        )
+        raise HTTPException(status_code=403, detail="服务没有可用的退出令牌")
     provided = request.headers.get("x-localai-shutdown-token", "").strip()
     if not provided or not hmac.compare_digest(provided, expected):
         raise HTTPException(status_code=403, detail="退出令牌无效")

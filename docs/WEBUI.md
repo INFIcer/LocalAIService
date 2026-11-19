@@ -119,7 +119,7 @@ GPU 卡片右上角的「释放显存」按钮调用 `POST /vram/unload`，请�
 | GET | `/admin/autostart` | 计划任务 `LocalAIService-Service` 状态 |
 | POST | `/admin/autostart` | `{"enabled":true|false}` 启用/禁用开机自启（非 Windows 返回 501） |
 | POST | `/admin/restart` | `{"confirm":true}` 才执行；返回 202 后延迟约 2 秒重启 |
-| POST | `/admin/shutdown` | 托盘专用：请求头 `X-LocalAI-Shutdown-Token` 匹配时优雅退出；手工启动的服务返回 403 |
+| POST | `/admin/shutdown` | 托盘专用：请求头 `X-LocalAI-Shutdown-Token` 与服务令牌匹配时优雅退出。令牌运行期间写在 `<HOME>/run/shutdown-<port>.token`，托盘挂靠时读它；配置了 `LOCALAI_TOKEN` 时仍需 Bearer |
 | GET | `/admin/logs?lines=200&file=service` | 日志尾部；自动探测 UTF-8(BOM) / UTF-16 / GBK |
 
 ### 设置白名单
@@ -153,7 +153,8 @@ GPU 卡片右上角的「释放显存」按钮调用 `POST /vram/unload`，请�
   下次请求按新档位加载，旧模型由空闲看门狗 / 显存管家回收。
 - **重启**：`POST /admin/restart` 先返回 202，延迟 1~2 秒后用脱离进程执行
   `tools/restart_service.ps1`：结束监听 7880 的 python 进程，再用 WMI 后台执行
-  `start_ai_service.ps1`。重启期间接口短暂不可用。
+  `start_ai_service.ps1`。重启期间接口短暂不可用。重启后的新进程不再是托盘的子进程，
+  但托盘退出时会按监听端口重新确认身份后关掉它，不会留下「托盘没了、服务还在」的孤儿。
 - **开机自启**：Windows 下操作计划任务 `LocalAIService-Service`；不存在时创建
   「登录时」触发任务。命令全部走 `powershell -NoProfile -NonInteractive`，
   不弹 UAC；权限不足时接口返回明确的 PowerShell stderr。
