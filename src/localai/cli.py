@@ -173,8 +173,24 @@ def cmd_serve(args: argparse.Namespace) -> int:
     port = args.port or cfg.port
     log_level = (args.log_level or cfg.log_level).lower()
     print(f"localai-service {__version__} 监听 http://{host}:{port}  (docs: /docs)")
-    uvicorn.run(app, host=host, port=port, log_level=log_level)
+    config = uvicorn.Config(app, host=host, port=port, log_level=log_level)
+    server = uvicorn.Server(config)
+    # 托盘通过 /admin/shutdown 请求退出时，需要从请求里把 should_exit 置位，
+    # 让 uvicorn 走正常关停流程（lifespan finally 会停调度器与视觉子进程）。
+    app.state.uvicorn_server = server
+    server.run()
     return 0
+
+
+def cmd_tray(args: argparse.Namespace) -> int:
+    from .tray.app import main as tray_main
+
+    argv: list[str] = []
+    if args.port is not None:
+        argv.extend(["--port", str(args.port)])
+    if args.host:
+        argv.extend(["--host", args.host])
+    return tray_main(argv)
 
 
 # ---------------------------------------------------------------------------
@@ -752,6 +768,11 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--port", type=int, help="监听端口（默认 LOCALAI_PORT / 7880）")
     serve.add_argument("--log-level", help="日志级别（debug/info/warning）")
     serve.set_defaults(func=cmd_serve)
+
+    tray = sub.add_parser("tray", help="Windows 托盘启动（后台服务 + 通知区图标）")
+    tray.add_argument("--host", help="监听地址（默认 LOCALAI_HOST / 127.0.0.1）")
+    tray.add_argument("--port", type=int, help="服务端口（默认 LOCALAI_PORT / 7880）")
+    tray.set_defaults(func=cmd_tray)
 
     doctor = sub.add_parser("doctor", help="体检：Python/依赖/GPU/ffmpeg/模型/端口")
     doctor.set_defaults(func=cmd_doctor)

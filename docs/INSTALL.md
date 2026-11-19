@@ -202,7 +202,23 @@ powershell -NoProfile -ExecutionPolicy Bypass -File E:\LocalAIService\start_ai_s
 - 用 `engine\.venv\Scripts\python.exe -m localai serve` 启动；
 - 日志写到 `logs\service.out.log` / `logs\service.err.log`。
 
-### 7.3 后台/隐藏启动（推荐）
+### 7.3 托盘启动（推荐）
+
+双击仓库根目录的 `start_ai_service_tray.vbs`：不弹控制台，服务在后台启动，通知区出现鱼形图标。
+
+- 左键双击图标 / 右键「打开 WebUI」：打开 `http://127.0.0.1:7880/ui`；
+- 右键「复制地址」：把上面的地址放进剪贴板；
+- 右键「退出」：先请求服务自己收尾（停调度器、停视觉子进程）；超时后用
+  `taskkill /T /F` 结束整棵进程树（含 venv 的 python 转发器），只收托盘拉起的进程；
+- 7880 上已有服务（例如之前用启动脚本开的）：托盘只挂图标，不启动第二份，退出也不关它；
+- 端口被其它程序占用：不启动服务，托盘提示端口被占用。
+
+日志在 `logs\tray.log`，服务自身仍是 `logs\service.out.log` / `service.err.log`。
+命令行等价：`engine\.venv\Scripts\pythonw.exe -m localai tray`；调试时把 `pythonw` 换成
+`python` 就能看到输出。计划随登录启动：把 `start_ai_service_tray.vbs` 的快捷方式放进
+`shell:startup`。
+
+### 7.4 后台/隐藏启动（不显示图标）
 
 ```powershell
 $py = "E:\LocalAIService\engine\.venv\Scripts\python.exe"
@@ -220,7 +236,7 @@ curl.exe -s http://127.0.0.1:7880/health
 不要用会阻塞前台的 `Start-Process -Wait` 来“重启”；先结束监听 7880 的进程，
 再用上面的 WMI 方式拉起。
 
-### 7.4 开机自启
+### 7.5 开机自启
 
 任选一种：
 

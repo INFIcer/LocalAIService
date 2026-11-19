@@ -1,7 +1,10 @@
 # 管理界面（WebUI）与 `/admin/*` 接口
 
 管理界面是服务层自带的一个**纯静态单页**：没有 npm、没有构建步骤、没有 CDN，
-所有 HTML / CSS / JS 都随 Python 包分发。打开浏览器访问：
+所有 HTML / CSS / JS 都随 Python 包分发。打开方式：
+
+- 双击 `start_ai_service_tray.vbs`，再左键双击托盘图标或右键「打开 WebUI」；
+- 或直接让浏览器访问：
 
 ```text
 http://127.0.0.1:7880/ui
@@ -114,6 +117,7 @@ GPU 卡片右上角的「释放显存」按钮调用 `POST /vram/unload`，请�
 | GET | `/admin/autostart` | 计划任务 `LocalAIService-Service` 状态 |
 | POST | `/admin/autostart` | `{"enabled":true|false}` 启用/禁用开机自启（非 Windows 返回 501） |
 | POST | `/admin/restart` | `{"confirm":true}` 才执行；返回 202 后延迟约 2 秒重启 |
+| POST | `/admin/shutdown` | 托盘专用：请求头 `X-LocalAI-Shutdown-Token` 匹配时优雅退出；手工启动的服务返回 403 |
 | GET | `/admin/logs?lines=200&file=service` | 日志尾部；自动探测 UTF-8(BOM) / UTF-16 / GBK |
 
 ### 设置白名单

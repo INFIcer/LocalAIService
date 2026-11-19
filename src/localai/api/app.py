@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -241,6 +242,9 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
     app.state.registry = registry
     app.state.vram = vram
     app.state.started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    # 托盘启动时把随机令牌注入子进程环境；只有带上它才能请求优雅退出。
+    app.state.shutdown_token = (os.environ.get("LOCALAI_SHUTDOWN_TOKEN") or "").strip() or None
+    app.state.shutdown_requested = False
     # 管理界面的模型下载任务管理器（单例；同一时刻只跑一个下载）。
     app.state.model_downloader = ModelDownloader()
     app.state.model_scanner = ModelScanner()

@@ -3,13 +3,16 @@
 安全约定
 --------
 - 全部接口都走全局 ``LOCALAI_TOKEN`` 中间件；``/admin/*`` 不例外；
-- 写操作必须显式带请求体，重启额外要求 ``confirm: true``；
+- 写操作必须显式带请求体，重启额外要求 ``confirm: true``（托盘退出用令牌头，不带请求体）；
+- ``/admin/shutdown`` 只接受托盘启动时注入的随机令牌（``X-LocalAI-Shutdown-Token``），
+  手工启动的服务没有这个令牌，入口直接拒绝；
 - 令牌永远不回显；模型下载同一时刻只允许一个任务。
 """
 
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import os
 from typing import Any, Optional
@@ -413,6 +416,31 @@ async def restart_service(payload: RestartRequest, request: Request) -> JSONResp
     except FileNotFoundError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     return JSONResponse(status_code=202, content=result)
+
+
+@router.post("/shutdown", summary="托盘专用：优雅退出服务（需退出令牌）")
+async def shutdown_service(request: Request) -> dict[str, Any]:
+    """托盘退出前调用：置位 uvicorn 的 should_exit，走正常关停流程。
+
+    只接受子进程环境里的随机令牌；没有令牌（手工启动、外部实例）一律拒绝，
+    避免本机其它程序顺手关掉正在被使用的服务。
+    """
+    expected = getattr(request.app.state, "shutdown_token", None)
+    if not expected:
+        raise HTTPException(
+            status_code=403,
+            detail="服务不是由托盘启动的，未开启退出入口",
+        )
+    provided = request.headers.get("x-localai-shutdown-token", "").strip()
+    if not provided or not hmac.compare_digest(provided, expected):
+        raise HTTPException(status_code=403, detail="退出令牌无效")
+
+    server = getattr(request.app.state, "uvicorn_server", None)
+    if server is not None:
+        server.should_exit = True
+    request.app.state.shutdown_requested = True
+    logger.info("收到托盘退出请求，开始关停")
+    return {"ok": True, "detail": "正在退出"}
 
 
 @router.get("/logs", summary="查看 service.out.log / service.err.log 尾部")

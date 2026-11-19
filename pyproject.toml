@@ -52,6 +52,10 @@ package-dir = { "" = "src" }
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# 托盘图标随包分发；源码运行与 pip 安装都能找到。
+[tool.setuptools.package-data]
+localai = ["tray/*.ico"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q -m 'not slow'"
