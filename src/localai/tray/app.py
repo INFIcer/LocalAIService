@@ -200,6 +200,8 @@ def _run(args: argparse.Namespace) -> int:
             controller,
             icon_path=Path(__file__).with_name("tray.ico"),
         )
+        # 清理显存的结果从后台线程回来，经窗口的队列再弹气泡。
+        actions.set_notify(window.notify_result)
         code = window.run()
         if code != 0 and controller.mode == MODE_OWNED:
             # 图标没建起来也要把服务收掉，避免留下不可见的后台进程。

@@ -10,14 +10,17 @@ import ctypes
 import logging
 import threading
 import time
+from collections import deque
 from ctypes import wintypes
 from pathlib import Path
 from typing import Optional
 
 from .actions import (
     ACTION_BY_MENU_ID,
+    ACTION_CLEAR_VRAM,
     ACTION_OPEN,
     ACTION_QUIT,
+    NOTIFY_ERROR,
     MENU_IDS,
     MENU_ITEMS,
     MODE_ATTACHED,
@@ -46,6 +49,7 @@ WM_TRAY = WM_APP + 1
 WM_TRAY_READY = WM_APP + 2
 WM_TRAY_EXIT = WM_APP + 3
 WM_TRAY_FAILED = WM_APP + 4
+WM_TRAY_NOTIFY = WM_APP + 5
 
 CS_DBLCLKS = 0x0008
 NIM_ADD = 0
@@ -260,7 +264,9 @@ class TrayWindow:
         self._destroyed = False
         self._quitting = False
         self._ballooned: set[str] = set()
+        self._notices: deque[tuple[str, str, int]] = deque()
         self._ready_thread: Optional[threading.Thread] = None
+        self._clear_thread: Optional[threading.Thread] = None
         self._stop_ready = threading.Event()
 
     # -- 生命周期 -----------------------------------------------------
@@ -442,10 +448,16 @@ class TrayWindow:
         if force:
             log.debug("tooltip -> %s", data.szTip)
 
-    def _balloon(self, key: str, title: str, text: str, flag: int) -> None:
-        if key in self._ballooned or not self._hwnd:
+    def _balloon(
+        self, key: str, title: str, text: str, flag: int, *, once: bool = True
+    ) -> None:
+        """弹气球；once=False 用于每次都要汇报的动作结果（例如清理显存）。"""
+        if not self._hwnd:
             return
-        self._ballooned.add(key)
+        if once:
+            if key in self._ballooned:
+                return
+            self._ballooned.add(key)
         data = self._notify_data(NIF_INFO)
         data.szInfoTitle = title
         data.szInfo = text
@@ -485,10 +497,43 @@ class TrayWindow:
         if action == ACTION_QUIT:
             self._begin_quit()
             return
+        if action == ACTION_CLEAR_VRAM:
+            self._start_clear_vram()
+            return
         try:
             self._actions.perform(action)
         except Exception:
             log.exception("托盘动作失败：%s", action)
+
+    # -- 异步结果 -----------------------------------------------------
+    def notify_result(self, title: str, text: str, flag: int) -> None:
+        """后台线程把结果交给窗口线程：队列 + PostMessage，不能直接碰 Shell_NotifyIcon。"""
+        if self._destroyed:
+            return
+        self._notices.append((title, text, flag))
+        self._post(WM_TRAY_NOTIFY)
+
+    def _show_notice(self) -> None:
+        try:
+            title, text, flag = self._notices.popleft()
+        except IndexError:
+            return
+        self._balloon("clear-vram", title, text, flag, once=False)
+
+    def _start_clear_vram(self) -> None:
+        """清理显存是网络请求，最多几秒；放后台线程，窗口线程继续响应菜单与消息。"""
+        thread = threading.Thread(
+            target=self._clear_vram_worker, name="localai-tray-vram", daemon=True
+        )
+        self._clear_thread = thread
+        thread.start()
+
+    def _clear_vram_worker(self) -> None:
+        try:
+            self._actions.perform(ACTION_CLEAR_VRAM)
+        except Exception:
+            log.exception("清理显存失败")
+            self.notify_result("清理失败", "清理显存时出错，稍后再试。", NOTIFY_ERROR)
 
     def _begin_quit(self) -> None:
         if self._quitting:
@@ -530,6 +575,9 @@ class TrayWindow:
                 return 0
             if message == WM_TRAY_FAILED:
                 self._set_mode("failed")
+                return 0
+            if message == WM_TRAY_NOTIFY:
+                self._show_notice()
                 return 0
             if message == WM_TRAY_EXIT:
                 self._destroy()

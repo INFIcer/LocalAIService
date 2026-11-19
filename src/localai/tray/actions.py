@@ -27,12 +27,19 @@ SHUTDOWN_PATH = "/admin/shutdown"
 
 ACTION_OPEN = "open"
 ACTION_COPY = "copy"
+ACTION_CLEAR_VRAM = "clear_vram"
 ACTION_QUIT = "quit"
+
+#: 气泡图标级别；与 Shell_NotifyIcon 的 NIIF_* 同值，避免动作层依赖 ctypes。
+NOTIFY_INFO = 1
+NOTIFY_WARNING = 2
+NOTIFY_ERROR = 3
 
 #: 右键菜单：id、文案。文字保持短，给普通人看。
 MENU_ITEMS: tuple[tuple[str, str], ...] = (
     (ACTION_OPEN, "打开 WebUI"),
     (ACTION_COPY, "复制地址"),
+    (ACTION_CLEAR_VRAM, "清理显存"),
     (ACTION_QUIT, "退出"),
 )
 
@@ -192,6 +199,111 @@ class ShutdownClient:
         except Exception as exc:  # noqa: BLE001 - 失败就走兜底 kill
             log.info("优雅退出请求失败：%s", exc)
             return False
+
+
+VRAM_UNLOAD_PATH = "/vram/unload"
+VRAM_UNLOAD_TIMEOUT = 5.0
+
+#: 显存接口返回的能力名 -> 给普通人看的中文短名。
+MODEL_LABELS: dict[str, str] = {
+    "tts": "语音合成",
+    "asr": "语音识别",
+    "whisper": "语音识别",
+    "speaker": "声纹",
+    "separate": "分轨",
+    "translate": "翻译",
+    "vision": "识图",
+}
+
+
+@dataclass(frozen=True)
+class VramUnloadRequest:
+    url: str
+    headers: tuple[tuple[str, str], ...]
+    body: bytes
+
+
+def build_vram_unload_request(port: int, bearer_token: str = "") -> VramUnloadRequest:
+    """手动释放全部模型：忙的跳过，服务端不会等长推理。"""
+    headers = [("Content-Type", "application/json")]
+    if bearer_token:
+        headers.append(("Authorization", f"Bearer {bearer_token}"))
+    body = json.dumps({"all": True, "skip_busy": True}).encode("utf-8")
+    return VramUnloadRequest(
+        f"http://127.0.0.1:{int(port)}{VRAM_UNLOAD_PATH}", tuple(headers), body
+    )
+
+
+class VramUnloadClient:
+    """让服务卸载全部已加载模型；失败返回 None，由调用方翻译成一句人话。"""
+
+    def __init__(
+        self,
+        port: int,
+        bearer_token: str = "",
+        *,
+        timeout: float = VRAM_UNLOAD_TIMEOUT,
+        opener: Optional[urllib.request.OpenerDirector] = None,
+    ) -> None:
+        self._request = build_vram_unload_request(port, bearer_token)
+        self._timeout = timeout
+        self._opener = opener or _direct_opener()
+
+    def request(self) -> Optional[dict[str, object]]:
+        request = urllib.request.Request(
+            self._request.url,
+            data=self._request.body,
+            method="POST",
+            headers=dict(self._request.headers),
+        )
+        try:
+            with self._opener.open(request, timeout=self._timeout) as response:  # noqa: S310
+                if not 200 <= int(response.status) < 300:
+                    log.info("清理显存请求失败：HTTP %s", response.status)
+                    return None
+                payload = json.loads(
+                    response.read(64 * 1024).decode("utf-8", errors="replace")
+                )
+        except Exception as exc:  # noqa: BLE001 - 服务没起来/超时都按失败提示
+            log.info("清理显存请求失败：%s", exc)
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return payload
+
+
+def _model_labels(names: object) -> list[str]:
+    """把接口返回的能力名换成中文短名，保留顺序并去掉重复（asr/whisper 同名）。"""
+    if not isinstance(names, (list, tuple)):
+        return []
+    labels: list[str] = []
+    for name in names:
+        label = MODEL_LABELS.get(str(name), str(name))
+        if label and label not in labels:
+            labels.append(label)
+    return labels
+
+
+def build_clear_vram_notice(
+    result: Optional[Mapping[str, object]],
+) -> tuple[str, str, int]:
+    """把 /vram/unload 的返回值翻译成气泡标题、正文与图标级别。"""
+    if result is None:
+        return ("清理失败", "服务没响应，稍后再试。", NOTIFY_ERROR)
+    released = _model_labels(result.get("released"))
+    skipped = _model_labels(result.get("skipped"))
+    if released:
+        text = f"已卸下 {'、'.join(released)}"
+        if skipped:
+            text += f"；正在用的 {'、'.join(skipped)} 没动"
+        return ("显存已清理", text, NOTIFY_INFO)
+    if skipped:
+        return (
+            "暂时没腾出显存",
+            f"正在用的 {'、'.join(skipped)} 没动；等它跑完再试一次。",
+            NOTIFY_WARNING,
+        )
+    return ("显存已清理", "现在没有模型占着显存。", NOTIFY_INFO)
 
 
 class ProcessLike(Protocol):
@@ -440,12 +552,27 @@ class TrayActions:
         *,
         open_url: Callable[[str], object],
         copy_text: Callable[[str], object],
+        unload_client: Optional[Callable[[], Optional[Mapping[str, object]]]] = None,
+        notify: Optional[Callable[[str, str, int], object]] = None,
         log_: Optional[logging.Logger] = None,
     ) -> None:
         self.controller = controller
         self._open_url = open_url
         self._copy_text = copy_text
+        self._unload_client = unload_client
+        self._notify = notify
         self._log = log_ or log
+
+    def set_notify(self, notify: Callable[[str, str, int], object]) -> None:
+        """UI 建好后接回调：清理显存是异步动作，结果要靠它弹气泡。"""
+        self._notify = notify
+
+    def _clear_vram(self) -> Optional[Mapping[str, object]]:
+        if self._unload_client is not None:
+            return self._unload_client()
+        return VramUnloadClient(
+            self.controller.port, getattr(self.controller, "bearer_token", "")
+        ).request()
 
     def perform(self, action: str) -> str:
         if action == ACTION_OPEN:
@@ -458,6 +585,20 @@ class TrayActions:
             self._copy_text(url)
             self._log.info("已复制地址：%s", url)
             return ACTION_COPY
+        if action == ACTION_CLEAR_VRAM:
+            try:
+                result = self._clear_vram()
+            except Exception:  # noqa: BLE001 - 请求态失败也要翻译成一句人话
+                self._log.exception("清理显存请求出错")
+                result = None
+            title, text, flag = build_clear_vram_notice(result)
+            self._log.info("清理显存：%s", text)
+            if self._notify is not None:
+                try:
+                    self._notify(title, text, flag)
+                except Exception:  # noqa: BLE001 - 气泡失败不影响动作结果
+                    self._log.exception("清理显存结果通知失败")
+            return ACTION_CLEAR_VRAM
         if action == ACTION_QUIT:
             self._log.info("收到退出请求")
             self.controller.quit()
@@ -467,11 +608,16 @@ class TrayActions:
 
 __all__ = [
     "ACTION_BY_MENU_ID",
+    "ACTION_CLEAR_VRAM",
     "ACTION_COPY",
     "ACTION_OPEN",
     "ACTION_QUIT",
     "MENU_IDS",
     "MENU_ITEMS",
+    "MODEL_LABELS",
+    "NOTIFY_ERROR",
+    "NOTIFY_INFO",
+    "NOTIFY_WARNING",
     "MODE_ATTACHED",
     "MODE_CONFLICT",
     "MODE_OWNED",
@@ -485,8 +631,12 @@ __all__ = [
     "StopResult",
     "TrayActions",
     "TrayController",
+    "VramUnloadClient",
+    "VramUnloadRequest",
+    "build_clear_vram_notice",
     "build_shutdown_request",
     "build_tooltip",
+    "build_vram_unload_request",
     "health_url",
     "is_localai_health",
     "port_free",

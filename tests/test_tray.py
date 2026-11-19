@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import socket
 import subprocess
@@ -63,9 +64,20 @@ def test_menu_items_and_action_mapping() -> None:
     assert [action for action, _label in tray.MENU_ITEMS] == [
         tray.ACTION_OPEN,
         tray.ACTION_COPY,
+        tray.ACTION_CLEAR_VRAM,
         tray.ACTION_QUIT,
     ]
-    assert [label for _action, label in tray.MENU_ITEMS] == ["打开 WebUI", "复制地址", "退出"]
+    assert [label for _action, label in tray.MENU_ITEMS] == [
+        "打开 WebUI",
+        "复制地址",
+        "清理显存",
+        "退出",
+    ]
+    # 插入新项后 id 自动重排；退出仍是最后一项，菜单分隔线插在它前面。
+    assert tray.MENU_IDS[tray.ACTION_CLEAR_VRAM] == 1003
+    assert tray.MENU_IDS[tray.ACTION_QUIT] == 1004
+    assert tray.ACTION_BY_MENU_ID[1003] == tray.ACTION_CLEAR_VRAM
+    assert tray.ACTION_BY_MENU_ID[1004] == tray.ACTION_QUIT
     for action, label in tray.MENU_ITEMS:
         assert len(label) <= 10
         assert tray.ACTION_BY_MENU_ID[tray.MENU_IDS[action]] == action
@@ -679,3 +691,212 @@ def test_controller_spawns_after_restart_window_is_empty(
     )
     assert controller.start() == tray.MODE_OWNED
     assert len(spawned) == 1
+
+
+# ---------------------------------------------------------------------------
+# 清理显存：请求契约与结果文案
+# ---------------------------------------------------------------------------
+class _VramResponse:
+    def __init__(self, payload: object, status: int = 200) -> None:
+        self.status = status
+        self._body = json.dumps(payload).encode("utf-8")
+
+    def read(self, _size: int = -1) -> bytes:
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args) -> bool:
+        return False
+
+
+class _VramOpener:
+    """假 opener：抓住托盘真正发出的 Request，不碰网络。"""
+
+    def __init__(self, payload: object = None, *, status: int = 200, error=None) -> None:
+        self.requests: list[tuple[object, float]] = []
+        self._payload = payload
+        self._status = status
+        self._error = error
+
+    def open(self, request, timeout=None):
+        self.requests.append((request, timeout))
+        if self._error is not None:
+            raise self._error
+        return _VramResponse(self._payload, self._status)
+
+
+def test_clear_vram_request_body_and_bearer_header() -> None:
+    opener = _VramOpener({"ok": True, "released": ["speaker"], "skipped": []})
+    result = tray.VramUnloadClient(7899, "secret", opener=opener).request()
+
+    assert result == {"ok": True, "released": ["speaker"], "skipped": []}
+    assert len(opener.requests) == 1
+    request, timeout = opener.requests[0]
+    assert request.full_url == "http://127.0.0.1:7899/vram/unload"
+    assert request.get_method() == "POST"
+    assert json.loads(request.data.decode("utf-8")) == {"all": True, "skip_busy": True}
+    assert request.get_header("Authorization") == "Bearer secret"
+    assert timeout == tray.VRAM_UNLOAD_TIMEOUT == 5.0
+
+
+def test_clear_vram_request_without_token_has_no_authorization() -> None:
+    opener = _VramOpener({"ok": True, "released": [], "skipped": []})
+    tray.VramUnloadClient(7880, opener=opener).request()
+
+    request, _timeout = opener.requests[0]
+    assert request.get_header("Authorization") is None
+
+
+def test_clear_vram_client_returns_none_on_http_error() -> None:
+    opener = _VramOpener({"ok": False}, status=500)
+    assert tray.VramUnloadClient(7899, opener=opener).request() is None
+
+
+def test_clear_vram_client_returns_none_on_exception() -> None:
+    opener = _VramOpener(error=OSError("connection refused"))
+    assert tray.VramUnloadClient(7899, opener=opener).request() is None
+
+
+def _actions_with_unload(unload, notices: list[tuple[str, str, int]]) -> tray.TrayActions:
+    actions = tray.TrayActions(
+        FakeController(),
+        open_url=lambda _url: None,
+        copy_text=lambda _text: None,
+        unload_client=unload,
+    )
+    # app.py 也是窗口建好后再接回调；这里覆盖 set_notify 这条路径。
+    actions.set_notify(lambda title, text, flag: notices.append((title, text, flag)))
+    return actions
+
+
+def test_clear_vram_notice_uses_chinese_model_names() -> None:
+    notices: list[tuple[str, str, int]] = []
+    actions = _actions_with_unload(
+        lambda: {"ok": True, "released": ["tts", "vision"], "skipped": []}, notices
+    )
+
+    assert actions.perform(tray.ACTION_CLEAR_VRAM) == tray.ACTION_CLEAR_VRAM
+    assert notices == [("显存已清理", "已卸下 语音合成、识图", tray.NOTIFY_INFO)]
+
+
+def test_clear_vram_notice_mentions_busy_models_and_dedupes_names() -> None:
+    notices: list[tuple[str, str, int]] = []
+    actions = _actions_with_unload(
+        lambda: {
+            "ok": True,
+            "released": ["asr", "whisper"],
+            "skipped": ["separate"],
+        },
+        notices,
+    )
+
+    actions.perform(tray.ACTION_CLEAR_VRAM)
+    assert notices == [
+        ("显存已清理", "已卸下 语音识别；正在用的 分轨 没动", tray.NOTIFY_INFO)
+    ]
+
+
+def test_clear_vram_notice_when_everything_is_busy() -> None:
+    notices: list[tuple[str, str, int]] = []
+    actions = _actions_with_unload(
+        lambda: {"ok": True, "released": [], "skipped": ["tts"]}, notices
+    )
+
+    actions.perform(tray.ACTION_CLEAR_VRAM)
+    assert notices == [
+        (
+            "暂时没腾出显存",
+            "正在用的 语音合成 没动；等它跑完再试一次。",
+            tray.NOTIFY_WARNING,
+        )
+    ]
+
+
+def test_clear_vram_notice_when_nothing_is_loaded() -> None:
+    notices: list[tuple[str, str, int]] = []
+    actions = _actions_with_unload(
+        lambda: {"ok": True, "released": [], "skipped": []}, notices
+    )
+
+    actions.perform(tray.ACTION_CLEAR_VRAM)
+    assert notices == [("显存已清理", "现在没有模型占着显存。", tray.NOTIFY_INFO)]
+
+
+def test_clear_vram_notice_falls_back_to_raw_model_name() -> None:
+    notices: list[tuple[str, str, int]] = []
+    actions = _actions_with_unload(
+        lambda: {"ok": True, "released": ["mystery"], "skipped": []}, notices
+    )
+
+    actions.perform(tray.ACTION_CLEAR_VRAM)
+    assert notices == [("显存已清理", "已卸下 mystery", tray.NOTIFY_INFO)]
+
+
+def test_clear_vram_notice_reports_failure_on_none() -> None:
+    notices: list[tuple[str, str, int]] = []
+    actions = _actions_with_unload(lambda: None, notices)
+
+    assert actions.perform(tray.ACTION_CLEAR_VRAM) == tray.ACTION_CLEAR_VRAM
+    assert notices == [
+        ("清理失败", "服务没响应，稍后再试。", tray.NOTIFY_ERROR)
+    ]
+
+
+def test_clear_vram_notice_reports_failure_on_exception() -> None:
+    def boom():
+        raise RuntimeError("timed out")
+
+    notices: list[tuple[str, str, int]] = []
+    actions = _actions_with_unload(boom, notices)
+
+    assert actions.perform(tray.ACTION_CLEAR_VRAM) == tray.ACTION_CLEAR_VRAM
+    assert notices == [
+        ("清理失败", "服务没响应，稍后再试。", tray.NOTIFY_ERROR)
+    ]
+
+
+def test_clear_vram_balloon_is_not_deduped(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    winicon = _winicon()
+    shell = _FakeShell32()
+    monkeypatch.setattr(winicon, "_shell32", shell)
+    window = winicon.TrayWindow(
+        object(), _FakeModeController(winicon.MODE_OWNED), icon_path=tmp_path / "tray.ico"
+    )
+    window._hwnd = 4321
+
+    window._balloon(
+        "clear-vram", "显存已清理", "已卸下 声纹", winicon.NIIF_INFO, once=False
+    )
+    window._balloon(
+        "clear-vram", "显存已清理", "已卸下 声纹", winicon.NIIF_INFO, once=False
+    )
+
+    infos = [data for _op, data in shell.calls if data.uFlags & winicon.NIF_INFO]
+    assert len(infos) == 2, "每次清理都要弹，不能被 _ballooned 去重"
+    assert "clear-vram" not in window._ballooned
+
+
+def test_notify_result_queues_then_shows(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    winicon = _winicon()
+    window = winicon.TrayWindow(
+        object(), _FakeModeController(winicon.MODE_OWNED), icon_path=tmp_path / "tray.ico"
+    )
+    posted: list[int] = []
+    balloons: list[tuple[tuple, dict]] = []
+    monkeypatch.setattr(window, "_post", lambda message: posted.append(message))
+    monkeypatch.setattr(
+        window, "_balloon", lambda *args, **kwargs: balloons.append((args, kwargs))
+    )
+
+    window.notify_result("显存已清理", "已卸下 声纹", winicon.NIIF_INFO)
+    assert posted == [winicon.WM_TRAY_NOTIFY]
+
+    window._show_notice()
+    assert balloons == [
+        (
+            ("clear-vram", "显存已清理", "已卸下 声纹", winicon.NIIF_INFO),
+            {"once": False},
+        )
+    ]
