@@ -216,7 +216,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File E:\LocalAIService\start_ai_s
 - 启动后会弹一次气球提示；图标默认收在通知区 `^` 溢出区，点开 `^` 或把它拖到任务栏常显，
   也可以在「设置 → 任务栏 → 选择哪些图标显示在任务栏上」里打开；
 - 启动失败会弹一句中文提示，完整 traceback 写在 `logs\tray-error.log`；
-- 托盘已经在运行时再双击：叫醒已有托盘打开页面，并弹框说明图标在通知区，不会起第二个托盘。
+- 托盘已经在运行时再双击：叫醒已有托盘打开页面，并弹框提示托盘已在运行，不会起第二个托盘。
 
 日志在 `logs\tray.log`，服务自身仍是 `logs\service.out.log` / `service.err.log`。
 命令行等价：`engine\.venv\Scripts\pythonw.exe -m localai tray`；调试时把 `pythonw` 换成

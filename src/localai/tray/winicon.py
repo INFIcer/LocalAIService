@@ -371,20 +371,20 @@ class TrayWindow:
 
     # -- 状态 ---------------------------------------------------------
     def _announce_initial(self) -> None:
-        """图标刚注册时弹一次气球：新图标默认收在通知区溢出区，不提示就找不到。"""
+        """图标刚注册时弹一次气球，只报启动结果。"""
         mode = self._controller.mode
         if mode == MODE_OWNED:
             self._balloon(
                 "started",
-                "本地 AI 服务托盘已启动",
-                "双击图标打开 WebUI。图标在任务栏右下角通知区，可能收在 ^ 里。",
+                "本地 AI 服务已启动",
+                f"127.0.0.1:{self._controller.port}",
                 NIIF_INFO,
             )
         elif mode == MODE_ATTACHED:
             self._balloon(
                 "attached",
                 "服务已在运行",
-                "托盘只负责打开页面；退出托盘不会关闭它。图标在通知区，可能收在 ^ 里。",
+                "托盘只负责打开页面；退出托盘不会关闭它。",
                 NIIF_INFO,
             )
         elif mode == MODE_CONFLICT:

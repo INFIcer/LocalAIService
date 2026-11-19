@@ -150,13 +150,12 @@ def _wake_existing_tray(timeout: float = 3.0) -> bool:
 
 def report_already_running(port: int) -> int:
     """第二个实例：不重复建图标，但必须让人看见「已经有一个在跑」。"""
-    log.warning("托盘已在运行，本次双击只提示图标位置，退出码 %s", EXIT_ALREADY_RUNNING)
+    log.warning("托盘已在运行，本次双击只打开页面并提示已在运行，退出码 %s", EXIT_ALREADY_RUNNING)
     opened = _wake_existing_tray()
     log.info("已叫醒已有托盘打开页面=%s", opened)
     _show_dialog(
         "LocalAIService 托盘",
-        "托盘已经在运行，看任务栏右下角的通知区（图标可能收在 ^ 里）。\n\n"
-        f"双击图标可打开 WebUI（端口 {int(port)}），右键图标可以退出。",
+        f"托盘已经在运行（端口 {int(port)}），已经帮你打开 WebUI。",
     )
     return EXIT_ALREADY_RUNNING
 

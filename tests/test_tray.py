@@ -561,7 +561,10 @@ def test_second_launch_shows_hint_instead_of_exiting_silently(
     assert code == app.EXIT_ALREADY_RUNNING != 0
     assert woken == [True], "第二次双击要顺手叫醒已有托盘打开页面"
     assert dialogs and "托盘已经在运行" in dialogs[0][1]
-    assert "通知区" in dialogs[0][1]
+    assert "打开 WebUI" in dialogs[0][1]
+    # 主人要求弹框只报「已在运行」，不要再教人去通知区找图标。
+    assert "通知区" not in dialogs[0][1]
+    assert "^" not in dialogs[0][1]
     log_text = (tmp_path / "logs" / "tray.log").read_text(encoding="utf-8")
     assert "托盘已在运行" in log_text
 
@@ -605,9 +608,10 @@ def test_startup_balloon_is_shown_exactly_once(
 
     infos = [data for _op, data in shell.calls if data.uFlags & winicon.NIF_INFO]
     assert len(infos) == 1, "气球只在启动时弹一次"
-    assert "托盘已启动" in infos[0].szInfoTitle
-    assert "双击" in infos[0].szInfo
-    assert "^" in infos[0].szInfo, "要告诉人去哪个区域找图标"
+    assert infos[0].szInfoTitle == "本地 AI 服务已启动"
+    assert infos[0].szInfo == "127.0.0.1:7880"
+    assert "通知区" not in infos[0].szInfo
+    assert "^" not in infos[0].szInfo
     assert infos[0].dwInfoFlags == winicon.NIIF_INFO
     assert _keep._ballooned == {"started"}
 
